@@ -7,9 +7,6 @@
 
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT_DIR"
-
 mkdir -p logs
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
@@ -23,9 +20,18 @@ TEXT_RECURSION_ROUNDS="${TEXT_RECURSION_ROUNDS:-3}"
 OUT_ROOT="${OUT_ROOT:-logs/recursive_baselines/$(date +%Y%m%d_%H%M%S)}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
+export CUDA_VISIBLE_DEVICES=7
+export CONDA_NO_PLUGINS=true
+export TMPDIR="${SLURM_TMPDIR:-/tmp}"
+export PYTHONNOUSERSITE=1
+unset PYTHONPATH || true
+
+echo "Using TMPDIR=$TMPDIR"
+mkdir -p "$TMPDIR" || true
+ls -ld "$TMPDIR" || true
+
 mkdir -p "$OUT_ROOT"
 
-echo "[baseline] root=$ROOT_DIR"
 echo "[baseline] out_root=$OUT_ROOT"
 echo "[baseline] style=$STYLE"
 echo "[baseline] datasets=$DATASETS"
