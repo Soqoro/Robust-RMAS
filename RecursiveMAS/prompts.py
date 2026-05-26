@@ -466,6 +466,22 @@ def build_code_solver_prompt(
     )
 
 
+def build_code_single_solver_prompt(
+    question: str,
+    task_type: str,
+    fn_name: Optional[str] = None,
+) -> str:
+    interface = build_code_interface_prompt(task_type, fn_name=fn_name)
+    return (
+        "You are a solver agent.\n"
+        f"{interface}\n"
+        "\n---\nThe programming problem is:\n"
+        f"{question}\n"
+        "Solve the problem and put the final code inside one markdown code block, "
+        "for example ```python\\n<your solution code>\\n```."
+    )
+
+
 def build_code_planner_prompt_with_feedback_slot(
     question: str,
     task_type: str,
@@ -625,6 +641,46 @@ def build_math_solver_prompt(
     )
 
 
+def build_math_single_solver_prompt(
+    question: str,
+    args=None,
+) -> str:
+    is_choice_question = bool(
+        re.search(r"(?mi)^\s*[A-D]\s*[\.\):\-]\s+", question)
+    )
+    choice_old_prompt_mode = (
+        int(getattr(args, "choice_old_prompt", 0))
+        if (is_choice_question and args is not None)
+        else 0
+    )
+    if choice_old_prompt_mode == 1:
+        final_instruction = (
+            "Final Choice: put only the option letter in \\boxed{}, e.g., \\boxed{A}.\n\n"
+            "Solve the question given information and put the final answer inside \\boxed{}, for example \\boxed{1}."
+        )
+    elif choice_old_prompt_mode == 2:
+        final_instruction = (
+            "Final Choice: put only the option letter in \\boxed{}, e.g., \\boxed{A}."
+        )
+    elif choice_old_prompt_mode == 3:
+        final_instruction = (
+            "Final Choice: put only the option letter in \\boxed{}."
+        )
+    else:
+        final_instruction = (
+            "Solve the question and put the final choice inside \\boxed{}, for example \\boxed{A}."
+            if is_choice_question
+            else "Solve the question and put the final answer inside \\boxed{}, for example \\boxed{1}."
+        )
+    return (
+        "You are a solver agent.\n"
+        "The question is:\n"
+        "Question:\n"
+        f"{question}\n\n"
+        f"{final_instruction}"
+    )
+
+
 def build_math_refiner_prompt_with_slot(question: str) -> str:
     return build_math_refiner_prompt(question, PLANNER_SLOT)
 
@@ -655,5 +711,4 @@ def build_math_prompt_bundle(
             mas_shape=mas_shape,
         ).replace(REFINED_SLOT, refined_output),
     )
-
 

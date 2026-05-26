@@ -48,6 +48,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--style", required=True, choices=list(STYLE_SPECS.keys()))
     p.add_argument("--dataset", required=True, default="math500", choices=["math500", "medqa", "gpqa", "mbppplus"])
     p.add_argument("--dataset_split", default="")
+    p.add_argument(
+        "--method",
+        default="ours_recursive",
+        choices=[
+            "single",
+            "text",
+            "text_recursive",
+            "ours",
+            "ours_recursive",
+            "ours_recursive_no_feedback",
+        ],
+        help="Sequential baselines only. Other style families ignore this release runner option.",
+    )
+    p.add_argument("--system_name", default="", help="Display name to store in JSONL logs.")
+    p.add_argument("--num_samples", type=int, default=-1)
+    p.add_argument("--result_jsonl", default="")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--sample_seed", type=int, default=-1)
     p.add_argument("--num_recursive_rounds", type=int, default=3)
@@ -182,7 +198,7 @@ def build_common_cli(args: argparse.Namespace, dataset_arg: str, dataset_split: 
     out = [
         "--dataset", dataset_arg,
         "--dataset_split", dataset_split,
-        "--num_samples", "-1",
+        "--num_samples", str(args.num_samples),
         "--seed", str(args.seed),
         "--sample_seed", str(args.sample_seed),
         "--num_rollouts", "1",
@@ -203,6 +219,8 @@ def build_common_cli(args: argparse.Namespace, dataset_arg: str, dataset_split: 
     ]
     if args.device is not None:
         out.extend(["--device", str(args.device)])
+    if args.result_jsonl:
+        out.extend(["--result_jsonl", str(args.result_jsonl)])
     out.append("--do_sample")
     out.append("--ans")
     return out
@@ -248,6 +266,8 @@ def build_cli_for_style(
     if family == "sequential":
         choice_old_prompt = GPQA_DEFAULT_CHOICE_OLD_PROMPT if args.dataset.lower() == "gpqa" else 0
         cli = [
+            "--method", str(args.method),
+            "--style", str(args.style),
             "--mas_shape", "chain",
             "--agent1_model_name_or_path", str(paths["planner"]),
             "--agent2_model_name_or_path", str(paths["critic"]),
@@ -263,6 +283,8 @@ def build_cli_for_style(
             "--inner_adapter_type_fallback", "ln_res_adapter",
             "--outer_adapter_type_fallback", "outer_ln_res_adapter",
         ] + common
+        if args.system_name:
+            cli.extend(["--system_name", str(args.system_name)])
         return inference_mas, cli
 
     if family == "mixture":
@@ -337,7 +359,11 @@ def main() -> int:
     latent_steps_values = resolve_latent_steps(args.latent_length)
 
     max_new_tokens = infer_max_new_tokens(args.style, args.dataset)
-    print(f"[run] style={args.style} dataset={args.dataset} rounds={args.num_recursive_rounds} batch_size={args.batch_size} max_new_tokens={max_new_tokens}")
+    print(
+        f"[run] style={args.style} dataset={args.dataset} method={args.method} "
+        f"rounds={args.num_recursive_rounds} num_samples={args.num_samples} "
+        f"batch_size={args.batch_size} max_new_tokens={max_new_tokens}"
+    )
     results: List[Tuple[int, str, float]] = []
     for latent_steps in latent_steps_values:
         print(f"[latent_steps={latent_steps}]", flush=True)

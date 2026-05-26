@@ -50,6 +50,7 @@ from prompts import (
     PLANNER_SLOT,
     REFINED_SLOT,
     SYSTEM_PROMPT,
+    build_code_single_solver_prompt,
     build_code_planner_prompt,
     build_code_planner_prompt_with_feedback_slot,
     build_code_refiner_prompt,
@@ -60,6 +61,7 @@ from prompts import (
     build_math_planner_prompt_with_feedback_slot,
     build_math_refiner_prompt,
     build_math_refiner_prompt_with_slot,
+    build_math_single_solver_prompt,
     build_math_solver_prompt,
     build_math_solver_prompt_with_slots,
 )
@@ -100,9 +102,129 @@ RELEASE_RECOMMENDED_SETTINGS: Dict[Tuple[str, str], Dict[str, int]] = {
     ("sequential_scaled", "mbppplus"): {"seed": 42, "batch_size": 16, "latent_length": 16},
 }
 
+METHOD_CHOICES = (
+    "single",
+    "text",
+    "text_recursive",
+    "ours",
+    "ours_recursive",
+    "ours_recursive_no_feedback",
+)
+
+METHOD_DEFAULT_SYSTEM_NAMES = {
+    "single": "Single final agent",
+    "text": "Traditional text MAS",
+    "text_recursive": "Recursive-TextMAS",
+    "ours": "RecursiveMAS",
+    "ours_recursive": "RecursiveMAS",
+    "ours_recursive_no_feedback": "RecursiveMAS no-feedback",
+}
+
+LATENT_METHODS = {"ours", "ours_recursive", "ours_recursive_no_feedback"}
+RECURSIVE_METHODS = {"text_recursive", "ours_recursive", "ours_recursive_no_feedback"}
+
 
 def get_release_recommended_settings(style: str, dataset: str) -> Optional[Dict[str, int]]:
     return RELEASE_RECOMMENDED_SETTINGS.get((str(style).lower(), str(dataset).lower()))
+
+
+def infer_system_name(method: str, explicit: str = "") -> str:
+    if explicit.strip():
+        return explicit.strip()
+    return METHOD_DEFAULT_SYSTEM_NAMES.get(method, method)
+
+
+def recursion_rounds_for_log(method: str, rounds: int) -> Optional[int]:
+    if method in RECURSIVE_METHODS:
+        return int(rounds)
+    if method == "ours":
+        return 1
+    return None
+
+
+def feedback_enabled_for_log(method: str) -> Optional[bool]:
+    if method == "ours_recursive_no_feedback":
+        return False
+    if method in {"ours_recursive", "text_recursive"}:
+        return True
+    return None
+
+
+def build_sample_id(
+    dataset_name: str,
+    dataset_split: str,
+    sample_idx: int,
+    sample_metadata: Optional[Sequence[Mapping]],
+) -> str:
+    if sample_metadata is not None and sample_idx < len(sample_metadata):
+        meta = sample_metadata[sample_idx]
+        for key in ("sample_id", "question_id", "task_id", "id"):
+            value = meta.get(key) if isinstance(meta, Mapping) else None
+            if value not in (None, ""):
+                return f"{dataset_name}:{dataset_split}:{value}"
+    return f"{dataset_name}:{dataset_split}:{sample_idx}"
+
+
+def latent_tensor_stats(latent: Optional[torch.Tensor]) -> Optional[Dict[str, Any]]:
+    if latent is None:
+        return None
+    shape = [int(x) for x in latent.shape]
+    if latent.numel() == 0:
+        return {"norm": 0.0, "mean": 0.0, "std": 0.0, "shape": shape}
+    x = latent.detach().float()
+    return {
+        "norm": float(torch.linalg.vector_norm(x).item()),
+        "mean": float(x.mean().item()),
+        "std": float(x.std(unbiased=False).item()),
+        "shape": shape,
+    }
+
+
+def build_latent_stats_record(
+    planner_to_critic: Optional[torch.Tensor] = None,
+    critic_to_solver: Optional[torch.Tensor] = None,
+    solver_to_planner: Optional[torch.Tensor] = None,
+) -> Dict[str, Optional[Dict[str, Any]]]:
+    return {
+        "planner_to_critic": latent_tensor_stats(planner_to_critic),
+        "critic_to_solver": latent_tensor_stats(critic_to_solver),
+        "solver_to_planner": latent_tensor_stats(solver_to_planner),
+    }
+
+
+def estimate_token_counts_for_logging(
+    model_name_or_path: str,
+    input_texts: Sequence[str],
+    output_texts: Sequence[str],
+    trust_remote_code: bool,
+) -> List[int]:
+    if len(input_texts) != len(output_texts):
+        raise ValueError("input_texts and output_texts must have the same length.")
+    tokenizer = None
+    try:
+        tokenizer = load_agent_tokenizer(
+            model_name_or_path=model_name_or_path,
+            trust_remote_code=trust_remote_code,
+            agent_name="token-counter",
+        )
+        counts: List[int] = []
+        for prompt, output in zip(input_texts, output_texts):
+            text = f"{prompt or ''}\n{output or ''}"
+            ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+            counts.append(int(len(ids)))
+        return counts
+    except Exception as exc:
+        print(
+            f"[warn] failed to count tokens with solver tokenizer: {exc}. "
+            "Falling back to whitespace token counts."
+        )
+        return [
+            len(f"{prompt or ''} {output or ''}".split())
+            for prompt, output in zip(input_texts, output_texts)
+        ]
+    finally:
+        if tokenizer is not None:
+            release_resources(tokenizer)
 
 
 def resolve_dtype(dtype_str: str):
@@ -1641,6 +1763,9 @@ def render_inputs_for_logging(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--method", type=str, default="ours_recursive", choices=METHOD_CHOICES)
+    parser.add_argument("--style", type=str, default="")
+    parser.add_argument("--system_name", type=str, default="")
     parser.add_argument("--mas_shape", type=str, default="chain", choices=["chain"])
     parser.add_argument("--dataset", type=str, default="openai/gsm8k")
     parser.add_argument("--dataset_split", type=str, default="test")
@@ -1815,7 +1940,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    args.method = "ours_recursive"
+    run_wall_start = time.time()
     global _GEN_TOP_K, _GEN_MIN_P, _GEN_REPETITION_PENALTY
 
     if args.mas_shape != "chain":
@@ -1824,8 +1949,10 @@ def main() -> None:
         raise ValueError("--max_new_tokens must be positive.")
     if args.num_rollouts <= 0:
         raise ValueError("--num_rollouts must be positive.")
-    if args.num_recursive_rounds <= 0:
-        raise ValueError("--num_recursive_rounds must be positive.")
+    if args.method in RECURSIVE_METHODS and args.num_recursive_rounds <= 0:
+        raise ValueError("--num_recursive_rounds must be positive for recursive methods.")
+    if args.method not in RECURSIVE_METHODS and args.num_recursive_rounds < 0:
+        raise ValueError("--num_recursive_rounds must be non-negative.")
     if args.top_k < -1:
         raise ValueError("--top_k must be >= -1.")
     if args.min_p < -1.0:
@@ -1844,7 +1971,10 @@ def main() -> None:
     planner_model = args.agent1_model_name_or_path
     refiner_model = args.agent2_model_name_or_path
     solver_model = args.agent3_model_name_or_path
-    if not planner_model or not refiner_model or not solver_model:
+    if args.method == "single":
+        if not solver_model:
+            raise ValueError("Please provide --agent3_model_name_or_path for --method single.")
+    elif not planner_model or not refiner_model or not solver_model:
         raise ValueError(
             "Please provide all of "
             "--agent1_model_name_or_path/--agent2_model_name_or_path/--agent3_model_name_or_path."
@@ -1852,7 +1982,11 @@ def main() -> None:
 
     if args.latent_steps < 0:
         raise ValueError("--latent_steps must be non-negative.")
-    if not args.agent1_inner_aligner_path or not args.agent2_inner_aligner_path or not args.agent3_inner_aligner_path:
+    if args.method in LATENT_METHODS and (
+        not args.agent1_inner_aligner_path
+        or not args.agent2_inner_aligner_path
+        or not args.agent3_inner_aligner_path
+    ):
         raise ValueError(
             "Please provide --agent1_inner_aligner_path, --agent2_inner_aligner_path, "
             "and --agent3_inner_aligner_path."
@@ -1877,11 +2011,15 @@ def main() -> None:
     outer_12_type = args.outer_adapter_type_fallback
     outer_23_type = args.outer_adapter_type_fallback
     outer_31_type = args.outer_adapter_type_fallback
-    outer_12_path, outer_23_path, outer_31_path = resolve_recursive_outer_paths(
-        outer_12_path=args.outer_12_path,
-        outer_23_path=args.outer_23_path,
-        outer_31_path=args.outer_31_path,
-    )
+    outer_12_path = args.outer_12_path
+    outer_23_path = args.outer_23_path
+    outer_31_path = args.outer_31_path
+    if args.method in LATENT_METHODS:
+        outer_12_path, outer_23_path, outer_31_path = resolve_recursive_outer_paths(
+            outer_12_path=args.outer_12_path,
+            outer_23_path=args.outer_23_path,
+            outer_31_path=args.outer_31_path,
+        )
 
     dataset_name, questions, gold_answers, sample_metadata = load_eval_questions_and_answers(
         dataset=args.dataset,
@@ -1907,8 +2045,9 @@ def main() -> None:
         task_types = [str(meta.get("task_type", "complete")) for meta in sample_metadata]
         fn_names = [meta.get("fn_name") if isinstance(meta, dict) else None for meta in sample_metadata]
 
+    system_name = infer_system_name(args.method, args.system_name)
     print(
-        f"Running method=ours_recursive on {len(questions)} samples "
+        f"Running method={args.method} system={system_name!r} on {len(questions)} samples "
         f"(planner={planner_model}, refiner={refiner_model}, solver={solver_model}, mas_shape={args.mas_shape})"
     )
     if args.num_rollouts > 1:
@@ -2057,6 +2196,18 @@ def main() -> None:
             )
         return build_math_solver_prompt(question, refined_plan, args)
 
+    def build_single_solver_prompt_text(question: str, sample_idx: int) -> str:
+        if is_code_eval:
+            if task_types is None:
+                raise RuntimeError("Missing task_types for code single-solver prompt.")
+            fn_name = fn_names[sample_idx] if fn_names is not None else None
+            return build_code_single_solver_prompt(
+                question,
+                task_types[sample_idx],
+                fn_name=fn_name,
+            )
+        return build_math_single_solver_prompt(question, args)
+
     agent1_inputs: List[str] = [
         build_planner_prompt_text(planner_questions[i], i)
         for i in range(len(planner_questions))
@@ -2079,8 +2230,37 @@ def main() -> None:
 
     solver_rollout_latents: Optional[List[torch.Tensor]] = None
     text_recursive_solver_outputs_rounds_for_log: Optional[List[List[str]]] = None
+    latent_stats_by_sample: Optional[List[Dict[str, Optional[Dict[str, Any]]]]] = None
+    latent_stats_by_round_for_log: Optional[List[List[Dict[str, Optional[Dict[str, Any]]]]]] = None
 
-    if args.method == "text":
+    if args.method == "single":
+        solver_prompts = [
+            build_single_solver_prompt_text(questions[i], i)
+            for i in range(len(questions))
+        ]
+        solver_outputs, solver_inputs_rendered = run_text_generation_stage(
+            stage_name="single-final",
+            model_name_or_path=solver_model,
+            user_prompts=solver_prompts,
+            batch_size=args.batch_size,
+            max_new_tokens=args.max_new_tokens,
+            do_sample=args.do_sample,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            device=device,
+            dtype=model_dtype,
+            trust_remote_code=trust_remote_code,
+            enable_thinking=enable_thinking,
+        )
+        not_used = ["<not used by single final agent>"] * len(questions)
+        agent1_inputs_for_log = list(not_used)
+        agent1_outputs = list(not_used)
+        agent2_inputs_for_log = list(not_used)
+        agent2_outputs = list(not_used)
+        agent3_inputs = solver_prompts
+        agent3_outputs = solver_outputs
+        agent3_inputs_for_log = solver_inputs_rendered
+    elif args.method == "text":
         planner_outputs, planner_inputs_rendered = run_text_generation_stage(
             stage_name="planner",
             model_name_or_path=planner_model,
@@ -2333,6 +2513,13 @@ def main() -> None:
         planner_to_refiner_desc = [format_latent_info(x) for x in planner_to_refiner]
         refiner_to_solver_desc = [format_latent_info(x) for x in refiner_to_solver]
         solver_rollout_latents = [x for x in refiner_to_solver]
+        latent_stats_by_sample = [
+            build_latent_stats_record(
+                planner_to_critic=planner_to_refiner[i],
+                critic_to_solver=refiner_to_solver[i],
+            )
+            for i in range(len(questions))
+        ]
 
         agent1_outputs = [
             f"to_agent2={planner_to_refiner_desc[i]}"
@@ -2376,15 +2563,16 @@ def main() -> None:
             a3_in = a3_in.replace(REFINED_SLOT, refiner_to_solver_desc[i])
             agent3_inputs.append(a3_in)
         agent3_outputs = solver_outputs
-    else:
+    elif args.method in {"ours_recursive", "ours_recursive_no_feedback"}:
         recursive_rounds = int(args.num_recursive_rounds)
+        use_recursive_feedback = args.method == "ours_recursive"
         planner_to_refiner_rounds: List[List[torch.Tensor]] = []
         refiner_to_solver_rounds: List[List[torch.Tensor]] = []
         feedback_to_planner_rounds: List[List[torch.Tensor]] = []
 
         feedback_to_planner: Optional[List[torch.Tensor]] = None
         for round_idx in range(recursive_rounds):
-            if round_idx == 0:
+            if round_idx == 0 or not use_recursive_feedback:
                 planner_to_refiner = run_planner_latent_stage(
                     model_name_or_path=planner_model,
                     questions=questions,
@@ -2420,6 +2608,8 @@ def main() -> None:
                     trust_remote_code=trust_remote_code,
                     inner_adapter_type_fallback=args.inner_adapter_type_fallback,
                     enable_thinking=enable_thinking,
+                    task_types=task_types,
+                    fn_names=fn_names,
                 )
             planner_to_refiner = [x for x in planner_to_refiner]
             planner_to_refiner_rounds.append(planner_to_refiner)
@@ -2445,7 +2635,7 @@ def main() -> None:
             refiner_to_solver = [x for x in refiner_to_solver]
             refiner_to_solver_rounds.append(refiner_to_solver)
 
-            if round_idx < recursive_rounds - 1:
+            if round_idx < recursive_rounds - 1 and use_recursive_feedback:
                 feedback_to_planner = run_solver_feedback_latent_stage(
                     model_name_or_path=solver_model,
                     questions=questions,
@@ -2497,6 +2687,36 @@ def main() -> None:
             [format_latent_info(x) for x in round_latents] for round_latents in feedback_to_planner_rounds
         ]
         solver_rollout_latents = [x for x in final_refiner_to_solver]
+        latent_stats_by_sample = []
+        latent_stats_by_round_for_log = []
+        for i in range(len(questions)):
+            sample_round_stats: List[Dict[str, Optional[Dict[str, Any]]]] = []
+            for rid in range(recursive_rounds):
+                feedback_latent = (
+                    feedback_to_planner_rounds[rid][i]
+                    if rid < len(feedback_to_planner_rounds)
+                    else None
+                )
+                sample_round_stats.append(
+                    build_latent_stats_record(
+                        planner_to_critic=planner_to_refiner_rounds[rid][i],
+                        critic_to_solver=refiner_to_solver_rounds[rid][i],
+                        solver_to_planner=feedback_latent,
+                    )
+                )
+            latent_stats_by_round_for_log.append(sample_round_stats)
+            final_feedback_latent = (
+                feedback_to_planner_rounds[-1][i]
+                if feedback_to_planner_rounds
+                else None
+            )
+            latent_stats_by_sample.append(
+                build_latent_stats_record(
+                    planner_to_critic=planner_to_refiner_rounds[-1][i],
+                    critic_to_solver=refiner_to_solver_rounds[-1][i],
+                    solver_to_planner=final_feedback_latent,
+                )
+            )
 
         agent1_outputs = []
         for i in range(len(questions)):
@@ -2555,10 +2775,13 @@ def main() -> None:
             build_planner_prompt_text(planner_questions[i], i)
             for i in range(len(questions))
         ]
-        a1_roundk_prompts = [
-            build_planner_prompt_text(planner_questions[i], i, FEEDBACK_SLOT)
-            for i in range(len(questions))
-        ]
+        if use_recursive_feedback:
+            a1_roundk_prompts = [
+                build_planner_prompt_text(planner_questions[i], i, FEEDBACK_SLOT)
+                for i in range(len(questions))
+            ]
+        else:
+            a1_roundk_prompts = list(a1_round1_prompts)
         a1_round1_rendered = render_inputs_for_logging(
             model_name_or_path=planner_model,
             user_prompts=a1_round1_prompts,
@@ -2577,10 +2800,15 @@ def main() -> None:
         for i in range(len(questions)):
             parts = [f"[Round1 planner input]\n{a1_round1_rendered[i]}"]
             for rid in range(1, recursive_rounds):
-                fb_desc = feedback_to_planner_desc_rounds[rid - 1][i]
-                parts.append(f"[Round{rid} feedback latent] {fb_desc}")
+                if use_recursive_feedback:
+                    fb_desc = feedback_to_planner_desc_rounds[rid - 1][i]
+                    parts.append(f"[Round{rid} feedback latent] {fb_desc}")
+                else:
+                    parts.append(f"[Round{rid} feedback latent] <disabled>")
                 parts.append(f"[Round{rid + 1} planner input]\n{a1_roundk_rendered[i]}")
             agent1_inputs_for_log.append("\n\n".join(parts))
+    else:
+        raise ValueError(f"Unsupported --method: {args.method}")
 
     ans_retry_count = 0
     ans_retry_max_new_tokens = int(args.ans_max_new_tokens)
@@ -2616,7 +2844,7 @@ def main() -> None:
             enable_thinking=enable_thinking,
         )
     if not agent2_inputs_for_log:
-        if args.method in {"ours", "ours_recursive"}:
+        if args.method in LATENT_METHODS:
             if is_code_eval:
                 if task_types is None:
                     raise RuntimeError("Missing task_types for code refiner slot logging prompts.")
@@ -2648,7 +2876,7 @@ def main() -> None:
                 enable_thinking=enable_thinking,
             )
     if not agent3_inputs_for_log:
-        if args.method in {"ours", "ours_recursive"}:
+        if args.method in LATENT_METHODS:
             if is_code_eval:
                 if task_types is None:
                     raise RuntimeError("Missing task_types for code solver slot logging prompts.")
@@ -2697,7 +2925,26 @@ def main() -> None:
                 agent3_outputs_by_rollout.append(list(agent3_outputs))
                 continue
 
-            if args.method == "text":
+            if args.method == "single":
+                solver_prompts_r = [
+                    build_single_solver_prompt_text(questions[i], i)
+                    for i in range(len(questions))
+                ]
+                rollout_outputs = run_text_generation_stage(
+                    stage_name=f"single-final-r{rollout_idx + 1}",
+                    model_name_or_path=solver_model,
+                    user_prompts=solver_prompts_r,
+                    batch_size=args.batch_size,
+                    max_new_tokens=args.max_new_tokens,
+                    do_sample=args.do_sample,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    device=device,
+                    dtype=model_dtype,
+                    trust_remote_code=trust_remote_code,
+                    enable_thinking=enable_thinking,
+                )[0]
+            elif args.method == "text":
                 planner_outputs_r, _ = run_text_generation_stage(
                     stage_name=f"planner-r{rollout_idx + 1}",
                     model_name_or_path=planner_model,
@@ -2982,12 +3229,56 @@ def main() -> None:
             if any(rollout_eval_math[r][i][2] for r in range(args.num_rollouts)):
                 pass_correct_total += 1
     pass_at_k = 100.0 * pass_correct_total / total if total > 0 else 0.0
+    runtime_total_sec = time.time() - run_wall_start
+    runtime_per_sample_sec = runtime_total_sec / total if total > 0 else 0.0
+    token_counts_for_log: List[int] = [0 for _ in range(total)]
+    if result_jsonl_path:
+        token_counts_for_log = estimate_token_counts_for_logging(
+            model_name_or_path=solver_model,
+            input_texts=agent3_inputs_for_log,
+            output_texts=agent3_outputs_by_rollout[0],
+            trust_remote_code=trust_remote_code,
+        )
+
+    def baseline_record_fields(sample_idx: int, final_answer: Any, is_correct: bool) -> Dict[str, Any]:
+        fields: Dict[str, Any] = {
+            "sample_id": build_sample_id(dataset_name, args.dataset_split, sample_idx, sample_metadata),
+            "sample_idx": sample_idx,
+            "dataset": args.dataset,
+            "dataset_name": dataset_name,
+            "dataset_split": args.dataset_split,
+            "system": system_name,
+            "style": args.style or None,
+            "method": args.method,
+            "mas_shape": args.mas_shape,
+            "recursion_rounds": recursion_rounds_for_log(args.method, args.num_recursive_rounds),
+            "feedback_enabled": feedback_enabled_for_log(args.method),
+            "latent_steps": args.latent_steps if args.method in LATENT_METHODS else None,
+            "question": questions[sample_idx],
+            "ground_truth": gold_answers[sample_idx],
+            "final_answer": final_answer,
+            "raw_final_output": agent3_outputs_by_rollout[0][sample_idx],
+            "is_correct": bool(is_correct),
+            "runtime_sec": round(runtime_per_sample_sec, 4),
+            "runtime_total_sec": round(runtime_total_sec, 4),
+            "tokens": token_counts_for_log[sample_idx],
+            "latent_stats": (
+                latent_stats_by_sample[sample_idx]
+                if latent_stats_by_sample is not None
+                else None
+            ),
+            "rollout_idx": 0,
+            "sample_seed": rollout_seeds[0],
+        }
+        if latent_stats_by_round_for_log is not None:
+            fields["latent_stats_by_round"] = latent_stats_by_round_for_log[sample_idx]
+        return fields
 
     if args.num_rollouts == 1:
         print("=" * 120)
         print("Per-Sample Logs")
         print("=" * 120)
-        if args.method in {"ours", "ours_recursive"}:
+        if args.method in LATENT_METHODS:
             print("[note] Agent2/Agent3 input logs show slot placeholders to mark latent embedding injection positions.")
 
         agent3_outputs_for_log = list(agent3_outputs_by_rollout[0])
@@ -3012,24 +3303,17 @@ def main() -> None:
                 eval_result = dict(code_eval.get("eval", {}))
                 is_correct = bool(code_eval.get("correct", False))
                 if result_jsonl_path:
-                    sample_records.append(
+                    record = baseline_record_fields(i, parsed_code, is_correct)
+                    record.update(
                         {
-                            "sample_idx": i,
-                            "dataset": args.dataset,
-                            "dataset_split": args.dataset_split,
-                            "method": args.method,
-                            "mas_shape": args.mas_shape,
-                            "latent_steps": args.latent_steps if args.method in {"ours", "ours_recursive"} else None,
-                            "question": questions[i],
                             "gold_answer_raw": gold_answers[i],
                             "pred_code_parsed": parsed_code,
                             "parse_ok": bool(code_eval.get("parse_ok", False)),
                             "correct": is_correct,
                             "eval": eval_result,
-                            "rollout_idx": 0,
-                            "sample_seed": rollout_seeds[0],
                         }
                     )
+                    sample_records.append(record)
 
                 print("=" * 120)
                 print(f"Sample {i + 1}/{total}")
@@ -3056,25 +3340,18 @@ def main() -> None:
                 gold_parsed, pred_parsed, is_correct, gold_norm, pred_norm = rollout_eval_math[0][i]
                 pred_display = pred_parsed if pred_parsed is not None else "<NOT_FOUND>"
                 if result_jsonl_path:
-                    sample_records.append(
+                    record = baseline_record_fields(i, pred_parsed, bool(is_correct))
+                    record.update(
                         {
-                            "sample_idx": i,
-                            "dataset": args.dataset,
-                            "dataset_split": args.dataset_split,
-                            "method": args.method,
-                            "mas_shape": args.mas_shape,
-                            "latent_steps": args.latent_steps if args.method in {"ours", "ours_recursive"} else None,
-                            "question": questions[i],
                             "gold_answer_raw": gold_answers[i],
                             "gold_answer_parsed": gold_parsed,
                             "pred_answer_parsed": pred_parsed,
                             "correct": bool(is_correct),
                             "gold_norm": gold_norm,
                             "pred_norm": pred_norm,
-                            "rollout_idx": 0,
-                            "sample_seed": rollout_seeds[0],
                         }
                     )
+                    sample_records.append(record)
                 print("=" * 120)
                 print(f"Sample {i + 1}/{total}")
                 print("-" * 120)
@@ -3138,22 +3415,24 @@ def main() -> None:
                             }
                         )
 
-                row_obj: Dict[str, Any] = {
-                    "sample_idx": i,
-                    "dataset": args.dataset,
-                    "dataset_split": args.dataset_split,
-                    "method": args.method,
-                    "mas_shape": args.mas_shape,
-                    "latent_steps": args.latent_steps if args.method in {"ours", "ours_recursive"} else None,
-                    "question": questions[i],
-                    "gold_answer_raw": gold_answers[i],
-                    "pass_at_k_correct": any(rec["correct"] for rec in rollout_records),
-                    "rollouts": rollout_records,
-                }
+                pass_correct = any(rec["correct"] for rec in rollout_records)
                 if is_code_eval:
-                    row_obj["pred_code_parsed"] = rollout_records[0].get("pred_code_parsed", "")
+                    final_answer = rollout_records[0].get("pred_code_parsed", "")
+                else:
+                    final_answer = rollout_records[0].get("pred_answer_parsed")
+                row_obj: Dict[str, Any] = baseline_record_fields(i, final_answer, bool(pass_correct))
+                row_obj.update(
+                    {
+                        "gold_answer_raw": gold_answers[i],
+                        "pass_at_k_correct": bool(pass_correct),
+                        "rollouts": rollout_records,
+                    }
+                )
+                if is_code_eval:
+                    row_obj["pred_code_parsed"] = final_answer
                 else:
                     row_obj["gold_answer_parsed"] = rollout_eval_math[0][i][0]
+                    row_obj["pred_answer_parsed"] = final_answer
                 sample_records.append(row_obj)
 
     if args.num_rollouts == 1:
@@ -3180,13 +3459,19 @@ def main() -> None:
             summary_record = {
                 "type": "summary",
                 "dataset": args.dataset,
+                "dataset_name": dataset_name,
                 "dataset_split": args.dataset_split,
+                "system": system_name,
+                "style": args.style or None,
                 "method": args.method,
                 "mas_shape": args.mas_shape,
-                "latent_steps": args.latent_steps if args.method in {"ours", "ours_recursive"} else None,
+                "recursion_rounds": recursion_rounds_for_log(args.method, args.num_recursive_rounds),
+                "feedback_enabled": feedback_enabled_for_log(args.method),
+                "latent_steps": args.latent_steps if args.method in LATENT_METHODS else None,
                 "num_samples": total,
                 "num_rollouts": args.num_rollouts,
                 "sample_seed_base": base_sample_seed,
+                "runtime_total_sec": round(runtime_total_sec, 4),
                 "per_rollout_num_correct": rollout_correct_counts,
                 "per_rollout_accuracy": [
                     (100.0 * n / total if total > 0 else 0.0) for n in rollout_correct_counts
