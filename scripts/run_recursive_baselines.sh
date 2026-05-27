@@ -119,7 +119,7 @@ for dataset in $DATASETS; do
   run_one "$dataset" "traditional_text_mas" "Traditional text MAS" "text" 1
   run_one "$dataset" "recursive_text_mas_r${TEXT_RECURSION_ROUNDS}" "Recursive-TextMAS" "text_recursive" "$TEXT_RECURSION_ROUNDS"
 
-  for rounds in 1 2 3 4 5; do
+  for rounds in 1 2 3; do
     run_one "$dataset" "recursivemas_r${rounds}" "RecursiveMAS" "ours_recursive" "$rounds"
   done
 
