@@ -75,6 +75,7 @@ from .lcb_utils import (
     is_mbppplus_dataset,
     load_mbppplus_records,
 )
+from .latent_contagion import PerturbConfig, maybe_perturb
 
 from modeling import (
     Adapter,
@@ -1083,6 +1084,8 @@ def run_planner_latent_stage(
     trust_remote_code: bool,
     inner_adapter_type_fallback: str,
     enable_thinking: bool,
+    perturb_cfg: Optional[PerturbConfig] = None,
+    round_idx: int = 0,
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
 ) -> List[torch.Tensor]:
@@ -1152,6 +1155,7 @@ def run_planner_latent_stage(
         )
         planner_self = run_inner_adapter(inner_1, hidden_rollout, output_dtype=planner_embed_dtype)
         lat12 = run_outer_adapter(outer_12, planner_self, output_dtype=planner_embed_dtype)
+        lat12, _meta = maybe_perturb(lat12, perturb_cfg, "p2c", round_idx, start)
 
         for i in range(lat12.size(0)):
             planner_to_refiner.append(lat12[i].detach().cpu())
@@ -1175,6 +1179,8 @@ def run_refiner_latent_stage(
     trust_remote_code: bool,
     inner_adapter_type_fallback: str,
     enable_thinking: bool,
+    perturb_cfg: Optional[PerturbConfig] = None,
+    round_idx: int = 0,
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
 ) -> List[torch.Tensor]:
@@ -1273,6 +1279,7 @@ def run_refiner_latent_stage(
         )
         refiner_self = run_inner_adapter(inner_2, hidden_rollout, output_dtype=refiner_embed_dtype)
         mapped = run_outer_adapter(outer_23, refiner_self, output_dtype=refiner_embed_dtype)
+        mapped, _meta = maybe_perturb(mapped, perturb_cfg, "c2s", round_idx, start)
         for i in range(mapped.size(0)):
             refiner_to_solver.append(mapped[i].detach().cpu())
 
@@ -1296,6 +1303,8 @@ def run_solver_feedback_latent_stage(
     inner_adapter_type_fallback: str,
     enable_thinking: bool,
     args: argparse.Namespace,
+    perturb_cfg: Optional[PerturbConfig] = None,
+    round_idx: int = 0,
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
 ) -> List[torch.Tensor]:
@@ -1396,6 +1405,7 @@ def run_solver_feedback_latent_stage(
         )
         solver_self = run_inner_adapter(inner_3, hidden_rollout, output_dtype=solver_embed_dtype)
         mapped_feedback = run_outer_adapter(outer_31, solver_self, output_dtype=torch.float32)
+        mapped_feedback, _meta = maybe_perturb(mapped_feedback, perturb_cfg, "s2p", round_idx, start)
         for i in range(mapped_feedback.size(0)):
             feedback_latents.append(mapped_feedback[i].detach().cpu())
 
@@ -1418,6 +1428,8 @@ def run_planner_feedback_latent_stage(
     trust_remote_code: bool,
     inner_adapter_type_fallback: str,
     enable_thinking: bool,
+    perturb_cfg: Optional[PerturbConfig] = None,
+    round_idx: int = 0,
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
 ) -> List[torch.Tensor]:
@@ -1516,6 +1528,7 @@ def run_planner_feedback_latent_stage(
         )
         planner_self = run_inner_adapter(inner_1, hidden_rollout, output_dtype=planner_embed_dtype)
         lat12 = run_outer_adapter(outer_12, planner_self, output_dtype=planner_embed_dtype)
+        lat12, _meta = maybe_perturb(lat12, perturb_cfg, "p2c", round_idx, start)
         for i in range(lat12.size(0)):
             planner_to_refiner.append(lat12[i].detach().cpu())
 
@@ -1808,6 +1821,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--outer_12_path", type=str, default=None)
     parser.add_argument("--outer_23_path", type=str, default=None)
     parser.add_argument("--outer_31_path", type=str, default=None)
+    parser.add_argument("--lc_mode", type=str, default="none", choices=["none", "one_shot"])
+    parser.add_argument("--lc_site", type=str, default="", choices=["", "p2c", "c2s", "s2p"])
+    parser.add_argument("--lc_epsilon", type=float, default=0.0)
+    parser.add_argument("--lc_round", type=int, default=0)
+    parser.add_argument("--lc_seed", type=int, default=42)
     parser.add_argument(
         "--inner_adapter_type_fallback",
         type=str,
@@ -1990,6 +2008,34 @@ def main() -> None:
         raise ValueError(
             "Please provide --agent1_inner_aligner_path, --agent2_inner_aligner_path, "
             "and --agent3_inner_aligner_path."
+        )
+    if args.lc_epsilon < 0.0:
+        raise ValueError("--lc_epsilon must be non-negative.")
+    if args.lc_round < 0:
+        raise ValueError("--lc_round must be non-negative.")
+    if args.lc_mode == "one_shot" and args.lc_epsilon > 0.0:
+        if args.method not in LATENT_METHODS:
+            raise ValueError("--lc_mode one_shot is only supported for latent methods.")
+        if not args.lc_site:
+            raise ValueError("--lc_site must be set when one-shot latent contagion is enabled.")
+    perturb_cfg = PerturbConfig(
+        mode=args.lc_mode,
+        site=args.lc_site,
+        epsilon=float(args.lc_epsilon),
+        round_idx=int(args.lc_round),
+        seed=int(args.lc_seed),
+        enabled=(
+            args.method in LATENT_METHODS
+            and args.lc_mode == "one_shot"
+            and float(args.lc_epsilon) > 0.0
+        ),
+    )
+    if perturb_cfg.enabled:
+        print(
+            "[latent-contagion] "
+            f"mode={perturb_cfg.mode} site={perturb_cfg.site} "
+            f"epsilon={perturb_cfg.epsilon:g} round_idx={perturb_cfg.round_idx} "
+            f"seed={perturb_cfg.seed}"
         )
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -2472,6 +2518,8 @@ def main() -> None:
             trust_remote_code=trust_remote_code,
             inner_adapter_type_fallback=args.inner_adapter_type_fallback,
             enable_thinking=enable_thinking,
+            perturb_cfg=perturb_cfg,
+            round_idx=0,
             task_types=task_types,
             fn_names=fn_names,
         )
@@ -2490,6 +2538,8 @@ def main() -> None:
             trust_remote_code=trust_remote_code,
             inner_adapter_type_fallback=args.inner_adapter_type_fallback,
             enable_thinking=enable_thinking,
+            perturb_cfg=perturb_cfg,
+            round_idx=0,
             task_types=task_types,
             fn_names=fn_names,
         )
@@ -2587,6 +2637,8 @@ def main() -> None:
                     trust_remote_code=trust_remote_code,
                     inner_adapter_type_fallback=args.inner_adapter_type_fallback,
                     enable_thinking=enable_thinking,
+                    perturb_cfg=perturb_cfg,
+                    round_idx=round_idx,
                     task_types=task_types,
                     fn_names=fn_names,
                 )
@@ -2608,6 +2660,8 @@ def main() -> None:
                     trust_remote_code=trust_remote_code,
                     inner_adapter_type_fallback=args.inner_adapter_type_fallback,
                     enable_thinking=enable_thinking,
+                    perturb_cfg=perturb_cfg,
+                    round_idx=round_idx,
                     task_types=task_types,
                     fn_names=fn_names,
                 )
@@ -2629,6 +2683,8 @@ def main() -> None:
                 trust_remote_code=trust_remote_code,
                 inner_adapter_type_fallback=args.inner_adapter_type_fallback,
                 enable_thinking=enable_thinking,
+                perturb_cfg=perturb_cfg,
+                round_idx=round_idx,
                 task_types=task_types,
                 fn_names=fn_names,
             )
@@ -2652,6 +2708,8 @@ def main() -> None:
                     inner_adapter_type_fallback=args.inner_adapter_type_fallback,
                     enable_thinking=enable_thinking,
                     args=args,
+                    perturb_cfg=perturb_cfg,
+                    round_idx=round_idx,
                     task_types=task_types,
                     fn_names=fn_names,
                 )
@@ -3254,6 +3312,12 @@ def main() -> None:
             "recursion_rounds": recursion_rounds_for_log(args.method, args.num_recursive_rounds),
             "feedback_enabled": feedback_enabled_for_log(args.method),
             "latent_steps": args.latent_steps if args.method in LATENT_METHODS else None,
+            "lc_mode": args.lc_mode,
+            "lc_site": args.lc_site,
+            "lc_epsilon": float(args.lc_epsilon),
+            "lc_round": int(args.lc_round),
+            "lc_seed": int(args.lc_seed),
+            "lc_enabled": bool(perturb_cfg.enabled),
             "question": questions[sample_idx],
             "ground_truth": gold_answers[sample_idx],
             "final_answer": final_answer,
@@ -3468,6 +3532,12 @@ def main() -> None:
                 "recursion_rounds": recursion_rounds_for_log(args.method, args.num_recursive_rounds),
                 "feedback_enabled": feedback_enabled_for_log(args.method),
                 "latent_steps": args.latent_steps if args.method in LATENT_METHODS else None,
+                "lc_mode": args.lc_mode,
+                "lc_site": args.lc_site,
+                "lc_epsilon": float(args.lc_epsilon),
+                "lc_round": int(args.lc_round),
+                "lc_seed": int(args.lc_seed),
+                "lc_enabled": bool(perturb_cfg.enabled),
                 "num_samples": total,
                 "num_rollouts": args.num_rollouts,
                 "sample_seed_base": base_sample_seed,

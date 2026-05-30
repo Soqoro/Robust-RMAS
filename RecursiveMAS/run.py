@@ -72,6 +72,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--temperature", type=float, default=0.6)
     p.add_argument("--top_p", type=float, default=0.95)
     p.add_argument("--top_k", type=int, default=-1)
+    p.add_argument("--deterministic", type=int, default=1, choices=[0, 1])
+    p.add_argument("--lc_mode", type=str, default="none", choices=["none", "one_shot"])
+    p.add_argument("--lc_site", type=str, default="", choices=["", "p2c", "c2s", "s2p"])
+    p.add_argument("--lc_epsilon", type=float, default=0.0)
+    p.add_argument("--lc_round", type=int, default=0)
+    p.add_argument("--lc_seed", type=int, default=42)
     p.add_argument("--trust_remote_code", type=int, default=1, choices=[0, 1])
     p.add_argument("--device", default=None)
     return p
@@ -221,7 +227,18 @@ def build_common_cli(args: argparse.Namespace, dataset_arg: str, dataset_split: 
         out.extend(["--device", str(args.device)])
     if args.result_jsonl:
         out.extend(["--result_jsonl", str(args.result_jsonl)])
-    out.append("--do_sample")
+    if str(STYLE_SPECS[args.style]["family"]) == "sequential":
+        out.extend(
+            [
+                "--lc_mode", str(args.lc_mode),
+                "--lc_site", str(args.lc_site),
+                "--lc_epsilon", str(args.lc_epsilon),
+                "--lc_round", str(args.lc_round),
+                "--lc_seed", str(args.lc_seed),
+            ]
+        )
+    if int(args.deterministic) == 0:
+        out.append("--do_sample")
     out.append("--ans")
     return out
 
@@ -362,7 +379,8 @@ def main() -> int:
     print(
         f"[run] style={args.style} dataset={args.dataset} method={args.method} "
         f"rounds={args.num_recursive_rounds} num_samples={args.num_samples} "
-        f"batch_size={args.batch_size} max_new_tokens={max_new_tokens}"
+        f"batch_size={args.batch_size} max_new_tokens={max_new_tokens} "
+        f"deterministic={args.deterministic}"
     )
     results: List[Tuple[int, str, float]] = []
     for latent_steps in latent_steps_values:
