@@ -26,12 +26,22 @@ SITES="${SITES:-p2c c2s s2p}"
 EPSILONS="${EPSILONS:-0 1e-4 3e-4 1e-3 3e-3 1e-2 3e-2 1e-1}"
 ROUNDS="${ROUNDS:-1 2 3 4 5}"
 SEEDS="${SEEDS:-42}"
+LC_MODE="${LC_MODE:-one_shot}"
+LC_ROUND="${LC_ROUND:-0}"
 NUM_SAMPLES="${NUM_SAMPLES:--1}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 LATENT_LENGTH="${LATENT_LENGTH:-48}"
 TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-1}"
 OUT_ROOT="${OUT_ROOT:-${OUT_DIR:-outputs/latent_contagion/experiment_b}}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
+
+if [[ -z "${RUN_SUBDIR:-}" ]]; then
+  if [[ "$LC_MODE" == "one_shot" ]]; then
+    RUN_SUBDIR="oneshot"
+  else
+    RUN_SUBDIR="$LC_MODE"
+  fi
+fi
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-7}"
 export CONDA_NO_PLUGINS=true
@@ -106,7 +116,7 @@ R=""
 SEED=""
 select_config "$TASK_ID"
 
-RUN_DIR="$OUT_ROOT/$DATASET/oneshot"
+RUN_DIR="$OUT_ROOT/$DATASET/$RUN_SUBDIR"
 LOG_DIR="$RUN_DIR/logs"
 RESULT_JSONL="$RUN_DIR/site=${SITE}_eps=${EPS}_R=${R}_seed=${SEED}.jsonl"
 RUN_LOG="$LOG_DIR/site=${SITE}_eps=${EPS}_R=${R}_seed=${SEED}.log"
@@ -121,6 +131,7 @@ echo "[experiment_b] sites=$SITES"
 echo "[experiment_b] epsilons=$EPSILONS"
 echo "[experiment_b] rounds=$ROUNDS"
 echo "[experiment_b] seeds=$SEEDS"
+echo "[experiment_b] lc_mode=$LC_MODE lc_round=$LC_ROUND run_subdir=$RUN_SUBDIR"
 echo "[experiment_b] selected dataset=$DATASET site=$SITE eps=$EPS rounds=$R seed=$SEED"
 echo "[experiment_b] num_samples=$NUM_SAMPLES batch_size=$BATCH_SIZE latent_length=$LATENT_LENGTH"
 echo "[experiment_b] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
@@ -138,6 +149,9 @@ nvidia-smi || true
   echo "epsilons=$EPSILONS"
   echo "rounds=$ROUNDS"
   echo "seeds=$SEEDS"
+  echo "lc_mode=$LC_MODE"
+  echo "lc_round=$LC_ROUND"
+  echo "run_subdir=$RUN_SUBDIR"
   echo "task_id=$TASK_ID"
   echo "total_tasks=$TOTAL_TASKS"
   echo "selected_dataset=$DATASET"
@@ -164,10 +178,10 @@ cmd=(
   --seed "$SEED"
   --trust_remote_code "$TRUST_REMOTE_CODE"
   --deterministic 1
-  --lc_mode one_shot
+  --lc_mode "$LC_MODE"
   --lc_site "$SITE"
   --lc_epsilon "$EPS"
-  --lc_round 0
+  --lc_round "$LC_ROUND"
   --lc_seed "$SEED"
   --result_jsonl "$RESULT_JSONL"
 )
@@ -193,7 +207,7 @@ if [[ -n "$EXTRA_ARGS" ]]; then
 fi
 
 echo
-echo "===== $DATASET :: one_shot site=$SITE eps=$EPS R=$R seed=$SEED ====="
+echo "===== $DATASET :: $LC_MODE site=$SITE eps=$EPS R=$R seed=$SEED ====="
 echo "[experiment_b] result_jsonl=$RESULT_JSONL"
 echo "[experiment_b] run_log=$RUN_LOG"
 printf '[experiment_b] command:'

@@ -46,14 +46,14 @@ def maybe_perturb(
     round_idx: int,
     batch_start: int,
 ) -> tuple[torch.Tensor, Optional[dict]]:
-    if (
-        cfg is None
-        or not cfg.enabled
-        or cfg.mode != "one_shot"
-        or cfg.site != site
-        or int(cfg.round_idx) != int(round_idx)
-        or float(cfg.epsilon) <= 0.0
-    ):
+    if cfg is None or not cfg.enabled:
+        return x, None
+    if cfg.site != site or float(cfg.epsilon) <= 0.0:
+        return x, None
+    if cfg.mode == "one_shot":
+        if int(cfg.round_idx) != int(round_idx):
+            return x, None
+    elif cfg.mode != "persistent":
         return x, None
 
     seed = stable_seed(cfg.seed, site, round_idx, batch_start)
@@ -72,6 +72,8 @@ def maybe_perturb(
         torch.zeros_like(delta_norm),
     )
     meta = {
+        "mode": cfg.mode,
+        "applied": True,
         "site": site,
         "round_idx": int(round_idx),
         "epsilon": float(cfg.epsilon),

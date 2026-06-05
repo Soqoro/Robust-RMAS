@@ -1821,7 +1821,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--outer_12_path", type=str, default=None)
     parser.add_argument("--outer_23_path", type=str, default=None)
     parser.add_argument("--outer_31_path", type=str, default=None)
-    parser.add_argument("--lc_mode", type=str, default="none", choices=["none", "one_shot"])
+    parser.add_argument("--lc_mode", type=str, default="none", choices=["none", "one_shot", "persistent"])
     parser.add_argument("--lc_site", type=str, default="", choices=["", "p2c", "c2s", "s2p"])
     parser.add_argument("--lc_epsilon", type=float, default=0.0)
     parser.add_argument("--lc_round", type=int, default=0)
@@ -2013,11 +2013,11 @@ def main() -> None:
         raise ValueError("--lc_epsilon must be non-negative.")
     if args.lc_round < 0:
         raise ValueError("--lc_round must be non-negative.")
-    if args.lc_mode == "one_shot" and args.lc_epsilon > 0.0:
+    if args.lc_mode in {"one_shot", "persistent"} and args.lc_epsilon > 0.0:
         if args.method not in LATENT_METHODS:
-            raise ValueError("--lc_mode one_shot is only supported for latent methods.")
+            raise ValueError(f"--lc_mode {args.lc_mode} is only supported for latent methods.")
         if not args.lc_site:
-            raise ValueError("--lc_site must be set when one-shot latent contagion is enabled.")
+            raise ValueError(f"--lc_site must be set when --lc_mode {args.lc_mode} is enabled.")
     perturb_cfg = PerturbConfig(
         mode=args.lc_mode,
         site=args.lc_site,
@@ -2026,7 +2026,7 @@ def main() -> None:
         seed=int(args.lc_seed),
         enabled=(
             args.method in LATENT_METHODS
-            and args.lc_mode == "one_shot"
+            and args.lc_mode in {"one_shot", "persistent"}
             and float(args.lc_epsilon) > 0.0
         ),
     )

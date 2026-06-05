@@ -73,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--top_p", type=float, default=0.95)
     p.add_argument("--top_k", type=int, default=-1)
     p.add_argument("--deterministic", type=int, default=1, choices=[0, 1])
-    p.add_argument("--lc_mode", type=str, default="none", choices=["none", "one_shot"])
+    p.add_argument("--lc_mode", type=str, default="none", choices=["none", "one_shot", "persistent"])
     p.add_argument("--lc_site", type=str, default="", choices=["", "p2c", "c2s", "s2p"])
     p.add_argument("--lc_epsilon", type=float, default=0.0)
     p.add_argument("--lc_round", type=int, default=0)
