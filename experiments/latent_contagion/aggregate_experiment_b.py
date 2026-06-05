@@ -77,6 +77,10 @@ PER_CONDITION_COLUMNS = CONDITION_COLUMNS + [
     "clean_to_wrong_count",
     "clean_to_invalid_count",
     "clean_to_invalid_rate",
+    "clean_flip_floor",
+    "excess_asrcc",
+    "clean_to_invalid_floor",
+    "excess_clean_to_invalid_rate",
 ]
 
 EPSILON50_COLUMNS = BASELINE_COLUMNS + [
@@ -96,6 +100,33 @@ DISAGREEMENT_COLUMNS = SITELESS_BASELINE_COLUMNS + [
     "correct_b",
     "final_answer_a",
     "final_answer_b",
+]
+
+CLEAN_FLIP_FLOOR_COLUMNS = SITELESS_BASELINE_COLUMNS + [
+    "site_a",
+    "site_b",
+    "n_common",
+    "clean_correct_a_n",
+    "clean_flip_count",
+    "clean_flip_rate",
+    "clean_to_invalid_count",
+    "clean_to_invalid_rate",
+]
+
+CLEAN_FLIP_FLOOR_POOLED_COLUMNS = SITELESS_BASELINE_COLUMNS + [
+    "n_ordered_pairs",
+    "pooled_clean_correct_a_n",
+    "pooled_clean_flip_count",
+    "pooled_clean_flip_rate",
+    "pooled_clean_to_invalid_count",
+    "pooled_clean_to_invalid_rate",
+]
+
+EXCESS_ASR_COLUMNS = [
+    "clean_flip_floor",
+    "excess_asrcc",
+    "clean_to_invalid_floor",
+    "excess_clean_to_invalid_rate",
 ]
 
 FILENAME_TOKEN_RE = re.compile(r"(?P<key>site|eps|epsilon|R|rounds|seed|lc_round)=(?P<value>[^_]+)")
@@ -548,6 +579,203 @@ def compute_per_condition_metrics(df: pd.DataFrame, warnings: List[str]) -> pd.D
     )
 
 
+def _siteless_warning_context(base: Mapping[str, Any]) -> str:
+    return " ".join(f"{column}={base.get(column)}" for column in SITELESS_BASELINE_COLUMNS)
+
+
+def compute_clean_flip_floor(
+    df: pd.DataFrame,
+    warnings: List[str],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    pairwise_empty = pd.DataFrame(columns=CLEAN_FLIP_FLOOR_COLUMNS)
+    pooled_empty = pd.DataFrame(columns=CLEAN_FLIP_FLOOR_POOLED_COLUMNS)
+    if df.empty:
+        return pairwise_empty, pooled_empty
+
+    pairwise_rows: List[Dict[str, Any]] = []
+    pooled_rows: List[Dict[str, Any]] = []
+    for _, full_group in df.groupby(SITELESS_BASELINE_COLUMNS, dropna=False, sort=True):
+        clean_group = full_group[full_group["eps"].apply(_is_zero_eps)].copy()
+        group = clean_group if not clean_group.empty else full_group
+        group = group.sort_values(["site", "sample_id"], kind="mergesort").reset_index(drop=True)
+        base = dict(zip(SITELESS_BASELINE_COLUMNS, _frame_key(group, SITELESS_BASELINE_COLUMNS)))
+        context = _siteless_warning_context(base)
+
+        site_frames: Dict[str, pd.DataFrame] = {}
+        for site, site_group in clean_group.groupby("site", dropna=False, sort=True):
+            site_key = str(_key_value(site))
+            site_frames[site_key] = (
+                site_group.sort_values("sample_id", kind="mergesort").reset_index(drop=True)
+            )
+
+        sites = sorted(site_frames)
+        if len(sites) < 2:
+            warnings.append(
+                f"fewer than two eps=0 clean sites for {context} (found {len(sites)})"
+            )
+            pooled_rows.append(
+                {
+                    **base,
+                    "n_ordered_pairs": 0,
+                    "pooled_clean_correct_a_n": 0,
+                    "pooled_clean_flip_count": 0,
+                    "pooled_clean_flip_rate": float("nan"),
+                    "pooled_clean_to_invalid_count": 0,
+                    "pooled_clean_to_invalid_rate": float("nan"),
+                }
+            )
+            continue
+
+        site_ids = {site: _sample_ids(site_frames[site]) for site in sites}
+        site_indexed = {
+            site: site_frames[site].set_index("sample_id", drop=False) for site in sites
+        }
+
+        pooled_ordered_pairs = 0
+        pooled_clean_correct_a_n = 0
+        pooled_clean_flip_count = 0
+        pooled_clean_to_invalid_count = 0
+
+        for i, site_a in enumerate(sites):
+            for j, site_b in enumerate(sites):
+                if i == j:
+                    continue
+
+                common_ids = sorted(site_ids[site_a] & site_ids[site_b])
+                n_common = int(len(common_ids))
+                clean_correct_a_n = 0
+                clean_flip_count = 0
+                clean_to_invalid_count = 0
+
+                if n_common == 0:
+                    if i < j:
+                        warnings.append(
+                            "eps=0 clean sample_id sets do not overlap for "
+                            f"{context} site_a={site_a} site_b={site_b}"
+                        )
+                else:
+                    aligned_a = site_indexed[site_a].loc[common_ids]
+                    aligned_b = site_indexed[site_b].loc[common_ids]
+                    correct_a = aligned_a["correct_bool"].astype(bool).to_numpy()
+                    correct_b = aligned_b["correct_bool"].astype(bool).to_numpy()
+                    invalid_b = aligned_b["invalid_bool"].astype(bool).to_numpy()
+                    clean_correct_a_n = int(np.sum(correct_a))
+                    if clean_correct_a_n > 0:
+                        clean_flip_count = int(np.sum(correct_a & ~correct_b))
+                        clean_to_invalid_count = int(np.sum(correct_a & invalid_b))
+
+                if clean_correct_a_n == 0:
+                    warnings.append(
+                        "clean flip floor denominator clean_correct_a_n is zero for "
+                        f"{context} site_a={site_a} site_b={site_b} n_common={n_common}"
+                    )
+
+                clean_flip_rate = (
+                    clean_flip_count / clean_correct_a_n
+                    if clean_correct_a_n > 0
+                    else float("nan")
+                )
+                clean_to_invalid_rate = (
+                    clean_to_invalid_count / clean_correct_a_n
+                    if clean_correct_a_n > 0
+                    else float("nan")
+                )
+
+                pairwise_rows.append(
+                    {
+                        **base,
+                        "site_a": site_a,
+                        "site_b": site_b,
+                        "n_common": n_common,
+                        "clean_correct_a_n": clean_correct_a_n,
+                        "clean_flip_count": clean_flip_count,
+                        "clean_flip_rate": clean_flip_rate,
+                        "clean_to_invalid_count": clean_to_invalid_count,
+                        "clean_to_invalid_rate": clean_to_invalid_rate,
+                    }
+                )
+
+                pooled_ordered_pairs += 1
+                pooled_clean_correct_a_n += clean_correct_a_n
+                pooled_clean_flip_count += clean_flip_count
+                pooled_clean_to_invalid_count += clean_to_invalid_count
+
+        pooled_clean_flip_rate = (
+            pooled_clean_flip_count / pooled_clean_correct_a_n
+            if pooled_clean_correct_a_n > 0
+            else float("nan")
+        )
+        pooled_clean_to_invalid_rate = (
+            pooled_clean_to_invalid_count / pooled_clean_correct_a_n
+            if pooled_clean_correct_a_n > 0
+            else float("nan")
+        )
+        pooled_rows.append(
+            {
+                **base,
+                "n_ordered_pairs": pooled_ordered_pairs,
+                "pooled_clean_correct_a_n": pooled_clean_correct_a_n,
+                "pooled_clean_flip_count": pooled_clean_flip_count,
+                "pooled_clean_flip_rate": pooled_clean_flip_rate,
+                "pooled_clean_to_invalid_count": pooled_clean_to_invalid_count,
+                "pooled_clean_to_invalid_rate": pooled_clean_to_invalid_rate,
+            }
+        )
+
+    pairwise = pd.DataFrame(pairwise_rows, columns=CLEAN_FLIP_FLOOR_COLUMNS)
+    pooled = pd.DataFrame(pooled_rows, columns=CLEAN_FLIP_FLOOR_POOLED_COLUMNS)
+    if not pairwise.empty:
+        pairwise = pairwise.sort_values(
+            SITELESS_BASELINE_COLUMNS + ["site_a", "site_b"], kind="mergesort"
+        )
+    if not pooled.empty:
+        pooled = pooled.sort_values(SITELESS_BASELINE_COLUMNS, kind="mergesort")
+    return pairwise, pooled
+
+
+def add_clean_floor_excess_columns(
+    per_condition: pd.DataFrame,
+    clean_flip_floor_pooled: pd.DataFrame,
+) -> pd.DataFrame:
+    if per_condition.empty:
+        return pd.DataFrame(columns=PER_CONDITION_COLUMNS)
+
+    out = per_condition.copy()
+    existing_excess_columns = [column for column in EXCESS_ASR_COLUMNS if column in out.columns]
+    if existing_excess_columns:
+        out = out.drop(columns=existing_excess_columns)
+
+    if clean_flip_floor_pooled.empty:
+        out["clean_flip_floor"] = float("nan")
+        out["clean_to_invalid_floor"] = float("nan")
+    else:
+        floor = clean_flip_floor_pooled[
+            SITELESS_BASELINE_COLUMNS
+            + ["pooled_clean_flip_rate", "pooled_clean_to_invalid_rate"]
+        ].copy()
+        floor = floor.rename(
+            columns={
+                "pooled_clean_flip_rate": "clean_flip_floor",
+                "pooled_clean_to_invalid_rate": "clean_to_invalid_floor",
+            }
+        )
+        floor = floor.drop_duplicates(SITELESS_BASELINE_COLUMNS, keep="first")
+        out = out.merge(floor, on=SITELESS_BASELINE_COLUMNS, how="left")
+
+    out["excess_asrcc"] = pd.to_numeric(out["asrcc"], errors="coerce") - pd.to_numeric(
+        out["clean_flip_floor"], errors="coerce"
+    )
+    out["excess_clean_to_invalid_rate"] = pd.to_numeric(
+        out["clean_to_invalid_rate"], errors="coerce"
+    ) - pd.to_numeric(out["clean_to_invalid_floor"], errors="coerce")
+
+    for column in PER_CONDITION_COLUMNS:
+        if column not in out.columns:
+            out[column] = float("nan")
+
+    return out[PER_CONDITION_COLUMNS].sort_values(CONDITION_COLUMNS, kind="mergesort")
+
+
 def compute_clean_disagreements(df: pd.DataFrame, warnings: List[str]) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=DISAGREEMENT_COLUMNS)
@@ -883,17 +1111,25 @@ def main() -> None:
         sample_df = sample_df[~((sample_df["site"] == "s2p") & (sample_df["R"] == 1))].reset_index(drop=True)
 
     per_condition = compute_per_condition_metrics(sample_df, warnings)
+    clean_flip_floor, clean_flip_floor_pooled = compute_clean_flip_floor(sample_df, warnings)
+    per_condition = add_clean_floor_excess_columns(per_condition, clean_flip_floor_pooled)
     epsilon50 = compute_epsilon50(per_condition)
     disagreements = compute_clean_disagreements(sample_df, warnings)
 
     per_condition_path = out_dir / f"{args.dataset}_experiment_b_per_condition.csv"
     epsilon50_path = out_dir / f"{args.dataset}_experiment_b_epsilon50.csv"
     disagreements_path = out_dir / f"{args.dataset}_experiment_b_clean_disagreements.csv"
+    clean_flip_floor_path = out_dir / f"{args.dataset}_experiment_b_clean_flip_floor.csv"
+    clean_flip_floor_pooled_path = (
+        out_dir / f"{args.dataset}_experiment_b_clean_flip_floor_pooled.csv"
+    )
     warnings_path = out_dir / f"{args.dataset}_experiment_b_warnings.txt"
 
     per_condition.to_csv(per_condition_path, index=False)
     epsilon50.to_csv(epsilon50_path, index=False)
     disagreements.to_csv(disagreements_path, index=False)
+    clean_flip_floor.to_csv(clean_flip_floor_path, index=False)
+    clean_flip_floor_pooled.to_csv(clean_flip_floor_pooled_path, index=False)
     if args.make_plots:
         make_plots(per_condition, epsilon50, args.dataset, out_dir, warnings)
 
@@ -903,6 +1139,8 @@ def main() -> None:
     print(f"sample records parsed: {sample_records_parsed}")
     print(f"conditions aggregated: {len(per_condition)}")
     print(f"epsilon50 rows: {len(epsilon50)}")
+    print(f"clean flip floor pairwise CSV: {clean_flip_floor_path}")
+    print(f"clean flip floor pooled CSV: {clean_flip_floor_pooled_path}")
     print(f"warnings count: {len(warnings)}")
     print(f"out_dir: {out_dir}")
 
