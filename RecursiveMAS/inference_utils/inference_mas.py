@@ -193,6 +193,110 @@ def build_latent_stats_record(
     }
 
 
+def parse_csv_items(text: str) -> List[str]:
+    return [item.strip() for item in str(text or "").split(",") if item.strip()]
+
+
+def parse_lc_trace_sites(text: str) -> List[str]:
+    sites = parse_csv_items(text)
+    allowed = {"p2c", "c2s", "s2p"}
+    unknown = [site for site in sites if site not in allowed]
+    if unknown:
+        raise ValueError(
+            f"Unsupported --lc_trace_sites value(s): {unknown}. "
+            f"Allowed sites: {sorted(allowed)}"
+        )
+    return sites
+
+
+def parse_lc_trace_rounds(text: str) -> List[int]:
+    rounds: List[int] = []
+    for item in parse_csv_items(text):
+        try:
+            round_idx = int(item)
+        except ValueError as exc:
+            raise ValueError(f"Invalid --lc_trace_rounds item {item!r}; expected integers.") from exc
+        if round_idx < 0:
+            raise ValueError("--lc_trace_rounds must contain non-negative integers.")
+        rounds.append(round_idx)
+    return rounds
+
+
+def resolve_lc_trace_dtype(dtype_str: str) -> torch.dtype:
+    if dtype_str == "float32":
+        return torch.float32
+    if dtype_str == "float16":
+        return torch.float16
+    if dtype_str == "bfloat16":
+        return torch.bfloat16
+    raise ValueError("--lc_trace_dtype must be one of: float32, float16, bfloat16.")
+
+
+def torch_load_dict_cpu(path: str) -> dict:
+    try:
+        obj = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        obj = torch.load(path, map_location="cpu")
+    if not isinstance(obj, dict):
+        raise ValueError(f"Expected torch file to load as a dict: {path}")
+    return obj
+
+
+class LatentTraceRecorder:
+    def __init__(
+        self,
+        path: str,
+        metadata: Mapping[str, Any],
+        sample_ids: Sequence[str],
+        sample_indices: Sequence[int],
+        sites: Sequence[str],
+        rounds: Sequence[int],
+        dtype: torch.dtype,
+    ) -> None:
+        self.path = str(path)
+        self.metadata = dict(metadata)
+        self.sample_ids = [str(x) for x in sample_ids]
+        self.sample_indices = [int(x) for x in sample_indices]
+        self.sites = set(str(site) for site in sites)
+        self.rounds = set(int(round_idx) for round_idx in rounds)
+        self.dtype = dtype
+        self._chunks: Dict[str, Dict[int, List[Tuple[int, torch.Tensor]]]] = {
+            site: {} for site in self.sites
+        }
+
+    def enabled_for(self, site: str, round_idx: int) -> bool:
+        return site in self.sites and int(round_idx) in self.rounds
+
+    def record(self, site: str, round_idx: int, batch_start: int, latent: torch.Tensor) -> None:
+        if not self.enabled_for(site, round_idx):
+            return
+        cpu_latent = latent.detach().to(device="cpu", dtype=self.dtype)
+        site_chunks = self._chunks.setdefault(site, {})
+        round_chunks = site_chunks.setdefault(int(round_idx), [])
+        round_chunks.append((int(batch_start), cpu_latent))
+
+    def save(self) -> None:
+        latents: Dict[str, Dict[int, torch.Tensor]] = {}
+        for site in sorted(self._chunks):
+            latents[site] = {}
+            for round_idx, chunks in sorted(self._chunks[site].items()):
+                if not chunks:
+                    continue
+                ordered = [chunk for _, chunk in sorted(chunks, key=lambda item: item[0])]
+                latents[site][int(round_idx)] = torch.cat(ordered, dim=0)
+
+        out = {
+            "metadata": self.metadata,
+            "sample_ids": self.sample_ids,
+            "sample_indices": self.sample_indices,
+            "latents": latents,
+        }
+        out_dir = os.path.dirname(self.path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        torch.save(out, self.path)
+
+
 def estimate_token_counts_for_logging(
     model_name_or_path: str,
     input_texts: Sequence[str],
@@ -1088,6 +1192,7 @@ def run_planner_latent_stage(
     round_idx: int = 0,
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
+    trace_recorder: Optional[LatentTraceRecorder] = None,
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
         out_dim = infer_outer_adapter_out_dim_from_file(outer_12_path)
@@ -1155,6 +1260,8 @@ def run_planner_latent_stage(
         )
         planner_self = run_inner_adapter(inner_1, hidden_rollout, output_dtype=planner_embed_dtype)
         lat12 = run_outer_adapter(outer_12, planner_self, output_dtype=planner_embed_dtype)
+        if trace_recorder is not None:
+            trace_recorder.record("p2c", round_idx, start, lat12)
         lat12, _meta = maybe_perturb(lat12, perturb_cfg, "p2c", round_idx, start)
 
         for i in range(lat12.size(0)):
@@ -1183,6 +1290,7 @@ def run_refiner_latent_stage(
     round_idx: int = 0,
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
+    trace_recorder: Optional[LatentTraceRecorder] = None,
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
         out_dim = infer_outer_adapter_out_dim_from_file(outer_23_path)
@@ -1279,6 +1387,8 @@ def run_refiner_latent_stage(
         )
         refiner_self = run_inner_adapter(inner_2, hidden_rollout, output_dtype=refiner_embed_dtype)
         mapped = run_outer_adapter(outer_23, refiner_self, output_dtype=refiner_embed_dtype)
+        if trace_recorder is not None:
+            trace_recorder.record("c2s", round_idx, start, mapped)
         mapped, _meta = maybe_perturb(mapped, perturb_cfg, "c2s", round_idx, start)
         for i in range(mapped.size(0)):
             refiner_to_solver.append(mapped[i].detach().cpu())
@@ -1307,6 +1417,7 @@ def run_solver_feedback_latent_stage(
     round_idx: int = 0,
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
+    trace_recorder: Optional[LatentTraceRecorder] = None,
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
         out_dim = infer_outer_adapter_out_dim_from_file(outer_31_path)
@@ -1405,6 +1516,8 @@ def run_solver_feedback_latent_stage(
         )
         solver_self = run_inner_adapter(inner_3, hidden_rollout, output_dtype=solver_embed_dtype)
         mapped_feedback = run_outer_adapter(outer_31, solver_self, output_dtype=torch.float32)
+        if trace_recorder is not None:
+            trace_recorder.record("s2p", round_idx, start, mapped_feedback)
         mapped_feedback, _meta = maybe_perturb(mapped_feedback, perturb_cfg, "s2p", round_idx, start)
         for i in range(mapped_feedback.size(0)):
             feedback_latents.append(mapped_feedback[i].detach().cpu())
@@ -1432,6 +1545,7 @@ def run_planner_feedback_latent_stage(
     round_idx: int = 0,
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
+    trace_recorder: Optional[LatentTraceRecorder] = None,
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
         out_dim = infer_outer_adapter_out_dim_from_file(outer_12_path)
@@ -1528,6 +1642,8 @@ def run_planner_feedback_latent_stage(
         )
         planner_self = run_inner_adapter(inner_1, hidden_rollout, output_dtype=planner_embed_dtype)
         lat12 = run_outer_adapter(outer_12, planner_self, output_dtype=planner_embed_dtype)
+        if trace_recorder is not None:
+            trace_recorder.record("p2c", round_idx, start, lat12)
         lat12, _meta = maybe_perturb(lat12, perturb_cfg, "p2c", round_idx, start)
         for i in range(lat12.size(0)):
             planner_to_refiner.append(lat12[i].detach().cpu())
@@ -1782,6 +1898,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mas_shape", type=str, default="chain", choices=["chain"])
     parser.add_argument("--dataset", type=str, default="openai/gsm8k")
     parser.add_argument("--dataset_split", type=str, default="test")
+    parser.add_argument("--question_suffix_path", type=str, default="")
     parser.add_argument("--num_samples", type=int, default=100)
     parser.add_argument("--shuffle", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
@@ -1826,6 +1943,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lc_epsilon", type=float, default=0.0)
     parser.add_argument("--lc_round", type=int, default=0)
     parser.add_argument("--lc_seed", type=int, default=42)
+    parser.add_argument("--lc_direction", type=str, default="random", choices=["random", "bank"])
+    parser.add_argument("--lc_steering_bank", type=str, default="")
+    parser.add_argument("--lc_steering_method", type=str, default="")
+    parser.add_argument("--lc_steering_id", type=str, default="")
+    parser.add_argument("--lc_trace_path", type=str, default="")
+    parser.add_argument("--lc_trace_sites", type=str, default="p2c,c2s,s2p")
+    parser.add_argument("--lc_trace_rounds", type=str, default="0")
+    parser.add_argument("--lc_trace_dtype", type=str, default="float16")
     parser.add_argument(
         "--inner_adapter_type_fallback",
         type=str,
@@ -2018,6 +2143,17 @@ def main() -> None:
             raise ValueError(f"--lc_mode {args.lc_mode} is only supported for latent methods.")
         if not args.lc_site:
             raise ValueError(f"--lc_site must be set when --lc_mode {args.lc_mode} is enabled.")
+    steering_bank: Optional[dict] = None
+    if args.lc_direction == "bank":
+        if args.lc_steering_method != "diffmean":
+            raise ValueError("--lc_direction bank requires --lc_steering_method diffmean.")
+        if not args.lc_steering_bank:
+            raise ValueError("--lc_direction bank requires --lc_steering_bank.")
+        if not os.path.exists(args.lc_steering_bank):
+            raise FileNotFoundError(f"--lc_steering_bank not found: {args.lc_steering_bank}")
+        steering_bank = torch_load_dict_cpu(args.lc_steering_bank)
+    if args.lc_trace_path and args.method not in LATENT_METHODS:
+        raise ValueError("--lc_trace_path is only supported for latent methods.")
     perturb_cfg = PerturbConfig(
         mode=args.lc_mode,
         site=args.lc_site,
@@ -2029,13 +2165,20 @@ def main() -> None:
             and args.lc_mode in {"one_shot", "persistent"}
             and float(args.lc_epsilon) > 0.0
         ),
+        direction=args.lc_direction,
+        steering_bank_path=args.lc_steering_bank,
+        steering_method=args.lc_steering_method,
+        steering_id=args.lc_steering_id,
+        steering_bank=steering_bank,
     )
     if perturb_cfg.enabled:
         print(
             "[latent-contagion] "
             f"mode={perturb_cfg.mode} site={perturb_cfg.site} "
             f"epsilon={perturb_cfg.epsilon:g} round_idx={perturb_cfg.round_idx} "
-            f"seed={perturb_cfg.seed}"
+            f"seed={perturb_cfg.seed} direction={perturb_cfg.direction} "
+            f"steering_method={perturb_cfg.steering_method} "
+            f"steering_id={perturb_cfg.steering_id}"
         )
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -2080,6 +2223,49 @@ def main() -> None:
         mbppplus_cache_dir=args.mbppplus_cache_dir,
         mbppplus_num_prompt_tests=int(args.mbppplus_num_prompt_tests),
     )
+
+    question_suffix_path = args.question_suffix_path.strip()
+    if question_suffix_path:
+        with open(question_suffix_path, "r", encoding="utf-8") as f:
+            question_suffix = f.read().rstrip()
+        questions = [str(question).rstrip() + "\n\n" + question_suffix for question in questions]
+        print(f"[direct-attack] appended question suffix from {question_suffix_path}")
+
+    trace_recorder: Optional[LatentTraceRecorder] = None
+    if args.lc_trace_path:
+        trace_sites = parse_lc_trace_sites(args.lc_trace_sites)
+        trace_rounds = parse_lc_trace_rounds(args.lc_trace_rounds)
+        trace_dtype = resolve_lc_trace_dtype(args.lc_trace_dtype)
+        trace_sample_ids = [
+            build_sample_id(dataset_name, args.dataset_split, sample_idx, sample_metadata)
+            for sample_idx in range(len(questions))
+        ]
+        trace_recorder = LatentTraceRecorder(
+            path=args.lc_trace_path,
+            metadata={
+                "dataset": args.dataset,
+                "style": args.style,
+                "method": args.method,
+                "mas_shape": args.mas_shape,
+                "R": recursion_rounds_for_log(args.method, args.num_recursive_rounds),
+                "seed": args.seed,
+                "num_samples": len(questions),
+                "trace_sites": trace_sites,
+                "trace_rounds": trace_rounds,
+                "trace_dtype": args.lc_trace_dtype,
+                "question_suffix_path": args.question_suffix_path,
+            },
+            sample_ids=trace_sample_ids,
+            sample_indices=list(range(len(questions))),
+            sites=trace_sites,
+            rounds=trace_rounds,
+            dtype=trace_dtype,
+        )
+        print(
+            "[latent-trace] "
+            f"path={args.lc_trace_path} sites={trace_sites} "
+            f"rounds={trace_rounds} dtype={args.lc_trace_dtype}"
+        )
 
     is_code_eval = is_code_eval_dataset(dataset_name)
     code_eval_timeout_s = int(args.mbppplus_timeout_s) if is_mbppplus_dataset(dataset_name) else int(args.lcb_timeout_s)
@@ -2522,6 +2708,7 @@ def main() -> None:
             round_idx=0,
             task_types=task_types,
             fn_names=fn_names,
+            trace_recorder=trace_recorder,
         )
         refiner_to_solver = run_refiner_latent_stage(
             model_name_or_path=refiner_model,
@@ -2542,6 +2729,7 @@ def main() -> None:
             round_idx=0,
             task_types=task_types,
             fn_names=fn_names,
+            trace_recorder=trace_recorder,
         )
         solver_outputs = run_solver_latent_stage(
             model_name_or_path=solver_model,
@@ -2641,6 +2829,7 @@ def main() -> None:
                     round_idx=round_idx,
                     task_types=task_types,
                     fn_names=fn_names,
+                    trace_recorder=trace_recorder,
                 )
             else:
                 if feedback_to_planner is None:
@@ -2664,6 +2853,7 @@ def main() -> None:
                     round_idx=round_idx,
                     task_types=task_types,
                     fn_names=fn_names,
+                    trace_recorder=trace_recorder,
                 )
             planner_to_refiner = [x for x in planner_to_refiner]
             planner_to_refiner_rounds.append(planner_to_refiner)
@@ -2687,6 +2877,7 @@ def main() -> None:
                 round_idx=round_idx,
                 task_types=task_types,
                 fn_names=fn_names,
+                trace_recorder=trace_recorder,
             )
             refiner_to_solver = [x for x in refiner_to_solver]
             refiner_to_solver_rounds.append(refiner_to_solver)
@@ -2712,6 +2903,7 @@ def main() -> None:
                     round_idx=round_idx,
                     task_types=task_types,
                     fn_names=fn_names,
+                    trace_recorder=trace_recorder,
                 )
                 feedback_to_planner = [x for x in feedback_to_planner]
                 feedback_to_planner_rounds.append(feedback_to_planner)
@@ -3317,7 +3509,12 @@ def main() -> None:
             "lc_epsilon": float(args.lc_epsilon),
             "lc_round": int(args.lc_round),
             "lc_seed": int(args.lc_seed),
+            "lc_direction": args.lc_direction,
+            "lc_steering_method": args.lc_steering_method,
+            "lc_steering_id": args.lc_steering_id,
+            "lc_steering_bank": args.lc_steering_bank,
             "lc_enabled": bool(perturb_cfg.enabled),
+            "question_suffix_path": args.question_suffix_path,
             "question": questions[sample_idx],
             "ground_truth": gold_answers[sample_idx],
             "final_answer": final_answer,
@@ -3537,7 +3734,12 @@ def main() -> None:
                 "lc_epsilon": float(args.lc_epsilon),
                 "lc_round": int(args.lc_round),
                 "lc_seed": int(args.lc_seed),
+                "lc_direction": args.lc_direction,
+                "lc_steering_method": args.lc_steering_method,
+                "lc_steering_id": args.lc_steering_id,
+                "lc_steering_bank": args.lc_steering_bank,
                 "lc_enabled": bool(perturb_cfg.enabled),
+                "question_suffix_path": args.question_suffix_path,
                 "num_samples": total,
                 "num_rollouts": args.num_rollouts,
                 "sample_seed_base": base_sample_seed,
@@ -3552,6 +3754,10 @@ def main() -> None:
             }
             f.write(json.dumps(summary_record, ensure_ascii=False) + "\n")
         print(f"[jsonl] wrote {len(sample_records)} sample records to {result_jsonl_path}")
+
+    if trace_recorder is not None:
+        trace_recorder.save()
+        print(f"[latent-trace] wrote trace file to {args.lc_trace_path}")
 
 if __name__ == "__main__":
     main()

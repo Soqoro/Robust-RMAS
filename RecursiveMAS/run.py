@@ -48,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--style", required=True, choices=list(STYLE_SPECS.keys()))
     p.add_argument("--dataset", required=True, default="math500", choices=["math500", "medqa", "gpqa", "mbppplus"])
     p.add_argument("--dataset_split", default="")
+    p.add_argument("--question_suffix_path", default="")
     p.add_argument(
         "--method",
         default="ours_recursive",
@@ -78,6 +79,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lc_epsilon", type=float, default=0.0)
     p.add_argument("--lc_round", type=int, default=0)
     p.add_argument("--lc_seed", type=int, default=42)
+    p.add_argument("--lc_direction", type=str, default="random", choices=["random", "bank"])
+    p.add_argument("--lc_steering_bank", default="")
+    p.add_argument("--lc_steering_method", default="")
+    p.add_argument("--lc_steering_id", default="")
+    p.add_argument("--lc_trace_path", default="")
+    p.add_argument("--lc_trace_sites", default="p2c,c2s,s2p")
+    p.add_argument("--lc_trace_rounds", default="0")
+    p.add_argument("--lc_trace_dtype", default="float16")
     p.add_argument("--trust_remote_code", type=int, default=1, choices=[0, 1])
     p.add_argument("--device", default=None)
     return p
@@ -228,6 +237,8 @@ def build_common_cli(args: argparse.Namespace, dataset_arg: str, dataset_split: 
     if args.result_jsonl:
         out.extend(["--result_jsonl", str(args.result_jsonl)])
     if str(STYLE_SPECS[args.style]["family"]) == "sequential":
+        if args.question_suffix_path:
+            out.extend(["--question_suffix_path", str(args.question_suffix_path)])
         out.extend(
             [
                 "--lc_mode", str(args.lc_mode),
@@ -235,8 +246,24 @@ def build_common_cli(args: argparse.Namespace, dataset_arg: str, dataset_split: 
                 "--lc_epsilon", str(args.lc_epsilon),
                 "--lc_round", str(args.lc_round),
                 "--lc_seed", str(args.lc_seed),
+                "--lc_direction", str(args.lc_direction),
             ]
         )
+        if args.lc_steering_bank:
+            out.extend(["--lc_steering_bank", str(args.lc_steering_bank)])
+        if args.lc_steering_method:
+            out.extend(["--lc_steering_method", str(args.lc_steering_method)])
+        if args.lc_steering_id:
+            out.extend(["--lc_steering_id", str(args.lc_steering_id)])
+        if args.lc_trace_path:
+            out.extend(
+                [
+                    "--lc_trace_path", str(args.lc_trace_path),
+                    "--lc_trace_sites", str(args.lc_trace_sites),
+                    "--lc_trace_rounds", str(args.lc_trace_rounds),
+                    "--lc_trace_dtype", str(args.lc_trace_dtype),
+                ]
+            )
     if int(args.deterministic) == 0:
         out.append("--do_sample")
     out.append("--ans")

@@ -35,6 +35,9 @@ CONDITION_COLUMNS = [
     "method",
     "mas_shape",
     "lc_mode",
+    "lc_direction",
+    "lc_steering_method",
+    "lc_steering_id",
     "site",
     "R",
     "lc_round",
@@ -48,6 +51,9 @@ BASELINE_COLUMNS = [
     "method",
     "mas_shape",
     "lc_mode",
+    "lc_direction",
+    "lc_steering_method",
+    "lc_steering_id",
     "site",
     "R",
     "lc_round",
@@ -60,6 +66,9 @@ SITELESS_BASELINE_COLUMNS = [
     "method",
     "mas_shape",
     "lc_mode",
+    "lc_direction",
+    "lc_steering_method",
+    "lc_steering_id",
     "R",
     "lc_round",
     "seed",
@@ -330,6 +339,9 @@ def _normalize_sample_record(
     lc_round = _first_nonempty(record.get("lc_round"), filename_metadata.get("lc_round"), 0)
     seed = _first_nonempty(record.get("lc_seed"), filename_metadata.get("seed"))
     dataset = _first_nonempty(record.get("dataset"), dataset_default)
+    lc_direction = _first_nonempty(record.get("lc_direction"), "random")
+    lc_steering_method = _first_nonempty(record.get("lc_steering_method"), "")
+    lc_steering_id = _first_nonempty(record.get("lc_steering_id"), "")
 
     return {
         "dataset": _metadata_text(dataset),
@@ -337,6 +349,9 @@ def _normalize_sample_record(
         "method": _metadata_text(record.get("method")),
         "mas_shape": _metadata_text(record.get("mas_shape")),
         "lc_mode": _metadata_text(record.get("lc_mode")),
+        "lc_direction": _metadata_text(lc_direction),
+        "lc_steering_method": _metadata_text(lc_steering_method),
+        "lc_steering_id": _metadata_text(lc_steering_id),
         "site": _metadata_text(site),
         "R": _to_int(recursion_rounds),
         "lc_round": _to_int(lc_round),
