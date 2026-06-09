@@ -38,11 +38,28 @@ NUM_SAMPLES="${NUM_SAMPLES:--1}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 LATENT_LENGTH="${LATENT_LENGTH:-48}"
 TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-1}"
+GPU_LIST="${GPU_LIST:-}"
 OUT_ROOT="${OUT_ROOT:-${OUT_DIR:-outputs/latent_contagion/experiment_c}}"
 RUN_SUBDIR="${RUN_SUBDIR:-diffmean_R${CALIBRATION_R}}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-7}"
+TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
+if ! [[ "$TASK_ID" =~ ^[0-9]+$ ]]; then
+  echo "[error] SLURM_ARRAY_TASK_ID must be a non-negative integer, got: $TASK_ID" >&2
+  exit 2
+fi
+
+if [[ -n "$GPU_LIST" ]]; then
+  read -r -a gpu_array <<< "$GPU_LIST"
+  if (( ${#gpu_array[@]} == 0 )); then
+    echo "[error] GPU_LIST was set but no GPU ids were parsed." >&2
+    exit 2
+  fi
+  gpu_index=$((TASK_ID % ${#gpu_array[@]}))
+  export CUDA_VISIBLE_DEVICES="${gpu_array[$gpu_index]}"
+else
+  export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-7}"
+fi
 export CONDA_NO_PLUGINS=true
 export TMPDIR="${SLURM_TMPDIR:-/tmp}"
 export PYTHONNOUSERSITE=1
@@ -55,12 +72,6 @@ ls -ld "$TMPDIR" || true
 if [[ "$LC_DIRECTION" == "bank" && ! -f "$LC_STEERING_BANK" ]]; then
   echo "[error] LC_STEERING_BANK does not exist: $LC_STEERING_BANK" >&2
   echo "[error] Run experiments/latent_contagion/run_experiment_c_calibration.sh first, or set LC_STEERING_BANK." >&2
-  exit 2
-fi
-
-TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
-if ! [[ "$TASK_ID" =~ ^[0-9]+$ ]]; then
-  echo "[error] SLURM_ARRAY_TASK_ID must be a non-negative integer, got: $TASK_ID" >&2
   exit 2
 fi
 
@@ -141,6 +152,7 @@ echo "[experiment_c] lc_steering_bank=$LC_STEERING_BANK"
 echo "[experiment_c] lc_steering_method=$LC_STEERING_METHOD lc_steering_id=$LC_STEERING_ID"
 echo "[experiment_c] selected dataset=$DATASET site=$SITE eps=$EPS rounds=$R seed=$SEED"
 echo "[experiment_c] num_samples=$NUM_SAMPLES batch_size=$BATCH_SIZE latent_length=$LATENT_LENGTH"
+echo "[experiment_c] gpu_list=${GPU_LIST:-<empty>}"
 echo "[experiment_c] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 
 echo "===== nvidia-smi -L ====="
@@ -174,6 +186,8 @@ nvidia-smi || true
   echo "batch_size=$BATCH_SIZE"
   echo "latent_length=$LATENT_LENGTH"
   echo "trust_remote_code=$TRUST_REMOTE_CODE"
+  echo "gpu_list=$GPU_LIST"
+  echo "cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-}"
   echo "extra_args=$EXTRA_ARGS"
 } > "$RUN_DIR/manifest_task_${TASK_ID}.txt"
 

@@ -34,6 +34,7 @@ TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-1}"
 TRACE_SITES="${TRACE_SITES:-p2c,c2s,s2p}"
 TRACE_ROUNDS="${TRACE_ROUNDS:-0}"
 TRACE_DTYPE="${TRACE_DTYPE:-float16}"
+GPU_LIST="${GPU_LIST:-}"
 FILTER="${FILTER:-all_valid_pairs}"
 ATTACK_SUFFIX_PATH="${ATTACK_SUFFIX_PATH:-experiments/latent_contagion/attack_suffix_math_role_aligned.txt}"
 STEERING_ID="${STEERING_ID:-diffmean_R${CALIBRATION_R}_${DATASET}_role_aligned}"
@@ -49,8 +50,8 @@ CLEAN_TRACE="${CLEAN_TRACE:-$CALIB_DIR/clean_R${CALIBRATION_R}_trace.pt}"
 ATTACK_TRACE="${ATTACK_TRACE:-$CALIB_DIR/attack_R${CALIBRATION_R}_trace.pt}"
 OUT_BANK="${OUT_BANK:-$CALIB_DIR/${STEERING_ID}.pt}"
 
+TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 if [[ -z "${CALIB_STAGE:-}" ]]; then
-  TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
   if ! [[ "$TASK_ID" =~ ^[0-9]+$ ]]; then
     echo "[error] SLURM_ARRAY_TASK_ID must be a non-negative integer, got: $TASK_ID" >&2
     exit 2
@@ -73,7 +74,17 @@ case "$CALIB_STAGE" in
     ;;
 esac
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-7}"
+if [[ -n "$GPU_LIST" ]]; then
+  read -r -a gpu_array <<< "$GPU_LIST"
+  if (( ${#gpu_array[@]} == 0 )); then
+    echo "[error] GPU_LIST was set but no GPU ids were parsed." >&2
+    exit 2
+  fi
+  gpu_index=$((TASK_ID % ${#gpu_array[@]}))
+  export CUDA_VISIBLE_DEVICES="${gpu_array[$gpu_index]}"
+else
+  export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-7}"
+fi
 export CONDA_NO_PLUGINS=true
 export TMPDIR="${SLURM_TMPDIR:-/tmp}"
 export PYTHONNOUSERSITE=1
@@ -93,6 +104,7 @@ echo "[experiment_c_calibration] calibration_R=$CALIBRATION_R seed=$SEED"
 echo "[experiment_c_calibration] num_samples=$NUM_SAMPLES batch_size=$BATCH_SIZE latent_length=$LATENT_LENGTH"
 echo "[experiment_c_calibration] trace_sites=$TRACE_SITES trace_rounds=$TRACE_ROUNDS trace_dtype=$TRACE_DTYPE"
 echo "[experiment_c_calibration] steering_id=$STEERING_ID out_bank=$OUT_BANK"
+echo "[experiment_c_calibration] gpu_list=${GPU_LIST:-<empty>} task_id=$TASK_ID"
 echo "[experiment_c_calibration] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 
 {
@@ -109,6 +121,9 @@ echo "[experiment_c_calibration] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<u
   echo "trace_sites=$TRACE_SITES"
   echo "trace_rounds=$TRACE_ROUNDS"
   echo "trace_dtype=$TRACE_DTYPE"
+  echo "gpu_list=$GPU_LIST"
+  echo "task_id=$TASK_ID"
+  echo "cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-}"
   echo "attack_suffix_path=$ATTACK_SUFFIX_PATH"
   echo "filter=$FILTER"
   echo "steering_id=$STEERING_ID"
