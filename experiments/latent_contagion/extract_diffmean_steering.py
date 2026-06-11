@@ -7,10 +7,28 @@ import argparse
 import json
 import math
 import os
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
+
+
+EXAMPLE_USAGE = """\
+Example:
+  python experiments/latent_contagion/extract_diffmean_steering.py \\
+    --clean_jsonl outputs/latent_contagion/diffmean_calibration/math500_R2/clean_R2.jsonl \\
+    --attack_jsonl outputs/latent_contagion/diffmean_calibration/math500_R2/attack_R2.jsonl \\
+    --clean_trace outputs/latent_contagion/diffmean_calibration/math500_R2/clean_R2_trace.pt \\
+    --attack_trace outputs/latent_contagion/diffmean_calibration/math500_R2/attack_R2_trace.pt \\
+    --out_bank outputs/latent_contagion/diffmean_calibration/math500_R2/diffmean_R2_math500_role_aligned_target_hit.pt \\
+    --sites p2c,c2s,s2p \\
+    --rounds 0 \\
+    --filter target_hit \\
+    --target_answer 999999999 \\
+    --calibration_R 2 \\
+    --steering_id diffmean_R2_math500_role_aligned_target_hit
+"""
 
 
 def parse_csv_items(text: str) -> List[str]:
@@ -65,6 +83,118 @@ def first_nonempty(*values: Any) -> Any:
             continue
         return value
     return None
+
+
+def _strip_matching_outer(text: str, left: str, right: str) -> Optional[str]:
+    text = text.strip()
+    if not (text.startswith(left) and text.endswith(right)):
+        return None
+    return text[len(left) : len(text) - len(right)]
+
+
+def _strip_outer_braces(text: str) -> Optional[str]:
+    text = text.strip()
+    if not (text.startswith("{") and text.endswith("}")):
+        return None
+    depth = 0
+    for idx, char in enumerate(text):
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0 and idx != len(text) - 1:
+                return None
+            if depth < 0:
+                return None
+    if depth != 0:
+        return None
+    return text[1:-1]
+
+
+def _strip_macro_wrapper(text: str, macro: str) -> Optional[str]:
+    text = text.strip()
+    prefix = f"\\{macro}"
+    if not text.startswith(prefix):
+        return None
+    rest = text[len(prefix) :].lstrip()
+    if not rest.startswith("{"):
+        return None
+
+    depth = 0
+    for idx, char in enumerate(rest):
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                trailing = rest[idx + 1 :].strip()
+                if trailing:
+                    return None
+                return rest[1:idx]
+            if depth < 0:
+                return None
+    return None
+
+
+def _unescape_known_latex_markers(text: str) -> str:
+    for marker in ("boxed", "fbox", "left", "right"):
+        text = text.replace(f"\\\\{marker}", f"\\{marker}")
+    for marker in ("(", ")", "[", "]"):
+        text = text.replace(f"\\\\{marker}", f"\\{marker}")
+    return text
+
+
+def strip_boxed(text: Any) -> str:
+    out = "" if text is None else _unescape_known_latex_markers(str(text).strip())
+    while True:
+        changed = False
+        for macro in ("boxed", "fbox"):
+            inner = _strip_macro_wrapper(out, macro)
+            if inner is not None:
+                out = inner.strip()
+                changed = True
+                break
+        if not changed:
+            return out
+
+
+def normalize_answer_for_target(text: Any) -> str:
+    out = "" if text is None else _unescape_known_latex_markers(str(text).strip())
+    for _ in range(16):
+        previous = out
+        out = out.strip()
+        out = _unescape_known_latex_markers(out)
+        out = out.replace("\\left", "").replace("\\right", "")
+        out = strip_boxed(out)
+
+        for left, right in (("\\(", "\\)"), ("\\[", "\\]"), ("$$", "$$"), ("$", "$")):
+            inner = _strip_matching_outer(out, left, right)
+            if inner is not None:
+                out = inner.strip()
+                break
+
+        inner_braced = _strip_outer_braces(out)
+        if inner_braced is not None:
+            out = inner_braced.strip()
+
+        if out == previous:
+            break
+
+    out = out.replace("\\left", "").replace("\\right", "")
+    out = strip_boxed(out)
+    out = out.replace(",", "")
+    out = re.sub(r"\s+", "", out)
+    return out
+
+
+def is_target_answer(record: Mapping[str, Any], target_answer: str) -> bool:
+    normalized_target = normalize_answer_for_target(target_answer)
+    for field_name in ("pred_answer_parsed", "final_answer"):
+        if field_name not in record:
+            continue
+        if normalize_answer_for_target(record.get(field_name)) == normalized_target:
+            return True
+    return False
 
 
 def load_jsonl_records(path: Path) -> List[Dict[str, Any]]:
@@ -143,6 +273,24 @@ def lookup_latent(trace: Mapping[str, Any], site: str, round_idx: int, path: Pat
     return tensor
 
 
+def collect_trace_tensors(
+    clean_trace: Mapping[str, Any],
+    attack_trace: Mapping[str, Any],
+    clean_trace_path: Path,
+    attack_trace_path: Path,
+    sites: Sequence[str],
+    rounds: Sequence[int],
+) -> Dict[Tuple[str, int], Tuple[torch.Tensor, torch.Tensor]]:
+    tensors: Dict[Tuple[str, int], Tuple[torch.Tensor, torch.Tensor]] = {}
+    for site in sites:
+        for round_idx in rounds:
+            tensors[(site, int(round_idx))] = (
+                lookup_latent(clean_trace, site, int(round_idx), clean_trace_path),
+                lookup_latent(attack_trace, site, int(round_idx), attack_trace_path),
+            )
+    return tensors
+
+
 def select_rows(tensor: torch.Tensor, indices: Sequence[int]) -> torch.Tensor:
     if not indices:
         return tensor[:0].float()
@@ -177,32 +325,17 @@ def correctness(record: Mapping[str, Any]) -> bool:
 
 
 def build_site_direction(
-    clean_trace: Mapping[str, Any],
-    attack_trace: Mapping[str, Any],
-    clean_trace_path: Path,
-    attack_trace_path: Path,
+    trace_tensors: Mapping[Tuple[str, int], Tuple[torch.Tensor, torch.Tensor]],
     site: str,
     round_idx: int,
-    paired_ids: Sequence[str],
-    clean_trace_index: Mapping[str, int],
-    attack_trace_index: Mapping[str, int],
+    clean_indices: Sequence[int],
+    attack_indices: Sequence[int],
+    selected_filter: str,
+    target_answer: str,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-    clean_tensor = lookup_latent(clean_trace, site, round_idx, clean_trace_path)
-    attack_tensor = lookup_latent(attack_trace, site, round_idx, attack_trace_path)
+    clean_tensor, attack_tensor = trace_tensors[(site, int(round_idx))]
 
-    site_ids: List[str] = []
-    clean_indices: List[int] = []
-    attack_indices: List[int] = []
-    for sample_id in paired_ids:
-        clean_idx = clean_trace_index[sample_id]
-        attack_idx = attack_trace_index[sample_id]
-        if clean_idx >= clean_tensor.size(0) or attack_idx >= attack_tensor.size(0):
-            continue
-        site_ids.append(sample_id)
-        clean_indices.append(clean_idx)
-        attack_indices.append(attack_idx)
-
-    if not site_ids:
+    if not clean_indices:
         raise ValueError(f"No valid paired trace rows for site={site!r} round={round_idx}.")
 
     clean_latent = select_rows(clean_tensor, clean_indices)
@@ -214,22 +347,27 @@ def build_site_direction(
         )
 
     delta = attack_latent - clean_latent
-    diffmean = delta.mean(dim=0)
-    diffmean_norm_before = torch.linalg.vector_norm(diffmean.float())
-    diffmean = diffmean.float() / diffmean_norm_before.clamp_min(1e-12)
+    diffmean_raw = delta.mean(dim=0).float()
+    diffmean_norm_before = torch.linalg.vector_norm(diffmean_raw)
+    diffmean = diffmean_raw / diffmean_norm_before.clamp_min(1e-12)
     per_sample_delta_norm = torch.linalg.vector_norm(delta.reshape(delta.size(0), -1), dim=1)
 
     stats = {
         "n_pairs": int(delta.size(0)),
         "mean_delta_norm": float(per_sample_delta_norm.mean().item()) if per_sample_delta_norm.numel() else 0.0,
+        "median_delta_norm": float(per_sample_delta_norm.median().item()) if per_sample_delta_norm.numel() else 0.0,
         "diffmean_norm_before_normalization": float(diffmean_norm_before.item()),
+        "selected_filter": selected_filter,
+        "target_answer": str(target_answer),
     }
     return diffmean.cpu(), stats
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Extract DiffMean steering directions from clean and directly attacked latent traces."
+        description="Extract DiffMean steering directions from clean and directly attacked latent traces.",
+        epilog=EXAMPLE_USAGE,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--clean_jsonl", required=True)
     parser.add_argument("--attack_jsonl", required=True)
@@ -238,14 +376,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out_bank", required=True)
     parser.add_argument("--sites", default="p2c,c2s,s2p")
     parser.add_argument("--rounds", default="0")
-    parser.add_argument("--filter", default="all_valid_pairs", choices=["all_valid_pairs"])
+    parser.add_argument(
+        "--filter",
+        default="all_valid_pairs",
+        choices=["all_valid_pairs", "target_hit", "clean_correct_target_hit"],
+    )
+    parser.add_argument("--target_answer", default="999999999")
+    parser.add_argument("--min_pairs", type=int, default=1)
     parser.add_argument("--calibration_R", type=int, default=2)
     parser.add_argument("--steering_id", default="diffmean_R2_math500_role_aligned")
     return parser.parse_args()
 
 
+def has_valid_trace_pair(
+    clean_idx: int,
+    attack_idx: int,
+    trace_tensors: Mapping[Tuple[str, int], Tuple[torch.Tensor, torch.Tensor]],
+) -> bool:
+    for clean_tensor, attack_tensor in trace_tensors.values():
+        if clean_idx >= clean_tensor.size(0) or attack_idx >= attack_tensor.size(0):
+            return False
+    return True
+
+
 def main() -> None:
     args = parse_args()
+    if args.min_pairs < 1:
+        raise ValueError("--min_pairs must be at least 1.")
     sites = parse_sites(args.sites)
     rounds = parse_rounds(args.rounds)
 
@@ -261,6 +418,14 @@ def main() -> None:
     attack_trace = torch_load_cpu(attack_trace_path)
     clean_trace_ids, clean_trace_index = index_by_sample_id(clean_trace, clean_trace_path)
     _, attack_trace_index = index_by_sample_id(attack_trace, attack_trace_path)
+    trace_tensors = collect_trace_tensors(
+        clean_trace=clean_trace,
+        attack_trace=attack_trace,
+        clean_trace_path=clean_trace_path,
+        attack_trace_path=attack_trace_path,
+        sites=sites,
+        rounds=rounds,
+    )
 
     paired_ids = paired_ids_from_sources(
         clean_json=clean_records,
@@ -272,49 +437,113 @@ def main() -> None:
     if not paired_ids:
         raise ValueError("No valid sample_id pairs found across JSONL and trace files.")
 
+    valid_sample_ids: List[str] = []
+    selected_sample_ids: List[str] = []
+    selected_clean_indices: List[int] = []
+    selected_attack_indices: List[int] = []
+
     n_clean_correct = 0
-    n_attack_wrong = 0
-    n_clean_correct_attack_wrong = 0
+    n_attack_wrong_by_existing_judge = 0
+    n_clean_correct_attack_wrong_by_existing_judge = 0
+    n_raw_contains_target = 0
+    n_strict_target_hit = 0
+    n_clean_correct_target_hit = 0
+
     for sample_id in paired_ids:
-        clean_is_correct = correctness(clean_records[sample_id])
-        attack_is_wrong = not correctness(attack_records[sample_id])
+        clean_idx = clean_trace_index[sample_id]
+        attack_idx = attack_trace_index[sample_id]
+        if not has_valid_trace_pair(clean_idx, attack_idx, trace_tensors):
+            continue
+
+        valid_sample_ids.append(sample_id)
+
+        clean_record = clean_records[sample_id]
+        attack_record = attack_records[sample_id]
+        clean_is_correct = correctness(clean_record)
+        attack_is_wrong = not correctness(attack_record)
+        target_hit = is_target_answer(attack_record, str(args.target_answer))
+        clean_correct_target_hit = clean_is_correct and target_hit
+        raw_contains_target = str(args.target_answer) in str(attack_record.get("raw_final_output", ""))
+
         n_clean_correct += int(clean_is_correct)
-        n_attack_wrong += int(attack_is_wrong)
-        n_clean_correct_attack_wrong += int(clean_is_correct and attack_is_wrong)
+        n_attack_wrong_by_existing_judge += int(attack_is_wrong)
+        n_clean_correct_attack_wrong_by_existing_judge += int(clean_is_correct and attack_is_wrong)
+        n_raw_contains_target += int(raw_contains_target)
+        n_strict_target_hit += int(target_hit)
+        n_clean_correct_target_hit += int(clean_correct_target_hit)
+
+        include = False
+        if args.filter == "all_valid_pairs":
+            include = True
+        elif args.filter == "target_hit":
+            include = target_hit
+        elif args.filter == "clean_correct_target_hit":
+            include = clean_correct_target_hit
+        else:
+            raise ValueError(f"Unsupported --filter: {args.filter}")
+
+        if include:
+            selected_sample_ids.append(sample_id)
+            selected_clean_indices.append(clean_idx)
+            selected_attack_indices.append(attack_idx)
+
+    diagnostics = {
+        "n_total_matched": len(paired_ids),
+        "n_valid_trace_pairs": len(valid_sample_ids),
+        "n_clean_correct": n_clean_correct,
+        "n_attack_wrong_by_existing_judge": n_attack_wrong_by_existing_judge,
+        "n_clean_correct_attack_wrong_by_existing_judge": n_clean_correct_attack_wrong_by_existing_judge,
+        "n_raw_contains_target": n_raw_contains_target,
+        "n_strict_target_hit": n_strict_target_hit,
+        "n_clean_correct_target_hit": n_clean_correct_target_hit,
+        "n_selected_pairs": len(selected_sample_ids),
+    }
+
+    if len(selected_sample_ids) < int(args.min_pairs):
+        raise ValueError(
+            f"Only {len(selected_sample_ids)} pairs selected for filter {args.filter}; "
+            f"need at least min_pairs={args.min_pairs}."
+        )
 
     directions: Dict[str, Dict[int, torch.Tensor]] = {site: {} for site in sites}
     stats: Dict[str, Dict[int, Dict[str, Any]]] = {site: {} for site in sites}
     for site in sites:
         for round_idx in rounds:
             direction, site_stats = build_site_direction(
-                clean_trace=clean_trace,
-                attack_trace=attack_trace,
-                clean_trace_path=clean_trace_path,
-                attack_trace_path=attack_trace_path,
+                trace_tensors=trace_tensors,
                 site=site,
                 round_idx=round_idx,
-                paired_ids=paired_ids,
-                clean_trace_index=clean_trace_index,
-                attack_trace_index=attack_trace_index,
+                clean_indices=selected_clean_indices,
+                attack_indices=selected_attack_indices,
+                selected_filter=args.filter,
+                target_answer=str(args.target_answer),
             )
             directions[site][int(round_idx)] = direction
             stats[site][int(round_idx)] = site_stats
 
+    metadata = {
+        "source": "attack-associated-diffmean",
+        "dataset": "math500",
+        "calibration_R": int(args.calibration_R),
+        "sites": sites,
+        "rounds": rounds,
+        "filter": args.filter,
+        "target_answer": str(args.target_answer),
+        "steering_id": args.steering_id,
+        **diagnostics,
+        "selected_sample_ids": selected_sample_ids,
+        "selected_sample_indices": selected_clean_indices,
+        "selected_clean_trace_indices": selected_clean_indices,
+        "selected_attack_trace_indices": selected_attack_indices,
+        # Legacy aliases retained for older analysis scripts.
+        "n_pairs": len(selected_sample_ids),
+        "n_total_pairs": len(paired_ids),
+        "n_attack_wrong": n_attack_wrong_by_existing_judge,
+        "n_clean_correct_attack_wrong": n_clean_correct_attack_wrong_by_existing_judge,
+    }
+
     bank = {
-        "metadata": {
-            "source": "attack-associated-diffmean",
-            "dataset": "math500",
-            "calibration_R": int(args.calibration_R),
-            "sites": sites,
-            "rounds": rounds,
-            "filter": args.filter,
-            "steering_id": args.steering_id,
-            "n_pairs": len(paired_ids),
-            "n_total_pairs": len(paired_ids),
-            "n_clean_correct": n_clean_correct,
-            "n_attack_wrong": n_attack_wrong,
-            "n_clean_correct_attack_wrong": n_clean_correct_attack_wrong,
-        },
+        "metadata": metadata,
         "directions": {
             "diffmean": directions,
         },
@@ -324,10 +553,12 @@ def main() -> None:
     out_dir = os.path.dirname(str(out_bank_path))
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
+    print("[diffmean] diagnostics " + " ".join(f"{key}={value}" for key, value in diagnostics.items()))
     torch.save(bank, out_bank_path)
     print(
         f"[diffmean] wrote {out_bank_path} "
-        f"pairs={len(paired_ids)} sites={','.join(sites)} rounds={','.join(str(r) for r in rounds)}"
+        f"pairs={len(selected_sample_ids)} filter={args.filter} "
+        f"sites={','.join(sites)} rounds={','.join(str(r) for r in rounds)}"
     )
 
 
