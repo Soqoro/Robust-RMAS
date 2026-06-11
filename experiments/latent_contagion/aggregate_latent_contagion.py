@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate latent-contagion Experiment B JSONL logs.
+"""Aggregate latent-contagion JSONL logs.
 
 This script intentionally computes all metrics from per-sample JSONL rows.
 Summary rows are used only for an accuracy sanity check.
@@ -16,17 +16,24 @@ from itertools import combinations
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-try:
-    import numpy as np
-    import pandas as pd
-except ImportError as exc:
-    raise SystemExit(
-        "aggregate_experiment_b.py requires numpy and pandas. "
-        "Install those packages, and install matplotlib as well if --make_plots true."
-    ) from exc
 
-
+np = None
+pd = None
 plt = None
+
+
+def load_required_packages() -> None:
+    global np, pd
+    try:
+        import numpy as np_module
+        import pandas as pd_module
+    except ImportError as exc:
+        raise SystemExit(
+            "aggregate_latent_contagion.py requires numpy and pandas. "
+            "Install those packages, and install matplotlib as well if --make_plots true."
+        ) from exc
+    np = np_module
+    pd = pd_module
 
 
 CONDITION_COLUMNS = [
@@ -1094,12 +1101,21 @@ def find_jsonl_files(root: Path, dataset: str, subdir: str) -> List[Path]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Aggregate latent-contagion Experiment B one-shot JSONL runs."
+        description="Aggregate latent-contagion JSONL runs."
     )
     parser.add_argument("--root", default="outputs/latent_contagion/experiment_b")
     parser.add_argument("--dataset", default="math500")
     parser.add_argument("--subdir", default="oneshot")
-    parser.add_argument("--out_dir", default="outputs/latent_contagion/experiment_b/aggregate")
+    parser.add_argument(
+        "--out_dir",
+        default=None,
+        help="Directory for aggregate outputs. Defaults to <root>/aggregate.",
+    )
+    parser.add_argument(
+        "--label",
+        default=None,
+        help="Label used in output filenames. Defaults to the final path component of --root.",
+    )
     parser.add_argument("--exclude_s2p_r1", nargs="?", const=True, default=True, type=parse_bool)
     parser.add_argument("--make_plots", nargs="?", const=True, default=True, type=parse_bool)
     return parser.parse_args()
@@ -1107,9 +1123,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    load_required_packages()
     root = Path(args.root)
-    out_dir = Path(args.out_dir)
+    out_dir = Path(args.out_dir) if args.out_dir else root / "aggregate"
     out_dir.mkdir(parents=True, exist_ok=True)
+    output_label = args.label or root.name or "latent_contagion"
 
     warnings: List[str] = []
     jsonl_files = find_jsonl_files(root, args.dataset, args.subdir)
@@ -1131,14 +1149,14 @@ def main() -> None:
     epsilon50 = compute_epsilon50(per_condition)
     disagreements = compute_clean_disagreements(sample_df, warnings)
 
-    per_condition_path = out_dir / f"{args.dataset}_experiment_b_per_condition.csv"
-    epsilon50_path = out_dir / f"{args.dataset}_experiment_b_epsilon50.csv"
-    disagreements_path = out_dir / f"{args.dataset}_experiment_b_clean_disagreements.csv"
-    clean_flip_floor_path = out_dir / f"{args.dataset}_experiment_b_clean_flip_floor.csv"
+    per_condition_path = out_dir / f"{args.dataset}_{output_label}_per_condition.csv"
+    epsilon50_path = out_dir / f"{args.dataset}_{output_label}_epsilon50.csv"
+    disagreements_path = out_dir / f"{args.dataset}_{output_label}_clean_disagreements.csv"
+    clean_flip_floor_path = out_dir / f"{args.dataset}_{output_label}_clean_flip_floor.csv"
     clean_flip_floor_pooled_path = (
-        out_dir / f"{args.dataset}_experiment_b_clean_flip_floor_pooled.csv"
+        out_dir / f"{args.dataset}_{output_label}_clean_flip_floor_pooled.csv"
     )
-    warnings_path = out_dir / f"{args.dataset}_experiment_b_warnings.txt"
+    warnings_path = out_dir / f"{args.dataset}_{output_label}_warnings.txt"
 
     per_condition.to_csv(per_condition_path, index=False)
     epsilon50.to_csv(epsilon50_path, index=False)
