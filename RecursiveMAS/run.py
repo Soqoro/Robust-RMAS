@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import io
 import os
+import random
 import re
 import sys
 from pathlib import Path
@@ -14,6 +15,8 @@ THIS_DIR = Path(__file__).resolve().parent
 PARENT_DIR = THIS_DIR.parent
 if str(PARENT_DIR) not in sys.path:
     sys.path.insert(0, str(PARENT_DIR))
+
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 from hf_resolver import (
     resolve_inner_adapter,
@@ -120,6 +123,41 @@ def resolve_latent_steps(explicit: int) -> Tuple[int, ...]:
 
 def _has_cli_flag(flag: str) -> bool:
     return flag in sys.argv[1:]
+
+
+def configure_reproducibility(seed: int, deterministic: bool) -> None:
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+    random.seed(int(seed))
+    try:
+        import numpy as np
+
+        np.random.seed(int(seed) % (2**32 - 1))
+    except Exception:
+        pass
+
+    try:
+        import torch
+
+        torch.manual_seed(int(seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(seed))
+
+        if deterministic:
+            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+            if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+                torch.backends.cuda.matmul.allow_tf32 = False
+            if hasattr(torch.backends, "cudnn") and hasattr(torch.backends.cudnn, "allow_tf32"):
+                torch.backends.cudnn.allow_tf32 = False
+            try:
+                torch.use_deterministic_algorithms(True, warn_only=True)
+            except TypeError:
+                torch.use_deterministic_algorithms(True)
+    except Exception as exc:
+        print(f"[warn] failed to configure reproducibility: {exc}")
 
 
 def apply_recommended_settings(args: argparse.Namespace) -> None:
@@ -395,6 +433,7 @@ def main() -> int:
 
     args = build_parser().parse_args()
     apply_recommended_settings(args)
+    configure_reproducibility(args.seed, deterministic=bool(args.deterministic))
     repo_root = Path(__file__).resolve().parent
     dataset_arg = resolve_medqa_dataset_arg(args.dataset, repo_root)
     dataset_split = infer_dataset_split(args.dataset, args.dataset_split)

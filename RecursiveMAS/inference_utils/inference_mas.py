@@ -25,6 +25,8 @@ def _patched_find_spec(name: str, *args, **kwargs):
 if os.environ.get("MAS_FORCE_DISABLE_TORCHVISION", "1") == "1":
     importlib.util.find_spec = _patched_find_spec
 
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 import torch
 from datasets import load_dataset
 from tqdm import tqdm
@@ -2454,12 +2456,10 @@ def main() -> None:
     agent2_inputs_for_log: List[str] = []
     agent3_inputs_for_log: List[str] = []
     rollout_seeds: List[int] = []
+    first_seed = set_rollout_seed(0)
+    rollout_seeds.append(first_seed)
     if args.do_sample:
-        first_seed = set_rollout_seed(0)
-        rollout_seeds.append(first_seed)
         print(f"[rollout 1/{args.num_rollouts}] sample_seed={first_seed}")
-    else:
-        rollout_seeds.append(base_sample_seed)
 
     solver_rollout_latents: Optional[List[torch.Tensor]] = None
     text_recursive_solver_outputs_rounds_for_log: Optional[List[List[str]]] = None
