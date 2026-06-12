@@ -183,6 +183,9 @@ def _is_empty_value(value: Any) -> bool:
 
 def is_invalid_record(record: Mapping[str, Any]) -> bool:
     """Conservative invalid-output rule for Math500/freeform tasks."""
+    invalid_value = _first_nonempty(record.get("answer_invalid_strict"), record.get("answer_invalid"))
+    if invalid_value is not None:
+        return parse_bool(invalid_value)
     return (
         _is_empty_value(record.get("raw_final_output"))
         or _is_empty_value(record.get("final_answer"))
@@ -234,6 +237,15 @@ def _first_nonempty(*values: Any) -> Any:
         if not _is_empty_value(value):
             return value
     return None
+
+
+def _preferred_correctness_value(record: Mapping[str, Any]) -> Any:
+    return _first_nonempty(
+        record.get("is_correct_strict"),
+        record.get("correct_strict"),
+        record.get("is_correct"),
+        record.get("correct"),
+    )
 
 
 def _key_value(value: Any) -> Any:
@@ -339,7 +351,7 @@ def _normalize_sample_record(
             f"{record.get('__line_number', 0)}"
         )
 
-    correctness_value = _first_nonempty(record.get("is_correct"), record.get("correct"))
+    correctness_value = _preferred_correctness_value(record)
     site = _first_nonempty(record.get("lc_site"), filename_metadata.get("site"))
     eps = _first_nonempty(record.get("lc_epsilon"), filename_metadata.get("eps"))
     recursion_rounds = _first_nonempty(record.get("recursion_rounds"), filename_metadata.get("R"))
@@ -368,6 +380,16 @@ def _normalize_sample_record(
         "correct_bool": parse_bool(correctness_value),
         "invalid_bool": is_invalid_record(record),
         "final_answer": _clean_text_value(record.get("final_answer")),
+        "judge_method": _metadata_text(record.get("judge_method")),
+        "judge_method_strict": _metadata_text(record.get("judge_method_strict")),
+        "answer_invalid": parse_bool(record.get("answer_invalid")) if record.get("answer_invalid") is not None else None,
+        "answer_invalid_strict": (
+            parse_bool(record.get("answer_invalid_strict"))
+            if record.get("answer_invalid_strict") is not None
+            else None
+        ),
+        "invalid_reason": _metadata_text(record.get("invalid_reason")),
+        "invalid_reason_strict": _metadata_text(record.get("invalid_reason_strict")),
         "source_file": str(record.get("__source_file", "")),
         "line_number": int(record.get("__line_number", 0) or 0),
     }
@@ -382,9 +404,11 @@ def _check_summary_accuracy(
     if not samples:
         return
     computed_accuracy = float(
-        np.mean([parse_bool(sample.get("is_correct", sample.get("correct"))) for sample in samples])
+        np.mean([parse_bool(_preferred_correctness_value(sample)) for sample in samples])
     )
     for summary in summaries:
+        if not any("strict" in str(key) for key in summary):
+            warnings.append(f"{path}: summary row was not rejudged; using strict per-sample fields when present")
         if "accuracy" not in summary:
             continue
         summary_accuracy = _to_float(summary.get("accuracy"))
@@ -417,6 +441,12 @@ def build_condition_dataframe(
         "correct_bool",
         "invalid_bool",
         "final_answer",
+        "judge_method",
+        "judge_method_strict",
+        "answer_invalid",
+        "answer_invalid_strict",
+        "invalid_reason",
+        "invalid_reason_strict",
         "source_file",
         "line_number",
     ]

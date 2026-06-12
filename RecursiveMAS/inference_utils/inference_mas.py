@@ -32,6 +32,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .answer_utils import (
     compare_answers,
+    compare_answers_detailed,
     ensure_choice_instruction,
     extract_boxed_answer,
     extract_choice_answer,
@@ -3409,7 +3410,7 @@ def main() -> None:
     total = len(questions)
     result_jsonl_path = args.result_jsonl.strip()
     sample_records: List[Dict[str, object]] = []
-    rollout_eval_math: List[List[Tuple[str, Optional[str], bool, str, str]]] = []
+    rollout_eval_math: List[List[Dict[str, Any]]] = []
     rollout_eval_code: List[List[Dict[str, Any]]] = []
     rollout_correct_counts: List[int] = []
 
@@ -3450,16 +3451,16 @@ def main() -> None:
                     )
             rollout_eval_code.append(eval_rows_code)
         else:
-            eval_rows_math: List[Tuple[str, Optional[str], bool, str, str]] = []
+            eval_rows_math: List[Dict[str, Any]] = []
             for i in range(total):
-                gold_parsed, pred_parsed, is_correct, gold_norm, pred_norm = compare_answers(
+                eval_row = compare_answers_detailed(
                     gold_answers[i],
                     outputs[i],
                     dataset_name=dataset_name,
                 )
-                if is_correct:
+                if bool(eval_row.get("correct", False)):
                     correct_count += 1
-                eval_rows_math.append((gold_parsed, pred_parsed, is_correct, gold_norm, pred_norm))
+                eval_rows_math.append(eval_row)
             rollout_eval_math.append(eval_rows_math)
 
         rollout_correct_counts.append(correct_count)
@@ -3476,7 +3477,7 @@ def main() -> None:
             if any(bool(rollout_eval_code[r][i]["correct"]) for r in range(args.num_rollouts)):
                 pass_correct_total += 1
         else:
-            if any(rollout_eval_math[r][i][2] for r in range(args.num_rollouts)):
+            if any(bool(rollout_eval_math[r][i].get("correct", False)) for r in range(args.num_rollouts)):
                 pass_correct_total += 1
     pass_at_k = 100.0 * pass_correct_total / total if total > 0 else 0.0
     runtime_total_sec = time.time() - run_wall_start
@@ -3598,7 +3599,12 @@ def main() -> None:
                 print("\n9) Code evaluation:")
                 print(json.dumps(eval_result, ensure_ascii=False))
             else:
-                gold_parsed, pred_parsed, is_correct, gold_norm, pred_norm = rollout_eval_math[0][i]
+                eval_row = rollout_eval_math[0][i]
+                gold_parsed = eval_row.get("gold_answer_parsed")
+                pred_parsed = eval_row.get("pred_answer_parsed")
+                is_correct = bool(eval_row.get("correct", False))
+                gold_norm = str(eval_row.get("gold_norm", ""))
+                pred_norm = str(eval_row.get("pred_norm", ""))
                 pred_display = pred_parsed if pred_parsed is not None else "<NOT_FOUND>"
                 if result_jsonl_path:
                     record = baseline_record_fields(i, pred_parsed, bool(is_correct))
@@ -3610,6 +3616,10 @@ def main() -> None:
                             "correct": bool(is_correct),
                             "gold_norm": gold_norm,
                             "pred_norm": pred_norm,
+                            "judge_method": eval_row.get("judge_method", ""),
+                            "answer_invalid": bool(eval_row.get("answer_invalid", False)),
+                            "invalid_reason": eval_row.get("invalid_reason", ""),
+                            "checker_version": eval_row.get("checker_version", ""),
                         }
                     )
                     sample_records.append(record)
@@ -3664,15 +3674,21 @@ def main() -> None:
                             }
                         )
                     else:
-                        gold_parsed, pred_parsed, is_correct, gold_norm, pred_norm = rollout_eval_math[r][i]
+                        eval_row = rollout_eval_math[r][i]
+                        pred_parsed = eval_row.get("pred_answer_parsed")
+                        is_correct = bool(eval_row.get("correct", False))
                         rollout_records.append(
                             {
                                 "rollout_idx": r,
                                 "sample_seed": rollout_seeds[r],
                                 "pred_answer_parsed": pred_parsed,
                                 "correct": bool(is_correct),
-                                "gold_norm": gold_norm,
-                                "pred_norm": pred_norm,
+                                "gold_norm": eval_row.get("gold_norm", ""),
+                                "pred_norm": eval_row.get("pred_norm", ""),
+                                "judge_method": eval_row.get("judge_method", ""),
+                                "answer_invalid": bool(eval_row.get("answer_invalid", False)),
+                                "invalid_reason": eval_row.get("invalid_reason", ""),
+                                "checker_version": eval_row.get("checker_version", ""),
                             }
                         )
 
@@ -3692,8 +3708,15 @@ def main() -> None:
                 if is_code_eval:
                     row_obj["pred_code_parsed"] = final_answer
                 else:
-                    row_obj["gold_answer_parsed"] = rollout_eval_math[0][i][0]
+                    first_eval = rollout_eval_math[0][i]
+                    row_obj["gold_answer_parsed"] = first_eval.get("gold_answer_parsed")
                     row_obj["pred_answer_parsed"] = final_answer
+                    row_obj["gold_norm"] = first_eval.get("gold_norm", "")
+                    row_obj["pred_norm"] = first_eval.get("pred_norm", "")
+                    row_obj["judge_method"] = first_eval.get("judge_method", "")
+                    row_obj["answer_invalid"] = bool(first_eval.get("answer_invalid", False))
+                    row_obj["invalid_reason"] = first_eval.get("invalid_reason", "")
+                    row_obj["checker_version"] = first_eval.get("checker_version", "")
                 sample_records.append(row_obj)
 
     if args.num_rollouts == 1:
