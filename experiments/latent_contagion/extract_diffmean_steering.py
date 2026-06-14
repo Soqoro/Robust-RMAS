@@ -273,6 +273,22 @@ def lookup_latent(trace: Mapping[str, Any], site: str, round_idx: int, path: Pat
     return tensor
 
 
+def find_latent(trace: Mapping[str, Any], site: str, round_idx: int) -> Optional[torch.Tensor]:
+    latents = trace.get("latents")
+    if not isinstance(latents, dict):
+        return None
+    rounds = latents.get(site)
+    if not isinstance(rounds, dict):
+        return None
+    if round_idx in rounds:
+        tensor = rounds[round_idx]
+    elif str(round_idx) in rounds:
+        tensor = rounds[str(round_idx)]
+    else:
+        return None
+    return tensor if isinstance(tensor, torch.Tensor) else None
+
+
 def collect_trace_tensors(
     clean_trace: Mapping[str, Any],
     attack_trace: Mapping[str, Any],
@@ -280,15 +296,30 @@ def collect_trace_tensors(
     attack_trace_path: Path,
     sites: Sequence[str],
     rounds: Sequence[int],
-) -> Dict[Tuple[str, int], Tuple[torch.Tensor, torch.Tensor]]:
+) -> Tuple[Dict[Tuple[str, int], Tuple[torch.Tensor, torch.Tensor]], List[Dict[str, Any]]]:
     tensors: Dict[Tuple[str, int], Tuple[torch.Tensor, torch.Tensor]] = {}
+    skipped: List[Dict[str, Any]] = []
     for site in sites:
         for round_idx in rounds:
-            tensors[(site, int(round_idx))] = (
-                lookup_latent(clean_trace, site, int(round_idx), clean_trace_path),
-                lookup_latent(attack_trace, site, int(round_idx), attack_trace_path),
-            )
-    return tensors
+            clean_tensor = find_latent(clean_trace, site, int(round_idx))
+            attack_tensor = find_latent(attack_trace, site, int(round_idx))
+            if clean_tensor is None and attack_tensor is None:
+                skipped.append(
+                    {
+                        "site": site,
+                        "round_idx": int(round_idx),
+                        "reason": "missing_in_both_traces",
+                    }
+                )
+                continue
+            if clean_tensor is None or attack_tensor is None:
+                missing_path = clean_trace_path if clean_tensor is None else attack_trace_path
+                raise ValueError(
+                    f"Trace pair is incomplete for site={site!r} round={int(round_idx)}; "
+                    f"missing in {missing_path}"
+                )
+            tensors[(site, int(round_idx))] = (clean_tensor, attack_tensor)
+    return tensors, skipped
 
 
 def select_rows(tensor: torch.Tensor, indices: Sequence[int]) -> torch.Tensor:
@@ -418,7 +449,7 @@ def main() -> None:
     attack_trace = torch_load_cpu(attack_trace_path)
     clean_trace_ids, clean_trace_index = index_by_sample_id(clean_trace, clean_trace_path)
     _, attack_trace_index = index_by_sample_id(attack_trace, attack_trace_path)
-    trace_tensors = collect_trace_tensors(
+    trace_tensors, skipped_trace_entries = collect_trace_tensors(
         clean_trace=clean_trace,
         attack_trace=attack_trace,
         clean_trace_path=clean_trace_path,
@@ -426,6 +457,8 @@ def main() -> None:
         sites=sites,
         rounds=rounds,
     )
+    if not trace_tensors:
+        raise ValueError("No requested site/round trace tensors were found.")
 
     paired_ids = paired_ids_from_sources(
         clean_json=clean_records,
@@ -507,19 +540,23 @@ def main() -> None:
 
     directions: Dict[str, Dict[int, torch.Tensor]] = {site: {} for site in sites}
     stats: Dict[str, Dict[int, Dict[str, Any]]] = {site: {} for site in sites}
-    for site in sites:
-        for round_idx in rounds:
-            direction, site_stats = build_site_direction(
-                trace_tensors=trace_tensors,
-                site=site,
-                round_idx=round_idx,
-                clean_indices=selected_clean_indices,
-                attack_indices=selected_attack_indices,
-                selected_filter=args.filter,
-                target_answer=str(args.target_answer),
-            )
-            directions[site][int(round_idx)] = direction
-            stats[site][int(round_idx)] = site_stats
+    for site, round_idx in sorted(trace_tensors, key=lambda item: (item[0], item[1])):
+        direction, site_stats = build_site_direction(
+            trace_tensors=trace_tensors,
+            site=site,
+            round_idx=round_idx,
+            clean_indices=selected_clean_indices,
+            attack_indices=selected_attack_indices,
+            selected_filter=args.filter,
+            target_answer=str(args.target_answer),
+        )
+        directions[site][int(round_idx)] = direction
+        stats[site][int(round_idx)] = site_stats
+
+    available_rounds_by_site = {
+        site: sorted(int(round_idx) for round_idx in directions.get(site, {}))
+        for site in sites
+    }
 
     metadata = {
         "source": "attack-associated-diffmean",
@@ -527,6 +564,8 @@ def main() -> None:
         "calibration_R": int(args.calibration_R),
         "sites": sites,
         "rounds": rounds,
+        "available_rounds_by_site": available_rounds_by_site,
+        "skipped_trace_entries": skipped_trace_entries,
         "filter": args.filter,
         "target_answer": str(args.target_answer),
         "steering_id": args.steering_id,
@@ -558,7 +597,8 @@ def main() -> None:
     print(
         f"[diffmean] wrote {out_bank_path} "
         f"pairs={len(selected_sample_ids)} filter={args.filter} "
-        f"sites={','.join(sites)} rounds={','.join(str(r) for r in rounds)}"
+        f"sites={','.join(sites)} rounds={','.join(str(r) for r in rounds)} "
+        f"skipped={len(skipped_trace_entries)}"
     )
 
 
