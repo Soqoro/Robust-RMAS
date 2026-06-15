@@ -21,13 +21,13 @@ Example:
     --attack_jsonl outputs/latent_contagion/diffmean_calibration/math500_R2/attack_R2.jsonl \\
     --clean_trace outputs/latent_contagion/diffmean_calibration/math500_R2/clean_R2_trace.pt \\
     --attack_trace outputs/latent_contagion/diffmean_calibration/math500_R2/attack_R2_trace.pt \\
-    --out_bank outputs/latent_contagion/diffmean_calibration/math500_R2/diffmean_R2_math500_role_aligned_target_hit.pt \\
+    --out_bank outputs/latent_contagion/diffmean_calibration/math500_R2/diffmean_R2_math500_role_aligned_clean_correct_attack_wrong.pt \\
     --sites p2c,c2s,s2p \\
     --rounds 0 \\
-    --filter target_hit \\
+    --filter clean_correct_attack_wrong \\
     --target_answer 999999999 \\
     --calibration_R 2 \\
-    --steering_id diffmean_R2_math500_role_aligned_target_hit
+    --steering_id diffmean_R2_math500_role_aligned_clean_correct_attack_wrong
 """
 
 
@@ -410,7 +410,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--filter",
         default="all_valid_pairs",
-        choices=["all_valid_pairs", "target_hit", "clean_correct_target_hit"],
+        choices=[
+            "all_valid_pairs",
+            "target_hit",
+            "clean_correct_target_hit",
+            "clean_correct_attack_wrong",
+        ],
     )
     parser.add_argument("--target_answer", default="999999999")
     parser.add_argument("--min_pairs", type=int, default=1)
@@ -512,6 +517,8 @@ def main() -> None:
             include = target_hit
         elif args.filter == "clean_correct_target_hit":
             include = clean_correct_target_hit
+        elif args.filter == "clean_correct_attack_wrong":
+            include = clean_is_correct and attack_is_wrong
         else:
             raise ValueError(f"Unsupported --filter: {args.filter}")
 

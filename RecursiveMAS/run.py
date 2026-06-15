@@ -52,6 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dataset", required=True, default="math500", choices=["math500", "medqa", "gpqa", "mbppplus"])
     p.add_argument("--dataset_split", default="")
     p.add_argument("--question_suffix_path", default="")
+    p.add_argument("--prompt_footer_path", default="")
     p.add_argument(
         "--method",
         default="ours_recursive",
@@ -277,6 +278,8 @@ def build_common_cli(args: argparse.Namespace, dataset_arg: str, dataset_split: 
     if str(STYLE_SPECS[args.style]["family"]) == "sequential":
         if args.question_suffix_path:
             out.extend(["--question_suffix_path", str(args.question_suffix_path)])
+        if args.prompt_footer_path:
+            out.extend(["--prompt_footer_path", str(args.prompt_footer_path)])
         out.extend(
             [
                 "--lc_mode", str(args.lc_mode),

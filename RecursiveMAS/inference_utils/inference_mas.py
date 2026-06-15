@@ -700,6 +700,13 @@ def render_chat_prompt(tokenizer, user_prompt: str, enable_thinking: bool) -> st
     return _normalize_template_text(tokenizer, rendered)
 
 
+def append_prompt_footer(user_prompt: str, prompt_footer: str = "") -> str:
+    footer = str(prompt_footer or "").strip()
+    if not footer:
+        return user_prompt
+    return str(user_prompt).rstrip() + "\n\n" + footer
+
+
 def render_chat_prompt_ids(tokenizer, user_prompt: str, enable_thinking: bool) -> List[int]:
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -1196,6 +1203,7 @@ def run_planner_latent_stage(
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
     trace_recorder: Optional[LatentTraceRecorder] = None,
+    prompt_footer: str = "",
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
         out_dim = infer_outer_adapter_out_dim_from_file(outer_12_path)
@@ -1237,6 +1245,7 @@ def run_planner_latent_stage(
             user_prompt = build_code_planner_prompt(question, task_types[idx], fn_name=fn_name)
         else:
             user_prompt = build_math_planner_prompt(question)
+        user_prompt = append_prompt_footer(user_prompt, prompt_footer)
         prompt_ids.append(render_chat_prompt_ids(tokenizer, user_prompt, enable_thinking))
 
     planner_to_refiner: List[torch.Tensor] = []
@@ -1294,6 +1303,7 @@ def run_refiner_latent_stage(
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
     trace_recorder: Optional[LatentTraceRecorder] = None,
+    prompt_footer: str = "",
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
         out_dim = infer_outer_adapter_out_dim_from_file(outer_23_path)
@@ -1345,6 +1355,7 @@ def run_refiner_latent_stage(
             )
         else:
             user_prompt = build_math_refiner_prompt_with_slot(question)
+        user_prompt = append_prompt_footer(user_prompt, prompt_footer)
         prompt_segments.append(
             split_prompt_ids_by_slots(
                 tokenizer,
@@ -1421,6 +1432,7 @@ def run_solver_feedback_latent_stage(
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
     trace_recorder: Optional[LatentTraceRecorder] = None,
+    prompt_footer: str = "",
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
         out_dim = infer_outer_adapter_out_dim_from_file(outer_31_path)
@@ -1474,6 +1486,7 @@ def run_solver_feedback_latent_stage(
             )
         else:
             user_prompt = build_math_solver_prompt_with_slots(question, args, mas_shape=args.mas_shape)
+        user_prompt = append_prompt_footer(user_prompt, prompt_footer)
         prompt_segments.append(
             split_prompt_ids_by_slots(
                 tokenizer,
@@ -1549,6 +1562,7 @@ def run_planner_feedback_latent_stage(
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
     trace_recorder: Optional[LatentTraceRecorder] = None,
+    prompt_footer: str = "",
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
         out_dim = infer_outer_adapter_out_dim_from_file(outer_12_path)
@@ -1600,6 +1614,7 @@ def run_planner_feedback_latent_stage(
             )
         else:
             user_prompt = build_math_planner_prompt_with_feedback_slot(question)
+        user_prompt = append_prompt_footer(user_prompt, prompt_footer)
         prompt_segments.append(
             split_prompt_ids_by_slots(
                 tokenizer,
@@ -1671,6 +1686,7 @@ def run_solver_latent_stage(
     enable_thinking: bool,
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
+    prompt_footer: str = "",
 ) -> List[str]:
     model, tokenizer = load_agent_model_and_tokenizer(
         model_name_or_path=model_name_or_path,
@@ -1702,6 +1718,7 @@ def run_solver_latent_stage(
             )
         else:
             user_prompt = build_math_solver_prompt_with_slots(question, args, mas_shape=args.mas_shape)
+        user_prompt = append_prompt_footer(user_prompt, prompt_footer)
         prompt_segments.append(
             split_prompt_ids_by_slots(
                 tokenizer,
@@ -1902,6 +1919,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", type=str, default="openai/gsm8k")
     parser.add_argument("--dataset_split", type=str, default="test")
     parser.add_argument("--question_suffix_path", type=str, default="")
+    parser.add_argument("--prompt_footer_path", type=str, default="")
     parser.add_argument("--num_samples", type=int, default=100)
     parser.add_argument("--shuffle", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
@@ -2234,6 +2252,13 @@ def main() -> None:
         questions = [str(question).rstrip() + "\n\n" + question_suffix for question in questions]
         print(f"[direct-attack] appended question suffix from {question_suffix_path}")
 
+    prompt_footer_path = args.prompt_footer_path.strip()
+    prompt_footer = ""
+    if prompt_footer_path:
+        with open(prompt_footer_path, "r", encoding="utf-8") as f:
+            prompt_footer = f.read().rstrip()
+        print(f"[direct-attack] appended prompt footer from {prompt_footer_path}")
+
     trace_recorder: Optional[LatentTraceRecorder] = None
     if args.lc_trace_path:
         trace_sites = parse_lc_trace_sites(args.lc_trace_sites)
@@ -2257,6 +2282,7 @@ def main() -> None:
                 "trace_rounds": trace_rounds,
                 "trace_dtype": args.lc_trace_dtype,
                 "question_suffix_path": args.question_suffix_path,
+                "prompt_footer_path": args.prompt_footer_path,
             },
             sample_ids=trace_sample_ids,
             sample_indices=list(range(len(questions))),
@@ -2380,18 +2406,21 @@ def main() -> None:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(rollout_seed)
         return rollout_seed
+
     def build_planner_prompt_text(question: str, sample_idx: int, feedback_text: Optional[str] = None) -> str:
         if is_code_eval:
             if task_types is None:
                 raise RuntimeError("Missing task_types for code planner prompt.")
             fn_name = fn_names[sample_idx] if fn_names is not None else None
             if feedback_text is None:
-                return build_code_planner_prompt(question, task_types[sample_idx], fn_name=fn_name)
-            return build_code_planner_prompt_with_feedback_slot(
-                question,
-                task_types[sample_idx],
-                fn_name=fn_name,
-            ).replace(FEEDBACK_SLOT, feedback_text)
+                prompt = build_code_planner_prompt(question, task_types[sample_idx], fn_name=fn_name)
+            else:
+                prompt = build_code_planner_prompt_with_feedback_slot(
+                    question,
+                    task_types[sample_idx],
+                    fn_name=fn_name,
+                ).replace(FEEDBACK_SLOT, feedback_text)
+            return append_prompt_footer(prompt, prompt_footer)
 
         if feedback_text is None:
             prompt = build_math_planner_prompt(question)
@@ -2399,49 +2428,54 @@ def main() -> None:
             prompt = build_math_planner_prompt_with_feedback_slot(question).replace(FEEDBACK_SLOT, feedback_text)
         if planner_soften_step_template:
             prompt = soften_planner_format_instruction(prompt)
-        return prompt
+        return append_prompt_footer(prompt, prompt_footer)
 
     def build_refiner_prompt_text(question: str, planner_output: str, sample_idx: int) -> str:
         if is_code_eval:
             if task_types is None:
                 raise RuntimeError("Missing task_types for code refiner prompt.")
             fn_name = fn_names[sample_idx] if fn_names is not None else None
-            return build_code_refiner_prompt(
+            prompt = build_code_refiner_prompt(
                 question,
                 planner_output,
                 task_types[sample_idx],
                 fn_name=fn_name,
             )
-        prompt = build_math_refiner_prompt(question, planner_output)
-        if refiner_force_plan_only:
-            prompt = f"{prompt}\nDo not calculate the final answer."
-        return prompt
+        else:
+            prompt = build_math_refiner_prompt(question, planner_output)
+            if refiner_force_plan_only:
+                prompt = f"{prompt}\nDo not calculate the final answer."
+        return append_prompt_footer(prompt, prompt_footer)
 
     def build_solver_prompt_text(question: str, refined_plan: str, sample_idx: int) -> str:
         if is_code_eval:
             if task_types is None:
                 raise RuntimeError("Missing task_types for code solver prompt.")
             fn_name = fn_names[sample_idx] if fn_names is not None else None
-            return build_code_solver_prompt(
+            prompt = build_code_solver_prompt(
                 question,
                 refined_plan,
                 task_types[sample_idx],
                 args=args,
                 fn_name=fn_name,
             )
-        return build_math_solver_prompt(question, refined_plan, args)
+        else:
+            prompt = build_math_solver_prompt(question, refined_plan, args)
+        return append_prompt_footer(prompt, prompt_footer)
 
     def build_single_solver_prompt_text(question: str, sample_idx: int) -> str:
         if is_code_eval:
             if task_types is None:
                 raise RuntimeError("Missing task_types for code single-solver prompt.")
             fn_name = fn_names[sample_idx] if fn_names is not None else None
-            return build_code_single_solver_prompt(
+            prompt = build_code_single_solver_prompt(
                 question,
                 task_types[sample_idx],
                 fn_name=fn_name,
             )
-        return build_math_single_solver_prompt(question, args)
+        else:
+            prompt = build_math_single_solver_prompt(question, args)
+        return append_prompt_footer(prompt, prompt_footer)
 
     agent1_inputs: List[str] = [
         build_planner_prompt_text(planner_questions[i], i)
@@ -2710,6 +2744,7 @@ def main() -> None:
             task_types=task_types,
             fn_names=fn_names,
             trace_recorder=trace_recorder,
+            prompt_footer=prompt_footer,
         )
         refiner_to_solver = run_refiner_latent_stage(
             model_name_or_path=refiner_model,
@@ -2731,6 +2766,7 @@ def main() -> None:
             task_types=task_types,
             fn_names=fn_names,
             trace_recorder=trace_recorder,
+            prompt_footer=prompt_footer,
         )
         solver_outputs = run_solver_latent_stage(
             model_name_or_path=solver_model,
@@ -2748,6 +2784,7 @@ def main() -> None:
             enable_thinking=enable_thinking,
             task_types=task_types,
             fn_names=fn_names,
+            prompt_footer=prompt_footer,
         )
         planner_to_refiner_desc = [format_latent_info(x) for x in planner_to_refiner]
         refiner_to_solver_desc = [format_latent_info(x) for x in refiner_to_solver]
@@ -2779,6 +2816,7 @@ def main() -> None:
                 a2_in = build_math_refiner_prompt_with_slot(question).replace(
                     PLANNER_SLOT, planner_to_refiner_desc[i]
                 )
+            a2_in = append_prompt_footer(a2_in, prompt_footer)
             agent2_inputs.append(a2_in)
         agent2_outputs = [
             f"to_agent3={refiner_to_solver_desc[i]}"
@@ -2800,6 +2838,7 @@ def main() -> None:
             else:
                 a3_in = build_math_solver_prompt_with_slots(question, args, mas_shape=args.mas_shape)
             a3_in = a3_in.replace(REFINED_SLOT, refiner_to_solver_desc[i])
+            a3_in = append_prompt_footer(a3_in, prompt_footer)
             agent3_inputs.append(a3_in)
         agent3_outputs = solver_outputs
     elif args.method in {"ours_recursive", "ours_recursive_no_feedback"}:
@@ -2831,6 +2870,7 @@ def main() -> None:
                     task_types=task_types,
                     fn_names=fn_names,
                     trace_recorder=trace_recorder,
+                    prompt_footer=prompt_footer,
                 )
             else:
                 if feedback_to_planner is None:
@@ -2855,6 +2895,7 @@ def main() -> None:
                     task_types=task_types,
                     fn_names=fn_names,
                     trace_recorder=trace_recorder,
+                    prompt_footer=prompt_footer,
                 )
             planner_to_refiner = [x for x in planner_to_refiner]
             planner_to_refiner_rounds.append(planner_to_refiner)
@@ -2879,6 +2920,7 @@ def main() -> None:
                 task_types=task_types,
                 fn_names=fn_names,
                 trace_recorder=trace_recorder,
+                prompt_footer=prompt_footer,
             )
             refiner_to_solver = [x for x in refiner_to_solver]
             refiner_to_solver_rounds.append(refiner_to_solver)
@@ -2905,6 +2947,7 @@ def main() -> None:
                     task_types=task_types,
                     fn_names=fn_names,
                     trace_recorder=trace_recorder,
+                    prompt_footer=prompt_footer,
                 )
                 feedback_to_planner = [x for x in feedback_to_planner]
                 feedback_to_planner_rounds.append(feedback_to_planner)
@@ -2926,6 +2969,7 @@ def main() -> None:
             enable_thinking=enable_thinking,
             task_types=task_types,
             fn_names=fn_names,
+            prompt_footer=prompt_footer,
         )
 
         planner_to_refiner_desc_rounds = [
@@ -2991,6 +3035,7 @@ def main() -> None:
                 ).replace(PLANNER_SLOT, final_planner_desc[i])
             else:
                 a2_in = build_math_refiner_prompt_with_slot(question).replace(PLANNER_SLOT, final_planner_desc[i])
+            a2_in = append_prompt_footer(a2_in, prompt_footer)
             agent2_inputs.append(a2_in)
 
         agent2_outputs = []
@@ -3018,6 +3063,7 @@ def main() -> None:
             else:
                 a3_in = build_math_solver_prompt_with_slots(question, args, mas_shape=args.mas_shape)
             a3_in = a3_in.replace(REFINED_SLOT, final_refiner_desc[i])
+            a3_in = append_prompt_footer(a3_in, prompt_footer)
             agent3_inputs.append(a3_in)
         agent3_outputs = solver_outputs
 
@@ -3100,16 +3146,20 @@ def main() -> None:
                 if task_types is None:
                     raise RuntimeError("Missing task_types for code refiner slot logging prompts.")
                 agent2_slot_prompts = [
-                    build_code_refiner_prompt_with_slot(
-                        questions[i],
-                        task_types[i],
-                        fn_name=(fn_names[i] if fn_names is not None else None),
+                    append_prompt_footer(
+                        build_code_refiner_prompt_with_slot(
+                            questions[i],
+                            task_types[i],
+                            fn_name=(fn_names[i] if fn_names is not None else None),
+                        ),
+                        prompt_footer,
                     )
                     for i in range(len(questions))
                 ]
             else:
                 agent2_slot_prompts = [
-                    build_math_refiner_prompt_with_slot(question) for question in questions
+                    append_prompt_footer(build_math_refiner_prompt_with_slot(question), prompt_footer)
+                    for question in questions
                 ]
             agent2_inputs_for_log = render_inputs_for_logging(
                 model_name_or_path=refiner_model,
@@ -3132,18 +3182,24 @@ def main() -> None:
                 if task_types is None:
                     raise RuntimeError("Missing task_types for code solver slot logging prompts.")
                 agent3_slot_prompts = [
-                    build_code_solver_prompt_with_slots(
-                        questions[i],
-                        task_types[i],
-                        args=args,
-                        mas_shape=args.mas_shape,
-                        fn_name=(fn_names[i] if fn_names is not None else None),
+                    append_prompt_footer(
+                        build_code_solver_prompt_with_slots(
+                            questions[i],
+                            task_types[i],
+                            args=args,
+                            mas_shape=args.mas_shape,
+                            fn_name=(fn_names[i] if fn_names is not None else None),
+                        ),
+                        prompt_footer,
                     )
                     for i in range(len(questions))
                 ]
             else:
                 agent3_slot_prompts = [
-                    build_math_solver_prompt_with_slots(question, args, mas_shape=args.mas_shape)
+                    append_prompt_footer(
+                        build_math_solver_prompt_with_slots(question, args, mas_shape=args.mas_shape),
+                        prompt_footer,
+                    )
                     for question in questions
                 ]
             agent3_inputs_for_log = render_inputs_for_logging(
@@ -3388,6 +3444,7 @@ def main() -> None:
                     enable_thinking=enable_thinking,
                     task_types=task_types,
                     fn_names=fn_names,
+                    prompt_footer=prompt_footer,
                 )
 
             if args.ans:
@@ -3516,6 +3573,7 @@ def main() -> None:
             "lc_steering_bank": args.lc_steering_bank,
             "lc_enabled": bool(perturb_cfg.enabled),
             "question_suffix_path": args.question_suffix_path,
+            "prompt_footer_path": args.prompt_footer_path,
             "question": questions[sample_idx],
             "ground_truth": gold_answers[sample_idx],
             "final_answer": final_answer,
@@ -3763,6 +3821,7 @@ def main() -> None:
                 "lc_steering_bank": args.lc_steering_bank,
                 "lc_enabled": bool(perturb_cfg.enabled),
                 "question_suffix_path": args.question_suffix_path,
+                "prompt_footer_path": args.prompt_footer_path,
                 "num_samples": total,
                 "num_rollouts": args.num_rollouts,
                 "sample_seed_base": base_sample_seed,

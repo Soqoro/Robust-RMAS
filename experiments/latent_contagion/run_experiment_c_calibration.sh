@@ -5,8 +5,10 @@
 #SBATCH --output=logs/latent_contagion_c_calibration_%A_%a.out
 #SBATCH --error=logs/latent_contagion_c_calibration_%A_%a.err
 
-# Experiment C calibration: collect clean/direct-attacked R=2 latent traces and
-# extract a DiffMean steering bank.
+# Experiment C calibration: collect clean/direct-attacked latent traces and
+# extract a DiffMean steering bank. TRACE_ROUNDS are zero-based latent round
+# indices: for recursive depth R=5, p2c/c2s rounds are 0..4 and s2p is absent
+# at final round 4.
 #
 # Slurm:
 #   CALIB_JOB=$(sbatch --parsable --array=0-1 experiments/latent_contagion/run_experiment_c_calibration.sh)
@@ -32,18 +34,32 @@ BATCH_SIZE="${BATCH_SIZE:-16}"
 LATENT_LENGTH="${LATENT_LENGTH:-48}"
 TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-1}"
 TRACE_SITES="${TRACE_SITES:-p2c,c2s,s2p}"
-TRACE_ROUNDS="${TRACE_ROUNDS:-0}"
+TRACE_ROUNDS="${TRACE_ROUNDS:-all}"
 TRACE_DTYPE="${TRACE_DTYPE:-float16}"
 GPU_LIST="${GPU_LIST:-}"
-FILTER="${FILTER:-all_valid_pairs}"
+FILTER="${FILTER:-clean_correct_attack_wrong}"
 TARGET_ANSWER="${TARGET_ANSWER:-999999999}"
 MIN_PAIRS="${MIN_PAIRS:-1}"
 ATTACK_SUFFIX_PATH="${ATTACK_SUFFIX_PATH:-experiments/latent_contagion/attack_suffix_math_role_aligned.txt}"
+
+if ! [[ "$CALIBRATION_R" =~ ^[0-9]+$ ]] || (( CALIBRATION_R < 1 )); then
+  echo "[error] CALIBRATION_R must be a positive integer, got: $CALIBRATION_R" >&2
+  exit 2
+fi
+
+# TRACE_ROUNDS uses zero-based latent round indices. "all" traces every p2c/c2s
+# round; extraction will skip the missing final s2p feedback round.
+if [[ -z "${TRACE_ROUNDS:-}" || "${TRACE_ROUNDS:-}" == "all" ]]; then
+  TRACE_ROUNDS="$(seq -s, 0 $((CALIBRATION_R - 1)))"
+fi
+
 DEFAULT_STEERING_ID="diffmean_R${CALIBRATION_R}_${DATASET}_role_aligned"
 if [[ "$FILTER" == "target_hit" ]]; then
   DEFAULT_STEERING_ID="${DEFAULT_STEERING_ID}_target_hit"
 elif [[ "$FILTER" == "clean_correct_target_hit" ]]; then
   DEFAULT_STEERING_ID="${DEFAULT_STEERING_ID}_clean_correct_target_hit"
+elif [[ "$FILTER" == "clean_correct_attack_wrong" ]]; then
+  DEFAULT_STEERING_ID="${DEFAULT_STEERING_ID}_clean_correct_attack_wrong"
 fi
 STEERING_ID="${STEERING_ID:-$DEFAULT_STEERING_ID}"
 CALIB_ROOT="${CALIB_ROOT:-outputs/latent_contagion/diffmean_calibration}"
@@ -101,6 +117,10 @@ unset PYTHONPATH || true
 mkdir -p "$CALIB_DIR" "$CALIB_DIR/logs" "$TMPDIR"
 
 RUN_LOG="$CALIB_DIR/logs/${CALIB_STAGE}_R${CALIBRATION_R}_seed=${SEED}.log"
+PROMPT_FOOTER_PATH_FOR_STAGE=""
+if [[ "$CALIB_STAGE" == "attack" ]]; then
+  PROMPT_FOOTER_PATH_FOR_STAGE="$ATTACK_SUFFIX_PATH"
+fi
 
 echo "Using TMPDIR=$TMPDIR"
 ls -ld "$TMPDIR" || true
@@ -133,6 +153,7 @@ echo "[experiment_c_calibration] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<u
   echo "task_id=$TASK_ID"
   echo "cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-}"
   echo "attack_suffix_path=$ATTACK_SUFFIX_PATH"
+  echo "prompt_footer_path=$PROMPT_FOOTER_PATH_FOR_STAGE"
   echo "filter=$FILTER"
   echo "target_answer=$TARGET_ANSWER"
   echo "min_pairs=$MIN_PAIRS"
@@ -176,11 +197,11 @@ if [[ "$CALIB_STAGE" == "extract" ]]; then
 else
   RESULT_JSONL="$CLEAN_JSONL"
   TRACE_PATH="$CLEAN_TRACE"
-  QUESTION_SUFFIX_ARGS=()
+  PROMPT_FOOTER_ARGS=()
   if [[ "$CALIB_STAGE" == "attack" ]]; then
     RESULT_JSONL="$ATTACK_JSONL"
     TRACE_PATH="$ATTACK_TRACE"
-    QUESTION_SUFFIX_ARGS=(--question_suffix_path "$ATTACK_SUFFIX_PATH")
+    PROMPT_FOOTER_ARGS=(--prompt_footer_path "$ATTACK_SUFFIX_PATH")
   fi
 
   cmd=(
@@ -202,7 +223,7 @@ else
     --lc_trace_sites "$TRACE_SITES"
     --lc_trace_rounds "$TRACE_ROUNDS"
     --lc_trace_dtype "$TRACE_DTYPE"
-    "${QUESTION_SUFFIX_ARGS[@]}"
+    "${PROMPT_FOOTER_ARGS[@]}"
   )
 
   if [[ -n "${SAMPLE_SEED:-}" ]]; then
