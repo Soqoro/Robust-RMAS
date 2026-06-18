@@ -91,6 +91,32 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lc_trace_sites", default="p2c,c2s,s2p")
     p.add_argument("--lc_trace_rounds", default="0")
     p.add_argument("--lc_trace_dtype", default="float16")
+    p.add_argument("--role_profile_trace_path", default="")
+    p.add_argument("--role_profile_trace_dtype", default="float32", choices=["float32", "float16", "bfloat16"])
+    p.add_argument("--role_profile_trace_messages", type=int, default=1, choices=[0, 1])
+    p.add_argument("--role_profile_trace_states", type=int, default=1, choices=[0, 1])
+    p.add_argument("--role_profile_trace_terminal", type=int, default=1, choices=[0, 1])
+    p.add_argument("--role_profile_probe_mode", default="none", choices=["none", "one_shot"])
+    p.add_argument("--role_profile_probe_target", default="none", choices=["none", "message", "state", "terminal"])
+    p.add_argument(
+        "--role_profile_probe_site",
+        default="none",
+        choices=[
+            "none",
+            "p2c",
+            "c2s",
+            "s2p",
+            "planner_self",
+            "critic_self",
+            "refiner_self",
+            "solver_self",
+            "final_c2s",
+        ],
+    )
+    p.add_argument("--role_profile_probe_round", type=int, default=-1)
+    p.add_argument("--role_profile_epsilon", type=float, default=0.0)
+    p.add_argument("--role_profile_seed", type=int, default=42)
+    p.add_argument("--role_profile_direction", default="random", choices=["random"])
     p.add_argument("--trust_remote_code", type=int, default=1, choices=[0, 1])
     p.add_argument("--device", default=None)
     return p
@@ -305,6 +331,22 @@ def build_common_cli(args: argparse.Namespace, dataset_arg: str, dataset_split: 
                     "--lc_trace_dtype", str(args.lc_trace_dtype),
                 ]
             )
+        out.extend(
+            [
+                "--role_profile_trace_path", str(args.role_profile_trace_path),
+                "--role_profile_trace_dtype", str(args.role_profile_trace_dtype),
+                "--role_profile_trace_messages", str(args.role_profile_trace_messages),
+                "--role_profile_trace_states", str(args.role_profile_trace_states),
+                "--role_profile_trace_terminal", str(args.role_profile_trace_terminal),
+                "--role_profile_probe_mode", str(args.role_profile_probe_mode),
+                "--role_profile_probe_target", str(args.role_profile_probe_target),
+                "--role_profile_probe_site", str(args.role_profile_probe_site),
+                "--role_profile_probe_round", str(args.role_profile_probe_round),
+                "--role_profile_epsilon", str(args.role_profile_epsilon),
+                "--role_profile_seed", str(args.role_profile_seed),
+                "--role_profile_direction", str(args.role_profile_direction),
+            ]
+        )
     if int(args.deterministic) == 0:
         out.append("--do_sample")
     out.append("--ans")

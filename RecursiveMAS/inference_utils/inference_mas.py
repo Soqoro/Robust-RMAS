@@ -79,6 +79,14 @@ from .lcb_utils import (
     load_mbppplus_records,
 )
 from .latent_contagion import PerturbConfig, maybe_perturb
+from .role_profile import (
+    RoleProfileConfig,
+    RoleProfileTraceRecorder,
+    apply_role_profile_probe,
+    canonical_probe_site,
+    resolve_role_profile_dtype,
+    state_site_to_role,
+)
 
 from modeling import (
     Adapter,
@@ -1203,6 +1211,8 @@ def run_planner_latent_stage(
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
     trace_recorder: Optional[LatentTraceRecorder] = None,
+    role_profile_cfg: Optional[RoleProfileConfig] = None,
+    role_profile_recorder: Optional[RoleProfileTraceRecorder] = None,
     prompt_footer: str = "",
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
@@ -1271,9 +1281,31 @@ def run_planner_latent_stage(
             latent_steps=latent_steps,
         )
         planner_self = run_inner_adapter(inner_1, hidden_rollout, output_dtype=planner_embed_dtype)
+        if role_profile_recorder is not None:
+            role_profile_recorder.record_state("planner", round_idx, start, planner_self)
+        planner_self, _role_meta = apply_role_profile_probe(
+            planner_self,
+            role_profile_cfg,
+            target="state",
+            site="planner_self",
+            round_idx=round_idx,
+            batch_start=start,
+            recorder=role_profile_recorder,
+        )
         lat12 = run_outer_adapter(outer_12, planner_self, output_dtype=planner_embed_dtype)
         if trace_recorder is not None:
             trace_recorder.record("p2c", round_idx, start, lat12)
+        if role_profile_recorder is not None:
+            role_profile_recorder.record_message("p2c", round_idx, start, lat12)
+        lat12, _role_meta = apply_role_profile_probe(
+            lat12,
+            role_profile_cfg,
+            target="message",
+            site="p2c",
+            round_idx=round_idx,
+            batch_start=start,
+            recorder=role_profile_recorder,
+        )
         lat12, _meta = maybe_perturb(lat12, perturb_cfg, "p2c", round_idx, start)
 
         for i in range(lat12.size(0)):
@@ -1303,6 +1335,8 @@ def run_refiner_latent_stage(
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
     trace_recorder: Optional[LatentTraceRecorder] = None,
+    role_profile_cfg: Optional[RoleProfileConfig] = None,
+    role_profile_recorder: Optional[RoleProfileTraceRecorder] = None,
     prompt_footer: str = "",
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
@@ -1400,9 +1434,31 @@ def run_refiner_latent_stage(
             latent_steps=latent_steps,
         )
         refiner_self = run_inner_adapter(inner_2, hidden_rollout, output_dtype=refiner_embed_dtype)
+        if role_profile_recorder is not None:
+            role_profile_recorder.record_state("critic", round_idx, start, refiner_self)
+        refiner_self, _role_meta = apply_role_profile_probe(
+            refiner_self,
+            role_profile_cfg,
+            target="state",
+            site="critic_self",
+            round_idx=round_idx,
+            batch_start=start,
+            recorder=role_profile_recorder,
+        )
         mapped = run_outer_adapter(outer_23, refiner_self, output_dtype=refiner_embed_dtype)
         if trace_recorder is not None:
             trace_recorder.record("c2s", round_idx, start, mapped)
+        if role_profile_recorder is not None:
+            role_profile_recorder.record_message("c2s", round_idx, start, mapped)
+        mapped, _role_meta = apply_role_profile_probe(
+            mapped,
+            role_profile_cfg,
+            target="message",
+            site="c2s",
+            round_idx=round_idx,
+            batch_start=start,
+            recorder=role_profile_recorder,
+        )
         mapped, _meta = maybe_perturb(mapped, perturb_cfg, "c2s", round_idx, start)
         for i in range(mapped.size(0)):
             refiner_to_solver.append(mapped[i].detach().cpu())
@@ -1432,6 +1488,8 @@ def run_solver_feedback_latent_stage(
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
     trace_recorder: Optional[LatentTraceRecorder] = None,
+    role_profile_cfg: Optional[RoleProfileConfig] = None,
+    role_profile_recorder: Optional[RoleProfileTraceRecorder] = None,
     prompt_footer: str = "",
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
@@ -1531,9 +1589,31 @@ def run_solver_feedback_latent_stage(
             latent_steps=latent_steps,
         )
         solver_self = run_inner_adapter(inner_3, hidden_rollout, output_dtype=solver_embed_dtype)
+        if role_profile_recorder is not None:
+            role_profile_recorder.record_state("solver", round_idx, start, solver_self)
+        solver_self, _role_meta = apply_role_profile_probe(
+            solver_self,
+            role_profile_cfg,
+            target="state",
+            site="solver_self",
+            round_idx=round_idx,
+            batch_start=start,
+            recorder=role_profile_recorder,
+        )
         mapped_feedback = run_outer_adapter(outer_31, solver_self, output_dtype=torch.float32)
         if trace_recorder is not None:
             trace_recorder.record("s2p", round_idx, start, mapped_feedback)
+        if role_profile_recorder is not None:
+            role_profile_recorder.record_message("s2p", round_idx, start, mapped_feedback)
+        mapped_feedback, _role_meta = apply_role_profile_probe(
+            mapped_feedback,
+            role_profile_cfg,
+            target="message",
+            site="s2p",
+            round_idx=round_idx,
+            batch_start=start,
+            recorder=role_profile_recorder,
+        )
         mapped_feedback, _meta = maybe_perturb(mapped_feedback, perturb_cfg, "s2p", round_idx, start)
         for i in range(mapped_feedback.size(0)):
             feedback_latents.append(mapped_feedback[i].detach().cpu())
@@ -1562,6 +1642,8 @@ def run_planner_feedback_latent_stage(
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
     trace_recorder: Optional[LatentTraceRecorder] = None,
+    role_profile_cfg: Optional[RoleProfileConfig] = None,
+    role_profile_recorder: Optional[RoleProfileTraceRecorder] = None,
     prompt_footer: str = "",
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
@@ -1659,9 +1741,31 @@ def run_planner_feedback_latent_stage(
             latent_steps=latent_steps,
         )
         planner_self = run_inner_adapter(inner_1, hidden_rollout, output_dtype=planner_embed_dtype)
+        if role_profile_recorder is not None:
+            role_profile_recorder.record_state("planner", round_idx, start, planner_self)
+        planner_self, _role_meta = apply_role_profile_probe(
+            planner_self,
+            role_profile_cfg,
+            target="state",
+            site="planner_self",
+            round_idx=round_idx,
+            batch_start=start,
+            recorder=role_profile_recorder,
+        )
         lat12 = run_outer_adapter(outer_12, planner_self, output_dtype=planner_embed_dtype)
         if trace_recorder is not None:
             trace_recorder.record("p2c", round_idx, start, lat12)
+        if role_profile_recorder is not None:
+            role_profile_recorder.record_message("p2c", round_idx, start, lat12)
+        lat12, _role_meta = apply_role_profile_probe(
+            lat12,
+            role_profile_cfg,
+            target="message",
+            site="p2c",
+            round_idx=round_idx,
+            batch_start=start,
+            recorder=role_profile_recorder,
+        )
         lat12, _meta = maybe_perturb(lat12, perturb_cfg, "p2c", round_idx, start)
         for i in range(lat12.size(0)):
             planner_to_refiner.append(lat12[i].detach().cpu())
@@ -1686,6 +1790,9 @@ def run_solver_latent_stage(
     enable_thinking: bool,
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
+    role_profile_cfg: Optional[RoleProfileConfig] = None,
+    role_profile_recorder: Optional[RoleProfileTraceRecorder] = None,
+    terminal_round_idx: int = 0,
     prompt_footer: str = "",
 ) -> List[str]:
     model, tokenizer = load_agent_model_and_tokenizer(
@@ -1744,7 +1851,27 @@ def run_solver_latent_stage(
         desc="solver text-from-latent",
     ):
         embed_seqs: List[torch.Tensor] = []
+        batch_refiner_latents = torch.stack(
+            [
+                refiner_latents[idx].to(device=device, dtype=embed_dtype)
+                for idx in range(start, end)
+            ],
+            dim=0,
+        )
+        if role_profile_recorder is not None:
+            role_profile_recorder.record_terminal("final_c2s", start, batch_refiner_latents)
+        batch_refiner_latents, _role_meta = apply_role_profile_probe(
+            batch_refiner_latents,
+            role_profile_cfg,
+            target="terminal",
+            site="final_c2s",
+            round_idx=terminal_round_idx,
+            batch_start=start,
+            recorder=role_profile_recorder,
+        )
+        latent_spans: List[Tuple[int, int, int]] = []
         for idx in range(start, end):
+            local_idx = idx - start
             seg_prefix, seg_suffix = prompt_segments[idx]
             prefix_embeds = token_ids_to_embeds(
                 embed_layer,
@@ -1758,7 +1885,7 @@ def run_solver_latent_stage(
                 device=device,
                 dtype=embed_dtype,
             )
-            refiner_embed = refiner_latents[idx].to(device=device, dtype=embed_dtype)
+            refiner_embed = batch_refiner_latents[local_idx]
             seq = torch.cat(
                 [
                     prefix_embeds,
@@ -1767,9 +1894,53 @@ def run_solver_latent_stage(
                 ],
                 dim=0,
             )
+            latent_start = int(prefix_embeds.size(0))
+            latent_end = latent_start + int(refiner_embed.size(0))
+            latent_spans.append((latent_start, latent_end, int(seq.size(0))))
             embed_seqs.append(seq)
 
         batch_embeds, attention_mask = pad_left_embeds(embed_seqs, device=device)
+        if role_profile_recorder is not None and role_profile_recorder.trace_terminal:
+            with torch.no_grad():
+                forward_kwargs = {
+                    "inputs_embeds": batch_embeds,
+                    "attention_mask": attention_mask,
+                    "output_hidden_states": True,
+                    "use_cache": False,
+                    "return_dict": True,
+                }
+                try:
+                    prefill_outputs = model(logits_to_keep=1, **forward_kwargs)
+                except TypeError:
+                    prefill_outputs = model(**forward_kwargs)
+            terminal_hidden = prefill_outputs.hidden_states[-1]
+            role_profile_recorder.record_terminal(
+                "solver_prefill_last_hidden",
+                start,
+                terminal_hidden[:, -1, :],
+            )
+            latent_means: List[torch.Tensor] = []
+            max_len = int(batch_embeds.size(1))
+            hidden_size_terminal = int(terminal_hidden.size(-1))
+            for local_idx, (latent_start, latent_end, seq_len) in enumerate(latent_spans):
+                pad_offset = max_len - int(seq_len)
+                start_pos = pad_offset + int(latent_start)
+                end_pos = pad_offset + int(latent_end)
+                if end_pos > start_pos:
+                    latent_means.append(terminal_hidden[local_idx, start_pos:end_pos, :].mean(dim=0))
+                else:
+                    latent_means.append(
+                        torch.zeros(
+                            hidden_size_terminal,
+                            device=terminal_hidden.device,
+                            dtype=terminal_hidden.dtype,
+                        )
+                    )
+            role_profile_recorder.record_terminal(
+                "solver_prefill_latent_mean",
+                start,
+                torch.stack(latent_means, dim=0),
+            )
         with torch.no_grad():
             generated = model.generate(
                 inputs_embeds=batch_embeds,
@@ -1972,6 +2143,53 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lc_trace_sites", type=str, default="p2c,c2s,s2p")
     parser.add_argument("--lc_trace_rounds", type=str, default="0")
     parser.add_argument("--lc_trace_dtype", type=str, default="float16")
+    parser.add_argument("--role_profile_trace_path", type=str, default="")
+    parser.add_argument(
+        "--role_profile_trace_dtype",
+        type=str,
+        default="float32",
+        choices=["float32", "float16", "bfloat16"],
+    )
+    parser.add_argument("--role_profile_trace_messages", type=int, default=1, choices=[0, 1])
+    parser.add_argument("--role_profile_trace_states", type=int, default=1, choices=[0, 1])
+    parser.add_argument("--role_profile_trace_terminal", type=int, default=1, choices=[0, 1])
+    parser.add_argument(
+        "--role_profile_probe_mode",
+        type=str,
+        default="none",
+        choices=["none", "one_shot"],
+    )
+    parser.add_argument(
+        "--role_profile_probe_target",
+        type=str,
+        default="none",
+        choices=["none", "message", "state", "terminal"],
+    )
+    parser.add_argument(
+        "--role_profile_probe_site",
+        type=str,
+        default="none",
+        choices=[
+            "none",
+            "p2c",
+            "c2s",
+            "s2p",
+            "planner_self",
+            "critic_self",
+            "refiner_self",
+            "solver_self",
+            "final_c2s",
+        ],
+    )
+    parser.add_argument("--role_profile_probe_round", type=int, default=-1)
+    parser.add_argument("--role_profile_epsilon", type=float, default=0.0)
+    parser.add_argument("--role_profile_seed", type=int, default=42)
+    parser.add_argument(
+        "--role_profile_direction",
+        type=str,
+        default="random",
+        choices=["random"],
+    )
     parser.add_argument(
         "--inner_adapter_type_fallback",
         type=str,
@@ -2175,6 +2393,26 @@ def main() -> None:
         steering_bank = torch_load_dict_cpu(args.lc_steering_bank)
     if args.lc_trace_path and args.method not in LATENT_METHODS:
         raise ValueError("--lc_trace_path is only supported for latent methods.")
+    if args.role_profile_trace_path and args.method not in LATENT_METHODS:
+        raise ValueError("--role_profile_trace_path is only supported for latent methods.")
+    if args.role_profile_epsilon < 0.0:
+        raise ValueError("--role_profile_epsilon must be non-negative.")
+    if args.role_profile_probe_round < -1:
+        raise ValueError("--role_profile_probe_round must be -1 or a non-negative integer.")
+    if args.role_profile_probe_mode == "one_shot":
+        if args.method not in LATENT_METHODS:
+            raise ValueError("--role_profile_probe_mode one_shot is only supported for latent methods.")
+        if args.role_profile_probe_target == "none":
+            raise ValueError("--role_profile_probe_target must be set for role-profile probes.")
+        if args.role_profile_probe_site == "none":
+            raise ValueError("--role_profile_probe_site must be set for role-profile probes.")
+        role_site = canonical_probe_site(args.role_profile_probe_site)
+        if args.role_profile_probe_target == "message" and role_site not in {"p2c", "c2s", "s2p"}:
+            raise ValueError("--role_profile_probe_target message requires site p2c, c2s, or s2p.")
+        if args.role_profile_probe_target == "state":
+            state_site_to_role(role_site)
+        if args.role_profile_probe_target == "terminal" and role_site != "final_c2s":
+            raise ValueError("--role_profile_probe_target terminal currently supports site final_c2s.")
     perturb_cfg = PerturbConfig(
         mode=args.lc_mode,
         site=args.lc_site,
@@ -2200,6 +2438,40 @@ def main() -> None:
             f"seed={perturb_cfg.seed} direction={perturb_cfg.direction} "
             f"steering_method={perturb_cfg.steering_method} "
             f"steering_id={perturb_cfg.steering_id}"
+        )
+    role_profile_cfg = RoleProfileConfig(
+        enabled=(
+            args.method in LATENT_METHODS
+            and (
+                bool(args.role_profile_trace_path)
+                or (
+                    args.role_profile_probe_mode == "one_shot"
+                    and float(args.role_profile_epsilon) > 0.0
+                )
+            )
+        ),
+        trace_path=args.role_profile_trace_path or None,
+        trace_dtype=args.role_profile_trace_dtype,
+        trace_messages=bool(args.role_profile_trace_messages),
+        trace_states=bool(args.role_profile_trace_states),
+        trace_terminal=bool(args.role_profile_trace_terminal),
+        probe_mode=args.role_profile_probe_mode,
+        probe_target=args.role_profile_probe_target,
+        probe_site=canonical_probe_site(args.role_profile_probe_site),
+        probe_round=int(args.role_profile_probe_round),
+        epsilon=float(args.role_profile_epsilon),
+        seed=int(args.role_profile_seed),
+        direction=args.role_profile_direction,
+        record_actual_delta=True,
+    )
+    if role_profile_cfg.enabled and role_profile_cfg.probe_mode == "one_shot":
+        print(
+            "[role-profile] "
+            f"probe_target={role_profile_cfg.probe_target} "
+            f"site={role_profile_cfg.probe_site} "
+            f"epsilon={role_profile_cfg.epsilon:g} "
+            f"round_idx={role_profile_cfg.probe_round} "
+            f"seed={role_profile_cfg.seed} direction={role_profile_cfg.direction}"
         )
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -2259,15 +2531,15 @@ def main() -> None:
             prompt_footer = f.read().rstrip()
         print(f"[direct-attack] appended prompt footer from {prompt_footer_path}")
 
+    run_sample_ids = [
+        build_sample_id(dataset_name, args.dataset_split, sample_idx, sample_metadata)
+        for sample_idx in range(len(questions))
+    ]
     trace_recorder: Optional[LatentTraceRecorder] = None
     if args.lc_trace_path:
         trace_sites = parse_lc_trace_sites(args.lc_trace_sites)
         trace_rounds = parse_lc_trace_rounds(args.lc_trace_rounds)
         trace_dtype = resolve_lc_trace_dtype(args.lc_trace_dtype)
-        trace_sample_ids = [
-            build_sample_id(dataset_name, args.dataset_split, sample_idx, sample_metadata)
-            for sample_idx in range(len(questions))
-        ]
         trace_recorder = LatentTraceRecorder(
             path=args.lc_trace_path,
             metadata={
@@ -2284,7 +2556,7 @@ def main() -> None:
                 "question_suffix_path": args.question_suffix_path,
                 "prompt_footer_path": args.prompt_footer_path,
             },
-            sample_ids=trace_sample_ids,
+            sample_ids=run_sample_ids,
             sample_indices=list(range(len(questions))),
             sites=trace_sites,
             rounds=trace_rounds,
@@ -2294,6 +2566,58 @@ def main() -> None:
             "[latent-trace] "
             f"path={args.lc_trace_path} sites={trace_sites} "
             f"rounds={trace_rounds} dtype={args.lc_trace_dtype}"
+        )
+
+    role_profile_recorder: Optional[RoleProfileTraceRecorder] = None
+    if args.role_profile_trace_path:
+        role_profile_dtype = resolve_role_profile_dtype(args.role_profile_trace_dtype)
+        role_profile_metadata = {
+            "experiment": "d",
+            "schema_version": 1,
+            "style": args.style,
+            "method": args.method,
+            "dataset": args.dataset,
+            "dataset_name": dataset_name,
+            "dataset_split": args.dataset_split,
+            "R": recursion_rounds_for_log(args.method, args.num_recursive_rounds),
+            "seed": args.seed,
+            "num_samples": len(questions),
+            "latent_steps": args.latent_steps,
+            "model_paths": {
+                "planner": planner_model,
+                "critic": refiner_model,
+                "solver": solver_model,
+            },
+            "role_map": {
+                "planner": "planner",
+                "critic": "refiner",
+                "solver": "solver",
+            },
+            "topology": {
+                "p2c": ["planner", "critic"],
+                "c2s": ["critic", "solver"],
+                "s2p": ["solver", "planner"],
+            },
+            "probe": role_profile_cfg.metadata(),
+            "question_suffix_path": args.question_suffix_path,
+            "prompt_footer_path": args.prompt_footer_path,
+        }
+        role_profile_recorder = RoleProfileTraceRecorder(
+            path=args.role_profile_trace_path,
+            metadata=role_profile_metadata,
+            sample_ids=run_sample_ids,
+            sample_indices=list(range(len(questions))),
+            dtype=role_profile_dtype,
+            trace_messages=bool(args.role_profile_trace_messages),
+            trace_states=bool(args.role_profile_trace_states),
+            trace_terminal=bool(args.role_profile_trace_terminal),
+            record_actual_delta=True,
+        )
+        print(
+            "[role-profile] "
+            f"path={args.role_profile_trace_path} dtype={args.role_profile_trace_dtype} "
+            f"messages={args.role_profile_trace_messages} "
+            f"states={args.role_profile_trace_states} terminal={args.role_profile_trace_terminal}"
         )
 
     is_code_eval = is_code_eval_dataset(dataset_name)
@@ -2744,6 +3068,8 @@ def main() -> None:
             task_types=task_types,
             fn_names=fn_names,
             trace_recorder=trace_recorder,
+            role_profile_cfg=role_profile_cfg,
+            role_profile_recorder=role_profile_recorder,
             prompt_footer=prompt_footer,
         )
         refiner_to_solver = run_refiner_latent_stage(
@@ -2766,6 +3092,8 @@ def main() -> None:
             task_types=task_types,
             fn_names=fn_names,
             trace_recorder=trace_recorder,
+            role_profile_cfg=role_profile_cfg,
+            role_profile_recorder=role_profile_recorder,
             prompt_footer=prompt_footer,
         )
         solver_outputs = run_solver_latent_stage(
@@ -2784,6 +3112,9 @@ def main() -> None:
             enable_thinking=enable_thinking,
             task_types=task_types,
             fn_names=fn_names,
+            role_profile_cfg=role_profile_cfg,
+            role_profile_recorder=role_profile_recorder,
+            terminal_round_idx=0,
             prompt_footer=prompt_footer,
         )
         planner_to_refiner_desc = [format_latent_info(x) for x in planner_to_refiner]
@@ -2870,6 +3201,8 @@ def main() -> None:
                     task_types=task_types,
                     fn_names=fn_names,
                     trace_recorder=trace_recorder,
+                    role_profile_cfg=role_profile_cfg,
+                    role_profile_recorder=role_profile_recorder,
                     prompt_footer=prompt_footer,
                 )
             else:
@@ -2895,6 +3228,8 @@ def main() -> None:
                     task_types=task_types,
                     fn_names=fn_names,
                     trace_recorder=trace_recorder,
+                    role_profile_cfg=role_profile_cfg,
+                    role_profile_recorder=role_profile_recorder,
                     prompt_footer=prompt_footer,
                 )
             planner_to_refiner = [x for x in planner_to_refiner]
@@ -2920,6 +3255,8 @@ def main() -> None:
                 task_types=task_types,
                 fn_names=fn_names,
                 trace_recorder=trace_recorder,
+                role_profile_cfg=role_profile_cfg,
+                role_profile_recorder=role_profile_recorder,
                 prompt_footer=prompt_footer,
             )
             refiner_to_solver = [x for x in refiner_to_solver]
@@ -2947,6 +3284,8 @@ def main() -> None:
                     task_types=task_types,
                     fn_names=fn_names,
                     trace_recorder=trace_recorder,
+                    role_profile_cfg=role_profile_cfg,
+                    role_profile_recorder=role_profile_recorder,
                     prompt_footer=prompt_footer,
                 )
                 feedback_to_planner = [x for x in feedback_to_planner]
@@ -2969,6 +3308,9 @@ def main() -> None:
             enable_thinking=enable_thinking,
             task_types=task_types,
             fn_names=fn_names,
+            role_profile_cfg=role_profile_cfg,
+            role_profile_recorder=role_profile_recorder,
+            terminal_round_idx=recursive_rounds - 1,
             prompt_footer=prompt_footer,
         )
 
@@ -3840,6 +4182,9 @@ def main() -> None:
     if trace_recorder is not None:
         trace_recorder.save()
         print(f"[latent-trace] wrote trace file to {args.lc_trace_path}")
+    if role_profile_recorder is not None:
+        role_profile_recorder.save()
+        print(f"[role-profile] wrote trace file to {args.role_profile_trace_path}")
 
 if __name__ == "__main__":
     main()
