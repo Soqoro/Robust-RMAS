@@ -13,6 +13,19 @@
 # Probe traces:
 #   D_STAGE=probe sbatch --array=0-N experiments/latent_contagion/run_experiment_d.sh
 #
+# Primary Experiment D early-infection probes:
+#   GPU_LIST="0 1 2 3" D_STAGE=probe ROLE_PROBE_ROUND_MODE=first \
+#     ROUNDS="1 2 3 4 5" DATASETS="math500" \
+#     sbatch --array=0-N%4 experiments/latent_contagion/run_experiment_d.sh
+#
+# Print probe grid:
+#   D_STAGE=probe_grid ROLE_PROBE_ROUND_MODE=first \
+#     ROUNDS="1 2 3 4 5" DATASETS="math500" \
+#     bash experiments/latent_contagion/run_experiment_d.sh
+#
+# Full round-wise diagnostic:
+#   D_STAGE=probe ROLE_PROBE_ROUND_MODE=all ...
+#
 # Estimate:
 #   D_STAGE=estimate bash experiments/latent_contagion/run_experiment_d.sh
 #
@@ -43,6 +56,8 @@ ROLE_PROBE_TARGETS="${ROLE_PROBE_TARGETS:-message state terminal}"
 ROLE_PROBE_SITES_MESSAGE="${ROLE_PROBE_SITES_MESSAGE:-p2c c2s s2p}"
 ROLE_PROBE_SITES_STATE="${ROLE_PROBE_SITES_STATE:-planner_self critic_self solver_self}"
 ROLE_PROBE_SITES_TERMINAL="${ROLE_PROBE_SITES_TERMINAL:-final_c2s}"
+ROLE_PROBE_ROUND_MODE="${ROLE_PROBE_ROUND_MODE:-first}"
+ROLE_PROBE_ROUNDS="${ROLE_PROBE_ROUNDS:-}"
 ROLE_TRACE_DTYPE="${ROLE_TRACE_DTYPE:-float32}"
 ROLE_PROFILE_DIRECTION="${ROLE_PROFILE_DIRECTION:-random}"
 ROLE_PROFILE_QUANTILES="${ROLE_PROFILE_QUANTILES:-0.5 0.75 0.9 0.95}"
@@ -50,6 +65,10 @@ CLEAN_CORRECT_ONLY="${CLEAN_CORRECT_ONLY:-1}"
 TAU_PROXY="${TAU_PROXY:-clean_clean_floor}"
 LAMBDA_STABILIZER="${LAMBDA_STABILIZER:-1e-8}"
 LAMBDA_GRID_FROM_EXPERIMENT_C="${LAMBDA_GRID_FROM_EXPERIMENT_C:-}"
+LAMBDA_MODE="${LAMBDA_MODE:-end_to_end_q_path}"
+LAMBDA_MISSING_GAIN_POLICY="${LAMBDA_MISSING_GAIN_POLICY:-nan}"
+LAMBDA_Q_SOURCE="${LAMBDA_Q_SOURCE:-direct_q}"
+ALLOW_RECOMPUTED_INPUT_DELTA="${ALLOW_RECOMPUTED_INPUT_DELTA:-0}"
 
 GPU_LIST="${GPU_LIST:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
@@ -80,8 +99,8 @@ validate_nonnegative_int() {
 
 validate_stage() {
   case "$D_STAGE" in
-    clean|probe|estimate|all) ;;
-    *) die "D_STAGE must be one of: clean, probe, estimate, all. Got: $D_STAGE" ;;
+    clean|probe|probe_grid|grid|estimate|all) ;;
+    *) die "D_STAGE must be one of: clean, probe, probe_grid, grid, estimate, all. Got: $D_STAGE" ;;
   esac
 }
 
@@ -136,6 +155,35 @@ PY
     random) ;;
     *) die "ROLE_PROFILE_DIRECTION currently supports only random. Got: $ROLE_PROFILE_DIRECTION" ;;
   esac
+  case "$ROLE_PROBE_ROUND_MODE" in
+    first|all|custom) ;;
+    *) die "ROLE_PROBE_ROUND_MODE must be one of: first, all, custom. Got: $ROLE_PROBE_ROUND_MODE" ;;
+  esac
+  if [[ "$ROLE_PROBE_ROUND_MODE" == "custom" ]]; then
+    if [[ -z "$ROLE_PROBE_ROUNDS" ]]; then
+      die "ROLE_PROBE_ROUNDS must be set when ROLE_PROBE_ROUND_MODE=custom."
+    fi
+    local probe_round
+    for probe_round in $ROLE_PROBE_ROUNDS; do
+      validate_nonnegative_int "ROLE_PROBE_ROUNDS item" "$probe_round"
+    done
+  fi
+  case "$LAMBDA_MODE" in
+    end_to_end_q_path|factorized_timevarying|stationary_round0|both) ;;
+    *) die "LAMBDA_MODE must be one of: end_to_end_q_path, factorized_timevarying, stationary_round0, both. Got: $LAMBDA_MODE" ;;
+  esac
+  case "$LAMBDA_MISSING_GAIN_POLICY" in
+    nan|zero) ;;
+    *) die "LAMBDA_MISSING_GAIN_POLICY must be nan or zero. Got: $LAMBDA_MISSING_GAIN_POLICY" ;;
+  esac
+  case "$LAMBDA_Q_SOURCE" in
+    direct_q|q_path_fallback) ;;
+    *) die "LAMBDA_Q_SOURCE must be direct_q or q_path_fallback. Got: $LAMBDA_Q_SOURCE" ;;
+  esac
+  case "$ALLOW_RECOMPUTED_INPUT_DELTA" in
+    0|1) ;;
+    *) die "ALLOW_RECOMPUTED_INPUT_DELTA must be 0 or 1. Got: $ALLOW_RECOMPUTED_INPUT_DELTA" ;;
+  esac
 }
 
 probe_sites_for_target() {
@@ -147,7 +195,7 @@ probe_sites_for_target() {
   esac
 }
 
-candidate_probe_rounds_for_config() {
+all_probe_rounds_for_config() {
   local target="$1"
   local site="$2"
   local rounds="$3"
@@ -167,6 +215,56 @@ candidate_probe_rounds_for_config() {
     *)
       die "Invalid probe target/site pair: target=$target site=$site"
       ;;
+  esac
+}
+
+first_probe_rounds_for_config() {
+  local target="$1"
+  local site="$2"
+  local rounds="$3"
+  validate_positive_int "ROUNDS item" "$rounds"
+  case "$target:$site" in
+    message:p2c|message:c2s|state:planner_self|state:critic_self|state:refiner_self)
+      echo 0
+      ;;
+    message:s2p|state:solver_self)
+      if (( rounds > 1 )); then
+        echo 0
+      fi
+      ;;
+    terminal:final_c2s)
+      echo $((rounds - 1))
+      ;;
+    *)
+      die "Invalid probe target/site pair: target=$target site=$site"
+      ;;
+  esac
+}
+
+custom_probe_rounds_for_config() {
+  local target="$1"
+  local site="$2"
+  local rounds="$3"
+  local requested valid
+  if [[ "$target:$site" == "terminal:final_c2s" ]]; then
+    echo $((rounds - 1))
+    return 0
+  fi
+  for requested in $ROLE_PROBE_ROUNDS; do
+    for valid in $(all_probe_rounds_for_config "$target" "$site" "$rounds"); do
+      if [[ "$requested" == "$valid" ]]; then
+        echo "$requested"
+      fi
+    done
+  done | awk '!seen[$0]++'
+}
+
+candidate_probe_rounds_for_config() {
+  case "$ROLE_PROBE_ROUND_MODE" in
+    first) first_probe_rounds_for_config "$@" ;;
+    all) all_probe_rounds_for_config "$@" ;;
+    custom) custom_probe_rounds_for_config "$@" ;;
+    *) die "ROLE_PROBE_ROUND_MODE must be one of: first, all, custom. Got: $ROLE_PROBE_ROUND_MODE" ;;
   esac
 }
 
@@ -297,6 +395,30 @@ total_probe_jobs() {
   echo "$total"
 }
 
+print_probe_grid() {
+  local index=0
+  local dataset rounds seed target site probe_round eps total
+  total="$(total_probe_jobs)"
+  echo "total_probe_jobs=$total"
+  echo "array_index dataset R seed probe_target probe_site probe_round epsilon"
+  for dataset in $DATASETS; do
+    for rounds in $ROUNDS; do
+      for seed in $SEEDS; do
+        for target in $ROLE_PROBE_TARGETS; do
+          for site in $(probe_sites_for_target "$target"); do
+            for probe_round in $(candidate_probe_rounds_for_config "$target" "$site" "$rounds"); do
+              for eps in $ROLE_EPSILONS; do
+                echo "$index $dataset $rounds $seed $target $site $probe_round $eps"
+                index=$((index + 1))
+              done
+            done
+          done
+        done
+      done
+    done
+  done
+}
+
 select_probe_config() {
   local target_index="$1"
   local index=0
@@ -404,7 +526,8 @@ run_clean_config() {
     "seed=$seed" "num_samples=$NUM_SAMPLES" "batch_size=$BATCH_SIZE" \
     "latent_length=$LATENT_LENGTH" "model_name_or_path=$MODEL_NAME_OR_PATH" \
     "result_jsonl=$result_jsonl" "trace_path=$trace_path" "run_log=$run_log" \
-    "role_trace_dtype=$ROLE_TRACE_DTYPE" "gpu_list=$GPU_LIST" \
+    "role_trace_dtype=$ROLE_TRACE_DTYPE" "role_probe_round_mode=$ROLE_PROBE_ROUND_MODE" \
+    "gpu_list=$GPU_LIST" \
     "cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-}" "extra_args=$EXTRA_ARGS"
 
   echo "===== Experiment D clean :: dataset=$dataset R=$rounds seed=$seed ====="
@@ -471,7 +594,8 @@ run_probe_config() {
     "batch_size=$BATCH_SIZE" "latent_length=$LATENT_LENGTH" \
     "model_name_or_path=$MODEL_NAME_OR_PATH" "result_jsonl=$result_jsonl" \
     "trace_path=$trace_path" "run_log=$run_log" "role_trace_dtype=$ROLE_TRACE_DTYPE" \
-    "gpu_list=$GPU_LIST" "cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-}" \
+    "role_probe_round_mode=$ROLE_PROBE_ROUND_MODE" "gpu_list=$GPU_LIST" \
+    "cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-}" \
     "extra_args=$EXTRA_ARGS"
 
   echo "===== Experiment D probe :: dataset=$dataset R=$rounds seed=$seed target=$probe_target site=$probe_site round=$probe_round eps=$eps ====="
@@ -521,6 +645,10 @@ run_estimate_config() {
     --lambda_grid_from_experiment_c "$LAMBDA_GRID_FROM_EXPERIMENT_C"
     --tau_proxy "$TAU_PROXY"
     --lambda_stabilizer "$LAMBDA_STABILIZER"
+    --lambda_mode "$LAMBDA_MODE"
+    --lambda_missing_gain_policy "$LAMBDA_MISSING_GAIN_POLICY"
+    --lambda_q_source "$LAMBDA_Q_SOURCE"
+    --allow_recomputed_input_delta "$ALLOW_RECOMPUTED_INPUT_DELTA"
   )
   if [[ -n "$ESTIMATE_EXTRA_ARGS" ]]; then
     read -r -a estimate_extra_args_array <<< "$ESTIMATE_EXTRA_ARGS"
@@ -533,8 +661,11 @@ run_estimate_config() {
     "summary_dir=$summary_dir" "role_epsilons=$ROLE_EPSILONS" \
     "role_profile_quantiles=$ROLE_PROFILE_QUANTILES" "clean_correct_only=$CLEAN_CORRECT_ONLY" \
     "tau_proxy=$TAU_PROXY" "lambda_stabilizer=$LAMBDA_STABILIZER" \
+    "lambda_mode=$LAMBDA_MODE" "lambda_missing_gain_policy=$LAMBDA_MISSING_GAIN_POLICY" \
+    "lambda_q_source=$LAMBDA_Q_SOURCE" \
+    "allow_recomputed_input_delta=$ALLOW_RECOMPUTED_INPUT_DELTA" \
     "lambda_grid_from_experiment_c=$LAMBDA_GRID_FROM_EXPERIMENT_C" \
-    "estimate_extra_args=$ESTIMATE_EXTRA_ARGS"
+    "role_probe_round_mode=$ROLE_PROBE_ROUND_MODE" "estimate_extra_args=$ESTIMATE_EXTRA_ARGS"
 
   echo "===== Experiment D estimate :: dataset=$dataset R=$rounds seed=$seed ====="
   echo "[experiment_d] summary_dir=$summary_dir"
@@ -579,6 +710,14 @@ run_all_local() {
 
 validate_stage
 validate_grid_inputs
+
+if [[ "$D_STAGE" == "probe_grid" || "$D_STAGE" == "grid" ]]; then
+  echo "[experiment_d] stage=$D_STAGE out_root=$OUT_ROOT"
+  echo "[experiment_d] role_probe_round_mode=$ROLE_PROBE_ROUND_MODE role_probe_rounds=${ROLE_PROBE_ROUNDS:-<empty>}"
+  print_probe_grid
+  exit 0
+fi
+
 configure_environment
 
 echo "Using TMPDIR=$TMPDIR"
@@ -587,6 +726,8 @@ echo "[experiment_d] stage=$D_STAGE out_root=$OUT_ROOT"
 echo "[experiment_d] style=$STYLE method=$METHOD datasets=$DATASETS rounds=$ROUNDS seeds=$SEEDS"
 echo "[experiment_d] num_samples=$NUM_SAMPLES batch_size=$BATCH_SIZE latent_length=$LATENT_LENGTH"
 echo "[experiment_d] targets=$ROLE_PROBE_TARGETS epsilons=$ROLE_EPSILONS trace_dtype=$ROLE_TRACE_DTYPE"
+echo "[experiment_d] role_probe_round_mode=$ROLE_PROBE_ROUND_MODE role_probe_rounds=${ROLE_PROBE_ROUNDS:-<empty>}"
+echo "[experiment_d] lambda_mode=$LAMBDA_MODE missing_gain_policy=$LAMBDA_MISSING_GAIN_POLICY q_source=$LAMBDA_Q_SOURCE allow_recomputed_input_delta=$ALLOW_RECOMPUTED_INPUT_DELTA"
 echo "[experiment_d] gpu_list=${GPU_LIST:-<empty>} task_id=$TASK_ID CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 
 if [[ "$D_STAGE" != "estimate" ]]; then
