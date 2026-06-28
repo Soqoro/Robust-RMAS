@@ -40,6 +40,7 @@ CONDITION_COLUMNS = [
     "dataset",
     "style",
     "method",
+    "role_response_regime",
     "mas_shape",
     "lc_mode",
     "lc_direction",
@@ -56,6 +57,7 @@ BASELINE_COLUMNS = [
     "dataset",
     "style",
     "method",
+    "role_response_regime",
     "mas_shape",
     "lc_mode",
     "lc_direction",
@@ -71,6 +73,7 @@ SITELESS_BASELINE_COLUMNS = [
     "dataset",
     "style",
     "method",
+    "role_response_regime",
     "mas_shape",
     "lc_mode",
     "lc_direction",
@@ -154,10 +157,12 @@ def parse_bool(value: Any) -> bool:
         return value
     if value is None:
         return False
-    if isinstance(value, (int, np.integer)):
+    integer_types = (int,) if np is None else (int, np.integer)
+    float_types = (float,) if np is None else (float, np.floating)
+    if isinstance(value, integer_types):
         return int(value) != 0
-    if isinstance(value, (float, np.floating)):
-        return bool(np.isfinite(value) and float(value) != 0.0)
+    if isinstance(value, float_types):
+        return bool(math.isfinite(float(value)) and float(value) != 0.0)
     if isinstance(value, str):
         text = value.strip().lower()
         if text in {"1", "true", "t", "yes", "y", "on"}:
@@ -304,6 +309,18 @@ def parse_metadata_from_filename(path: Path) -> Dict[str, Any]:
     return metadata
 
 
+def infer_role_response_regime(record: Mapping[str, Any]) -> str:
+    value = _first_nonempty(record.get("role_response_regime"))
+    if value is not None:
+        return str(value).strip().lower() or "neutral"
+    source = str(record.get("__source_file", "")).replace("\\", "/").lower()
+    path_text = f"/{source.strip('/')}/"
+    for regime in ("amplifying", "corrective", "neutral"):
+        if f"/{regime}/" in path_text:
+            return regime
+    return "neutral"
+
+
 def load_jsonl_file(
     path: Path,
     warnings: Optional[List[str]] = None,
@@ -361,11 +378,13 @@ def _normalize_sample_record(
     lc_direction = _first_nonempty(record.get("lc_direction"), "random")
     lc_steering_method = _first_nonempty(record.get("lc_steering_method"), "")
     lc_steering_id = _first_nonempty(record.get("lc_steering_id"), "")
+    role_response_regime = infer_role_response_regime(record)
 
     return {
         "dataset": _metadata_text(dataset),
         "style": _metadata_text(record.get("style")),
         "method": _metadata_text(record.get("method")),
+        "role_response_regime": _metadata_text(role_response_regime),
         "mas_shape": _metadata_text(record.get("mas_shape")),
         "lc_mode": _metadata_text(record.get("lc_mode")),
         "lc_direction": _metadata_text(lc_direction),

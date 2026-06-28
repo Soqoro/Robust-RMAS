@@ -53,6 +53,7 @@ from prompts import (
     PLANNER_SLOT,
     REFINED_SLOT,
     SYSTEM_PROMPT,
+    apply_role_response_regime,
     build_code_single_solver_prompt,
     build_code_planner_prompt,
     build_code_planner_prompt_with_feedback_slot,
@@ -715,6 +716,15 @@ def append_prompt_footer(user_prompt: str, prompt_footer: str = "") -> str:
     return str(user_prompt).rstrip() + "\n\n" + footer
 
 
+def apply_role_regime_to_prompt(user_prompt: str, role: str, args) -> str:
+    return apply_role_response_regime(
+        user_prompt,
+        regime=getattr(args, "role_response_regime", "neutral"),
+        role=role,
+        custom_path=getattr(args, "role_response_regime_path", ""),
+    )
+
+
 def render_chat_prompt_ids(tokenizer, user_prompt: str, enable_thinking: bool) -> List[int]:
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -1213,6 +1223,7 @@ def run_planner_latent_stage(
     trace_recorder: Optional[LatentTraceRecorder] = None,
     role_profile_cfg: Optional[RoleProfileConfig] = None,
     role_profile_recorder: Optional[RoleProfileTraceRecorder] = None,
+    args: Optional[argparse.Namespace] = None,
     prompt_footer: str = "",
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
@@ -1255,6 +1266,7 @@ def run_planner_latent_stage(
             user_prompt = build_code_planner_prompt(question, task_types[idx], fn_name=fn_name)
         else:
             user_prompt = build_math_planner_prompt(question)
+        user_prompt = apply_role_regime_to_prompt(user_prompt, "planner", args)
         user_prompt = append_prompt_footer(user_prompt, prompt_footer)
         prompt_ids.append(render_chat_prompt_ids(tokenizer, user_prompt, enable_thinking))
 
@@ -1337,6 +1349,7 @@ def run_refiner_latent_stage(
     trace_recorder: Optional[LatentTraceRecorder] = None,
     role_profile_cfg: Optional[RoleProfileConfig] = None,
     role_profile_recorder: Optional[RoleProfileTraceRecorder] = None,
+    args: Optional[argparse.Namespace] = None,
     prompt_footer: str = "",
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
@@ -1389,6 +1402,7 @@ def run_refiner_latent_stage(
             )
         else:
             user_prompt = build_math_refiner_prompt_with_slot(question)
+        user_prompt = apply_role_regime_to_prompt(user_prompt, "critic", args)
         user_prompt = append_prompt_footer(user_prompt, prompt_footer)
         prompt_segments.append(
             split_prompt_ids_by_slots(
@@ -1544,6 +1558,7 @@ def run_solver_feedback_latent_stage(
             )
         else:
             user_prompt = build_math_solver_prompt_with_slots(question, args, mas_shape=args.mas_shape)
+        user_prompt = apply_role_regime_to_prompt(user_prompt, "solver", args)
         user_prompt = append_prompt_footer(user_prompt, prompt_footer)
         prompt_segments.append(
             split_prompt_ids_by_slots(
@@ -1644,6 +1659,7 @@ def run_planner_feedback_latent_stage(
     trace_recorder: Optional[LatentTraceRecorder] = None,
     role_profile_cfg: Optional[RoleProfileConfig] = None,
     role_profile_recorder: Optional[RoleProfileTraceRecorder] = None,
+    args: Optional[argparse.Namespace] = None,
     prompt_footer: str = "",
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
@@ -1696,6 +1712,7 @@ def run_planner_feedback_latent_stage(
             )
         else:
             user_prompt = build_math_planner_prompt_with_feedback_slot(question)
+        user_prompt = apply_role_regime_to_prompt(user_prompt, "planner", args)
         user_prompt = append_prompt_footer(user_prompt, prompt_footer)
         prompt_segments.append(
             split_prompt_ids_by_slots(
@@ -1825,6 +1842,7 @@ def run_solver_latent_stage(
             )
         else:
             user_prompt = build_math_solver_prompt_with_slots(question, args, mas_shape=args.mas_shape)
+        user_prompt = apply_role_regime_to_prompt(user_prompt, "solver", args)
         user_prompt = append_prompt_footer(user_prompt, prompt_footer)
         prompt_segments.append(
             split_prompt_ids_by_slots(
@@ -2091,6 +2109,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_split", type=str, default="test")
     parser.add_argument("--question_suffix_path", type=str, default="")
     parser.add_argument("--prompt_footer_path", type=str, default="")
+    parser.add_argument(
+        "--role_response_regime",
+        type=str,
+        default="neutral",
+        choices=["neutral", "amplifying", "corrective", "custom"],
+    )
+    parser.add_argument("--role_response_regime_path", type=str, default="")
     parser.add_argument("--num_samples", type=int, default=100)
     parser.add_argument("--shuffle", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
@@ -2349,6 +2374,11 @@ def main() -> None:
             "[warn] --presence_penalty is currently ignored in this HF pipeline "
             "(not supported by GenerationConfig)."
         )
+    print(
+        "[role-response] "
+        f"regime={args.role_response_regime} "
+        f"custom_path={args.role_response_regime_path or '<empty>'}"
+    )
 
     planner_model = args.agent1_model_name_or_path
     refiner_model = args.agent2_model_name_or_path
@@ -2555,6 +2585,8 @@ def main() -> None:
                 "trace_dtype": args.lc_trace_dtype,
                 "question_suffix_path": args.question_suffix_path,
                 "prompt_footer_path": args.prompt_footer_path,
+                "role_response_regime": args.role_response_regime,
+                "role_response_regime_path": args.role_response_regime_path,
             },
             sample_ids=run_sample_ids,
             sample_indices=list(range(len(questions))),
@@ -2601,6 +2633,8 @@ def main() -> None:
             "probe": role_profile_cfg.metadata(),
             "question_suffix_path": args.question_suffix_path,
             "prompt_footer_path": args.prompt_footer_path,
+            "role_response_regime": args.role_response_regime,
+            "role_response_regime_path": args.role_response_regime_path,
         }
         role_profile_recorder = RoleProfileTraceRecorder(
             path=args.role_profile_trace_path,
@@ -2744,6 +2778,7 @@ def main() -> None:
                     task_types[sample_idx],
                     fn_name=fn_name,
                 ).replace(FEEDBACK_SLOT, feedback_text)
+            prompt = apply_role_regime_to_prompt(prompt, "planner", args)
             return append_prompt_footer(prompt, prompt_footer)
 
         if feedback_text is None:
@@ -2752,6 +2787,7 @@ def main() -> None:
             prompt = build_math_planner_prompt_with_feedback_slot(question).replace(FEEDBACK_SLOT, feedback_text)
         if planner_soften_step_template:
             prompt = soften_planner_format_instruction(prompt)
+        prompt = apply_role_regime_to_prompt(prompt, "planner", args)
         return append_prompt_footer(prompt, prompt_footer)
 
     def build_refiner_prompt_text(question: str, planner_output: str, sample_idx: int) -> str:
@@ -2769,6 +2805,7 @@ def main() -> None:
             prompt = build_math_refiner_prompt(question, planner_output)
             if refiner_force_plan_only:
                 prompt = f"{prompt}\nDo not calculate the final answer."
+        prompt = apply_role_regime_to_prompt(prompt, "critic", args)
         return append_prompt_footer(prompt, prompt_footer)
 
     def build_solver_prompt_text(question: str, refined_plan: str, sample_idx: int) -> str:
@@ -2785,6 +2822,7 @@ def main() -> None:
             )
         else:
             prompt = build_math_solver_prompt(question, refined_plan, args)
+        prompt = apply_role_regime_to_prompt(prompt, "solver", args)
         return append_prompt_footer(prompt, prompt_footer)
 
     def build_single_solver_prompt_text(question: str, sample_idx: int) -> str:
@@ -2799,6 +2837,7 @@ def main() -> None:
             )
         else:
             prompt = build_math_single_solver_prompt(question, args)
+        prompt = apply_role_regime_to_prompt(prompt, "solver", args)
         return append_prompt_footer(prompt, prompt_footer)
 
     agent1_inputs: List[str] = [
@@ -3070,6 +3109,7 @@ def main() -> None:
             trace_recorder=trace_recorder,
             role_profile_cfg=role_profile_cfg,
             role_profile_recorder=role_profile_recorder,
+            args=args,
             prompt_footer=prompt_footer,
         )
         refiner_to_solver = run_refiner_latent_stage(
@@ -3094,6 +3134,7 @@ def main() -> None:
             trace_recorder=trace_recorder,
             role_profile_cfg=role_profile_cfg,
             role_profile_recorder=role_profile_recorder,
+            args=args,
             prompt_footer=prompt_footer,
         )
         solver_outputs = run_solver_latent_stage(
@@ -3147,6 +3188,7 @@ def main() -> None:
                 a2_in = build_math_refiner_prompt_with_slot(question).replace(
                     PLANNER_SLOT, planner_to_refiner_desc[i]
                 )
+            a2_in = apply_role_regime_to_prompt(a2_in, "critic", args)
             a2_in = append_prompt_footer(a2_in, prompt_footer)
             agent2_inputs.append(a2_in)
         agent2_outputs = [
@@ -3169,6 +3211,7 @@ def main() -> None:
             else:
                 a3_in = build_math_solver_prompt_with_slots(question, args, mas_shape=args.mas_shape)
             a3_in = a3_in.replace(REFINED_SLOT, refiner_to_solver_desc[i])
+            a3_in = apply_role_regime_to_prompt(a3_in, "solver", args)
             a3_in = append_prompt_footer(a3_in, prompt_footer)
             agent3_inputs.append(a3_in)
         agent3_outputs = solver_outputs
@@ -3203,6 +3246,7 @@ def main() -> None:
                     trace_recorder=trace_recorder,
                     role_profile_cfg=role_profile_cfg,
                     role_profile_recorder=role_profile_recorder,
+                    args=args,
                     prompt_footer=prompt_footer,
                 )
             else:
@@ -3230,6 +3274,7 @@ def main() -> None:
                     trace_recorder=trace_recorder,
                     role_profile_cfg=role_profile_cfg,
                     role_profile_recorder=role_profile_recorder,
+                    args=args,
                     prompt_footer=prompt_footer,
                 )
             planner_to_refiner = [x for x in planner_to_refiner]
@@ -3257,6 +3302,7 @@ def main() -> None:
                 trace_recorder=trace_recorder,
                 role_profile_cfg=role_profile_cfg,
                 role_profile_recorder=role_profile_recorder,
+                args=args,
                 prompt_footer=prompt_footer,
             )
             refiner_to_solver = [x for x in refiner_to_solver]
@@ -3377,6 +3423,7 @@ def main() -> None:
                 ).replace(PLANNER_SLOT, final_planner_desc[i])
             else:
                 a2_in = build_math_refiner_prompt_with_slot(question).replace(PLANNER_SLOT, final_planner_desc[i])
+            a2_in = apply_role_regime_to_prompt(a2_in, "critic", args)
             a2_in = append_prompt_footer(a2_in, prompt_footer)
             agent2_inputs.append(a2_in)
 
@@ -3405,6 +3452,7 @@ def main() -> None:
             else:
                 a3_in = build_math_solver_prompt_with_slots(question, args, mas_shape=args.mas_shape)
             a3_in = a3_in.replace(REFINED_SLOT, final_refiner_desc[i])
+            a3_in = apply_role_regime_to_prompt(a3_in, "solver", args)
             a3_in = append_prompt_footer(a3_in, prompt_footer)
             agent3_inputs.append(a3_in)
         agent3_outputs = solver_outputs
@@ -3489,10 +3537,14 @@ def main() -> None:
                     raise RuntimeError("Missing task_types for code refiner slot logging prompts.")
                 agent2_slot_prompts = [
                     append_prompt_footer(
-                        build_code_refiner_prompt_with_slot(
-                            questions[i],
-                            task_types[i],
-                            fn_name=(fn_names[i] if fn_names is not None else None),
+                        apply_role_regime_to_prompt(
+                            build_code_refiner_prompt_with_slot(
+                                questions[i],
+                                task_types[i],
+                                fn_name=(fn_names[i] if fn_names is not None else None),
+                            ),
+                            "critic",
+                            args,
                         ),
                         prompt_footer,
                     )
@@ -3500,7 +3552,14 @@ def main() -> None:
                 ]
             else:
                 agent2_slot_prompts = [
-                    append_prompt_footer(build_math_refiner_prompt_with_slot(question), prompt_footer)
+                    append_prompt_footer(
+                        apply_role_regime_to_prompt(
+                            build_math_refiner_prompt_with_slot(question),
+                            "critic",
+                            args,
+                        ),
+                        prompt_footer,
+                    )
                     for question in questions
                 ]
             agent2_inputs_for_log = render_inputs_for_logging(
@@ -3525,12 +3584,16 @@ def main() -> None:
                     raise RuntimeError("Missing task_types for code solver slot logging prompts.")
                 agent3_slot_prompts = [
                     append_prompt_footer(
-                        build_code_solver_prompt_with_slots(
-                            questions[i],
-                            task_types[i],
-                            args=args,
-                            mas_shape=args.mas_shape,
-                            fn_name=(fn_names[i] if fn_names is not None else None),
+                        apply_role_regime_to_prompt(
+                            build_code_solver_prompt_with_slots(
+                                questions[i],
+                                task_types[i],
+                                args=args,
+                                mas_shape=args.mas_shape,
+                                fn_name=(fn_names[i] if fn_names is not None else None),
+                            ),
+                            "solver",
+                            args,
                         ),
                         prompt_footer,
                     )
@@ -3539,7 +3602,11 @@ def main() -> None:
             else:
                 agent3_slot_prompts = [
                     append_prompt_footer(
-                        build_math_solver_prompt_with_slots(question, args, mas_shape=args.mas_shape),
+                        apply_role_regime_to_prompt(
+                            build_math_solver_prompt_with_slots(question, args, mas_shape=args.mas_shape),
+                            "solver",
+                            args,
+                        ),
                         prompt_footer,
                     )
                     for question in questions
@@ -3901,6 +3968,8 @@ def main() -> None:
             "style": args.style or None,
             "method": args.method,
             "mas_shape": args.mas_shape,
+            "role_response_regime": args.role_response_regime,
+            "role_response_regime_path": args.role_response_regime_path,
             "recursion_rounds": recursion_rounds_for_log(args.method, args.num_recursive_rounds),
             "feedback_enabled": feedback_enabled_for_log(args.method),
             "latent_steps": args.latent_steps if args.method in LATENT_METHODS else None,
@@ -4149,6 +4218,8 @@ def main() -> None:
                 "style": args.style or None,
                 "method": args.method,
                 "mas_shape": args.mas_shape,
+                "role_response_regime": args.role_response_regime,
+                "role_response_regime_path": args.role_response_regime_path,
                 "recursion_rounds": recursion_rounds_for_log(args.method, args.num_recursive_rounds),
                 "feedback_enabled": feedback_enabled_for_log(args.method),
                 "latent_steps": args.latent_steps if args.method in LATENT_METHODS else None,

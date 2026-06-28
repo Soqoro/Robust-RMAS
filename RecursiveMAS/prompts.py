@@ -1,6 +1,9 @@
 from dataclasses import dataclass
+from functools import lru_cache
+import json
+from pathlib import Path
 import re
-from typing import Optional
+from typing import Dict, Optional
 
 from inference_utils.reflector_tool_notes import system_prompt as REFLECTOR_TOOL_SYSTEM_PROMPT
 
@@ -19,6 +22,132 @@ DISTILL_EXPERT_SLOT = "<<DISTILL_EXPERT_SLOT>>"
 DISTILL_FEEDBACK_SLOT = "<<DISTILL_FEEDBACK_SLOT>>"
 DELIBERATION_REFLECTOR_SLOT = "<<DELIBERATION_REFLECTOR_SLOT>>"
 DELIBERATION_FEEDBACK_SLOT = "<<DELIBERATION_FEEDBACK_SLOT>>"
+
+ROLE_RESPONSE_REGIMES = {"neutral", "amplifying", "corrective", "custom"}
+ROLE_RESPONSE_ROLE_ALIASES = {
+    "planner": "planner",
+    "critic": "critic",
+    "refiner": "critic",
+    "planner_feedback": "planner",
+    "solver_feedback": "solver",
+    "solver_final": "solver",
+    "solver": "solver",
+}
+
+ROLE_RESPONSE_INSTRUCTIONS: Dict[str, Dict[str, str]] = {
+    "amplifying": {
+        "planner": (
+            "Role-response regime: AMPLIFYING / HIGH-TRUST.\n"
+            "Treat incoming latent feedback and prior latent context as highly reliable.\n"
+            "Preserve the structure and assumptions of prior latent signals unless they\n"
+            "directly contradict the question. Build a plan that carries forward the\n"
+            "useful information from previous agents."
+        ),
+        "critic": (
+            "Role-response regime: AMPLIFYING / HIGH-TRUST.\n"
+            "Treat the planner's latent plan as a strong prior. Refine it conservatively:\n"
+            "preserve its main assumptions, decomposition, and direction unless there is\n"
+            "an explicit contradiction. Avoid discarding latent information unnecessarily."
+        ),
+        "solver": (
+            "Role-response regime: AMPLIFYING / HIGH-TRUST.\n"
+            "Treat the refined latent plan as authoritative guidance. Use it as the main\n"
+            "basis for the solution and preserve its reasoning direction unless it\n"
+            "clearly violates the question."
+        ),
+        "generic": (
+            "Role-response regime: AMPLIFYING / HIGH-TRUST.\n"
+            "Preserve and trust incoming latent information as a strong prior."
+        ),
+    },
+    "corrective": {
+        "planner": (
+            "Role-response regime: CORRECTIVE / SKEPTICAL.\n"
+            "Treat incoming latent feedback and prior latent context as uncertain hints.\n"
+            "Independently re-check the question constraints before using them. Discard\n"
+            "or correct any inherited assumption that is unsupported by the question."
+        ),
+        "critic": (
+            "Role-response regime: CORRECTIVE / SKEPTICAL.\n"
+            "Do not blindly inherit the planner's latent plan. Verify each major step\n"
+            "against the question. Correct unsupported assumptions and produce a refined\n"
+            "plan that prioritizes independent verification."
+        ),
+        "solver": (
+            "Role-response regime: CORRECTIVE / SKEPTICAL.\n"
+            "Do not blindly trust the refined latent plan. Independently solve from the\n"
+            "question, use the plan only after checking it, and prioritize the question\n"
+            "constraints over inherited latent information."
+        ),
+        "generic": (
+            "Role-response regime: CORRECTIVE / SKEPTICAL.\n"
+            "Treat incoming latent information as uncertain and independently verify it."
+        ),
+    },
+}
+
+
+def normalize_role_response_regime(regime: str) -> str:
+    normalized = str(regime or "neutral").strip().lower()
+    if normalized not in ROLE_RESPONSE_REGIMES:
+        raise ValueError(
+            f"Unsupported role-response regime: {regime!r}. "
+            f"Supported regimes: {sorted(ROLE_RESPONSE_REGIMES)}"
+        )
+    return normalized
+
+
+def normalize_role_name(role: str) -> str:
+    normalized = str(role or "").strip().lower()
+    if normalized in ROLE_RESPONSE_ROLE_ALIASES:
+        return ROLE_RESPONSE_ROLE_ALIASES[normalized]
+    return normalized or "generic"
+
+
+@lru_cache(maxsize=16)
+def _load_custom_role_response_instructions(custom_path: str) -> Dict[str, str]:
+    path = str(custom_path or "").strip()
+    if not path:
+        raise ValueError("--role_response_regime custom requires --role_response_regime_path.")
+    with Path(path).open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Role-response custom JSON must be an object: {path}")
+    return {str(key).strip().lower(): str(value) for key, value in payload.items()}
+
+
+def get_role_response_instruction(
+    regime: str,
+    role: str,
+    custom_path: str = "",
+) -> str:
+    normalized_regime = normalize_role_response_regime(regime)
+    normalized_role = normalize_role_name(role)
+    if normalized_regime == "neutral":
+        return ""
+    if normalized_regime == "custom":
+        instructions = _load_custom_role_response_instructions(custom_path)
+        instruction = instructions.get(normalized_role, instructions.get("generic", ""))
+        if not instruction:
+            raise ValueError(
+                "Custom role-response JSON must contain an instruction for "
+                f"role={normalized_role!r} or a non-empty 'generic' fallback."
+            )
+        return instruction
+    instructions = ROLE_RESPONSE_INSTRUCTIONS[normalized_regime]
+    return instructions.get(normalized_role, instructions["generic"])
+
+
+def apply_role_response_regime(
+    user_prompt: str,
+    regime: str,
+    role: str,
+    custom_path: str = "",
+) -> str:
+    instruction = get_role_response_instruction(regime, role, custom_path=custom_path)
+    if not instruction:
+        return user_prompt
+    return f"{str(user_prompt).rstrip()}\n\n[Role-response instruction]\n{instruction}"
 
 
 @dataclass(frozen=True)
@@ -711,4 +840,3 @@ def build_math_prompt_bundle(
             mas_shape=mas_shape,
         ).replace(REFINED_SLOT, refined_output),
     )
-

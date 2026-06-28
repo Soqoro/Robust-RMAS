@@ -33,6 +33,8 @@ NUM_SAMPLES="${NUM_SAMPLES:--1}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 LATENT_LENGTH="${LATENT_LENGTH:-48}"
 TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-1}"
+ROLE_RESPONSE_REGIME="${ROLE_RESPONSE_REGIME:-neutral}"
+ROLE_RESPONSE_REGIME_PATH="${ROLE_RESPONSE_REGIME_PATH:-}"
 TRACE_SITES="${TRACE_SITES:-p2c,c2s,s2p}"
 TRACE_ROUNDS="${TRACE_ROUNDS:-all}"
 TRACE_DTYPE="${TRACE_DTYPE:-float16}"
@@ -53,7 +55,13 @@ if [[ -z "${TRACE_ROUNDS:-}" || "${TRACE_ROUNDS:-}" == "all" ]]; then
   TRACE_ROUNDS="$(seq -s, 0 $((CALIBRATION_R - 1)))"
 fi
 
-DEFAULT_STEERING_ID="diffmean_R${CALIBRATION_R}_${DATASET}_role_aligned"
+if [[ "$ROLE_RESPONSE_REGIME" == "neutral" ]]; then
+  DEFAULT_STEERING_ID="diffmean_R${CALIBRATION_R}_${DATASET}_role_aligned"
+  DEFAULT_CALIB_SUBDIR="${DATASET}_R${CALIBRATION_R}"
+else
+  DEFAULT_STEERING_ID="diffmean_R${CALIBRATION_R}_${DATASET}_${ROLE_RESPONSE_REGIME}_role_aligned"
+  DEFAULT_CALIB_SUBDIR="${DATASET}_R${CALIBRATION_R}/${ROLE_RESPONSE_REGIME}"
+fi
 if [[ "$FILTER" == "target_hit" ]]; then
   DEFAULT_STEERING_ID="${DEFAULT_STEERING_ID}_target_hit"
 elif [[ "$FILTER" == "clean_correct_target_hit" ]]; then
@@ -63,7 +71,7 @@ elif [[ "$FILTER" == "clean_correct_attack_wrong" ]]; then
 fi
 STEERING_ID="${STEERING_ID:-$DEFAULT_STEERING_ID}"
 CALIB_ROOT="${CALIB_ROOT:-outputs/latent_contagion/diffmean_calibration}"
-CALIB_SUBDIR="${CALIB_SUBDIR:-${DATASET}_R${CALIBRATION_R}}"
+CALIB_SUBDIR="${CALIB_SUBDIR:-$DEFAULT_CALIB_SUBDIR}"
 CALIB_DIR="$CALIB_ROOT/$CALIB_SUBDIR"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 EXTRACT_EXTRA_ARGS="${EXTRACT_EXTRA_ARGS:-}"
@@ -129,6 +137,7 @@ echo "[experiment_c_calibration] calib_stage=$CALIB_STAGE"
 echo "[experiment_c_calibration] calib_dir=$CALIB_DIR"
 echo "[experiment_c_calibration] style=$STYLE method=$METHOD dataset=$DATASET"
 echo "[experiment_c_calibration] calibration_R=$CALIBRATION_R seed=$SEED"
+echo "[experiment_c_calibration] role_response_regime=$ROLE_RESPONSE_REGIME role_response_regime_path=${ROLE_RESPONSE_REGIME_PATH:-<empty>}"
 echo "[experiment_c_calibration] num_samples=$NUM_SAMPLES batch_size=$BATCH_SIZE latent_length=$LATENT_LENGTH"
 echo "[experiment_c_calibration] trace_sites=$TRACE_SITES trace_rounds=$TRACE_ROUNDS trace_dtype=$TRACE_DTYPE"
 echo "[experiment_c_calibration] steering_id=$STEERING_ID out_bank=$OUT_BANK"
@@ -146,6 +155,8 @@ echo "[experiment_c_calibration] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<u
   echo "batch_size=$BATCH_SIZE"
   echo "latent_length=$LATENT_LENGTH"
   echo "trust_remote_code=$TRUST_REMOTE_CODE"
+  echo "role_response_regime=$ROLE_RESPONSE_REGIME"
+  echo "role_response_regime_path=$ROLE_RESPONSE_REGIME_PATH"
   echo "trace_sites=$TRACE_SITES"
   echo "trace_rounds=$TRACE_ROUNDS"
   echo "trace_dtype=$TRACE_DTYPE"
@@ -189,6 +200,7 @@ if [[ "$CALIB_STAGE" == "extract" ]]; then
     --min_pairs "$MIN_PAIRS"
     --calibration_R "$CALIBRATION_R"
     --steering_id "$STEERING_ID"
+    --role_response_regime "$ROLE_RESPONSE_REGIME"
   )
   if [[ -n "$EXTRACT_EXTRA_ARGS" ]]; then
     read -r -a extract_extra_args_array <<< "$EXTRACT_EXTRA_ARGS"
@@ -216,6 +228,8 @@ else
     --seed "$SEED"
     --trust_remote_code "$TRUST_REMOTE_CODE"
     --deterministic 1
+    --role_response_regime "$ROLE_RESPONSE_REGIME"
+    --role_response_regime_path "$ROLE_RESPONSE_REGIME_PATH"
     --lc_mode none
     --lc_direction random
     --result_jsonl "$RESULT_JSONL"

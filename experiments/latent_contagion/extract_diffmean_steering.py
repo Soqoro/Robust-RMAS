@@ -421,6 +421,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min_pairs", type=int, default=1)
     parser.add_argument("--calibration_R", type=int, default=2)
     parser.add_argument("--steering_id", default="diffmean_R2_math500_role_aligned")
+    parser.add_argument("--role_response_regime", default="neutral")
     return parser.parse_args()
 
 
@@ -576,6 +577,7 @@ def main() -> None:
         "filter": args.filter,
         "target_answer": str(args.target_answer),
         "steering_id": args.steering_id,
+        "role_response_regime": args.role_response_regime,
         **diagnostics,
         "selected_sample_ids": selected_sample_ids,
         "selected_sample_indices": selected_clean_indices,

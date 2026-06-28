@@ -21,6 +21,7 @@ SUMMARY_COLUMNS = [
     "dataset",
     "R",
     "seed",
+    "role_response_regime",
     "quantity_type",
     "role",
     "sender_role",
@@ -40,6 +41,7 @@ ROW_COLUMNS = [
     "dataset",
     "R",
     "seed",
+    "role_response_regime",
     "sample_id",
     "sample_index",
     "quantity_type",
@@ -60,6 +62,7 @@ LAMBDA_COLUMNS = [
     "dataset",
     "R",
     "seed",
+    "role_response_regime",
     "lambda_mode",
     "H_source",
     "missing_gain_policy",
@@ -83,6 +86,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--probe_root", required=True)
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--dataset", default="math500")
+    parser.add_argument("--role_response_regime", default="")
+    parser.add_argument("--role_response_regime_path", default="")
     parser.add_argument("--rounds", default="")
     parser.add_argument("--epsilons", default="")
     parser.add_argument("--quantiles", default="0.5,0.75,0.9,0.95")
@@ -118,6 +123,23 @@ def parse_float_list(text: str, default: Sequence[float]) -> List[float]:
 
 def parse_int_list(text: str) -> List[int]:
     return [int(item) for item in parse_csv_items(text)]
+
+
+def resolve_role_response_regime(args: argparse.Namespace, clean_trace: Mapping[str, Any]) -> str:
+    explicit = str(getattr(args, "role_response_regime", "") or "").strip().lower()
+    if explicit:
+        return explicit
+    metadata = clean_trace.get("metadata") if isinstance(clean_trace.get("metadata"), dict) else {}
+    value = str(metadata.get("role_response_regime", "") or "").strip().lower()
+    return value or "neutral"
+
+
+def resolve_role_response_regime_path(args: argparse.Namespace, clean_trace: Mapping[str, Any]) -> str:
+    explicit = str(getattr(args, "role_response_regime_path", "") or "").strip()
+    if explicit:
+        return explicit
+    metadata = clean_trace.get("metadata") if isinstance(clean_trace.get("metadata"), dict) else {}
+    return str(metadata.get("role_response_regime_path", "") or "")
 
 
 def to_bool(value: Any) -> Optional[bool]:
@@ -780,7 +802,7 @@ def estimate_rows(
 
 
 def summarize_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
-    group_columns = SUMMARY_COLUMNS[:10]
+    group_columns = SUMMARY_COLUMNS[:11]
     grouped: Dict[Tuple[Any, ...], List[float]] = defaultdict(list)
     for row in rows:
         ratio = finite_or_none(row.get("ratio"))
@@ -1106,6 +1128,7 @@ def make_lambda_row(
     dataset: str,
     R: int,
     seed: Any,
+    role_response_regime: str,
     lambda_mode: str,
     H_source: str,
     missing_gain_policy: str,
@@ -1123,6 +1146,7 @@ def make_lambda_row(
         "dataset": dataset,
         "R": int(R),
         "seed": seed,
+        "role_response_regime": role_response_regime,
         "lambda_mode": lambda_mode,
         "H_source": H_source,
         "missing_gain_policy": missing_gain_policy,
@@ -1298,6 +1322,7 @@ def lambda_predictions(
     R: int,
     dataset: str,
     seed: Any,
+    role_response_regime: str,
     quantiles: Sequence[float],
     tau: float,
     lambda_mode: str,
@@ -1348,6 +1373,7 @@ def lambda_predictions(
                         dataset=dataset,
                         R=R,
                         seed=seed,
+                        role_response_regime=role_response_regime,
                         lambda_mode=mode,
                         H_source=H_source,
                         missing_gain_policy=missing_gain_policy,
@@ -1376,6 +1402,8 @@ def build_profile(
 ) -> Dict[str, Any]:
     metadata = clean_trace.get("metadata") if isinstance(clean_trace.get("metadata"), dict) else {}
     R = int(metadata.get("R") or (parse_int_list(args.rounds)[0] if args.rounds else 1))
+    role_response_regime = resolve_role_response_regime(args, clean_trace)
+    role_response_regime_path = resolve_role_response_regime_path(args, clean_trace)
     stabilizer = float(args.lambda_stabilizer)
     alpha: Dict[str, Any] = {role: {} for role in ROLES}
     beta: Dict[str, Any] = {}
@@ -1442,6 +1470,8 @@ def build_profile(
             "dataset": args.dataset,
             "R": R,
             "seed": metadata.get("seed"),
+            "role_response_regime": role_response_regime,
+            "role_response_regime_path": role_response_regime_path,
             "clean_trace_metadata": metadata,
             "probe_count": len(probes),
             "discovered_probe_count": int(probe_discovery_meta.get("discovered_probe_count", len(probes))),
@@ -1516,6 +1546,8 @@ def main() -> int:
     metadata = clean_trace.get("metadata") if isinstance(clean_trace.get("metadata"), dict) else {}
     R = int(metadata.get("R") or (parse_int_list(args.rounds)[0] if args.rounds else 1))
     seed = metadata.get("seed", "")
+    role_response_regime = resolve_role_response_regime(args, clean_trace)
+    role_response_regime_path = resolve_role_response_regime_path(args, clean_trace)
     quantiles = parse_float_list(args.quantiles, default=[0.5, 0.75, 0.9, 0.95])
 
     rows = estimate_rows(
@@ -1527,6 +1559,8 @@ def main() -> int:
         args=args,
         warnings=warnings,
     )
+    for row in rows:
+        row["role_response_regime"] = role_response_regime
     summaries = summarize_rows(rows)
     tau, tau_meta = tau_value(args, warnings)
     lambda_rows = lambda_predictions(
@@ -1535,6 +1569,7 @@ def main() -> int:
         R=R,
         dataset=args.dataset,
         seed=seed,
+        role_response_regime=role_response_regime,
         quantiles=quantiles,
         tau=tau,
         lambda_mode=args.lambda_mode,
@@ -1566,6 +1601,8 @@ def main() -> int:
         "dataset": args.dataset,
         "R": R,
         "seed": seed,
+        "role_response_regime": role_response_regime,
+        "role_response_regime_path": role_response_regime_path,
         "probe_count": len(probes),
         "discovered_probe_count": int(probe_discovery_meta.get("discovered_probe_count", len(probes))),
         "used_probe_count": int(probe_discovery_meta.get("used_probe_count", len(probes))),
