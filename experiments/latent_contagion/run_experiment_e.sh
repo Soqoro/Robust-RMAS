@@ -85,6 +85,14 @@ ALLOW_RECOMPUTED_INPUT_DELTA="${ALLOW_RECOMPUTED_INPUT_DELTA:-0}"
 LAMBDA_GRID_FROM_EXPERIMENT_C="${LAMBDA_GRID_FROM_EXPERIMENT_C:-}"
 GAIN_QUANTILE="${GAIN_QUANTILE:-0.5}"
 ATTACK_EPS_MODE="${ATTACK_EPS_MODE:-mean_positive}"
+COMPARE_REGIMES="${COMPARE_REGIMES:-neutral amplifying corrective}"
+NEUTRAL_ATTACK_AGGREGATE_DIR="${NEUTRAL_ATTACK_AGGREGATE_DIR:-}"
+NEUTRAL_PROFILE_ROOT="${NEUTRAL_PROFILE_ROOT:-}"
+NEUTRAL_PROFILE_LAYOUT="${NEUTRAL_PROFILE_LAYOUT:-auto}"
+FORCE_NEUTRAL_BASELINE_REGIME="${FORCE_NEUTRAL_BASELINE_REGIME:-1}"
+EXTRA_ATTACK_AGGREGATE_DIRS="${EXTRA_ATTACK_AGGREGATE_DIRS:-}"
+EXTRA_PROFILE_ROOTS="${EXTRA_PROFILE_ROOTS:-}"
+COMPARE_EXTRA_ARGS="${COMPARE_EXTRA_ARGS:-}"
 
 GPU_LIST="${GPU_LIST:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
@@ -115,8 +123,8 @@ validate_nonnegative_int() {
 
 validate_stage() {
   case "$E_STAGE" in
-    attack_grid|attack|profile_clean_grid|profile_clean|profile_probe_grid|profile_probe|profile_estimate_grid|profile_estimate|aggregate_attack|compare|all) ;;
-    *) die "E_STAGE must be one of: attack_grid, attack, profile_clean_grid, profile_clean, profile_probe_grid, profile_probe, profile_estimate_grid, profile_estimate, aggregate_attack, compare, all. Got: $E_STAGE" ;;
+    attack_grid|attack|profile_clean_grid|profile_clean|profile_probe_grid|profile_probe|profile_estimate_grid|profile_estimate|aggregate_attack|compare|verify_sources|all) ;;
+    *) die "E_STAGE must be one of: attack_grid, attack, profile_clean_grid, profile_clean, profile_probe_grid, profile_probe, profile_estimate_grid, profile_estimate, aggregate_attack, compare, verify_sources, all. Got: $E_STAGE" ;;
   esac
 }
 
@@ -155,6 +163,10 @@ validate_lc_site() {
 validate_grid_inputs() {
   local regime rounds seed site target eps lc_round normalized
   for regime in $ROLE_RESPONSE_REGIMES; do
+    validate_regime "$regime"
+  done
+  local compare_regimes_normalized="${COMPARE_REGIMES//,/ }"
+  for regime in $compare_regimes_normalized; do
     validate_regime "$regime"
   done
   for rounds in $ROUNDS; do
@@ -228,6 +240,14 @@ PY
   case "$ATTACK_EPS_MODE" in
     same_as_profile|mean_positive|max_positive) ;;
     *) die "ATTACK_EPS_MODE must be same_as_profile, mean_positive, or max_positive. Got: $ATTACK_EPS_MODE" ;;
+  esac
+  case "$NEUTRAL_PROFILE_LAYOUT" in
+    auto|experiment_d|experiment_e|direct) ;;
+    *) die "NEUTRAL_PROFILE_LAYOUT must be one of: auto, experiment_d, experiment_e, direct. Got: $NEUTRAL_PROFILE_LAYOUT" ;;
+  esac
+  case "$FORCE_NEUTRAL_BASELINE_REGIME" in
+    0|1) ;;
+    *) die "FORCE_NEUTRAL_BASELINE_REGIME must be 0 or 1. Got: $FORCE_NEUTRAL_BASELINE_REGIME" ;;
   esac
 }
 
@@ -382,6 +402,95 @@ first_word() {
   local first=""
   read -r first _ <<< "$1"
   echo "$first"
+}
+
+contains_regime_word() {
+  local text="${1//,/ }"
+  local needle="$2"
+  local item
+  for item in $text; do
+    if [[ "$item" == "$needle" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+extra_source_list_has_regime() {
+  local text="$1"
+  local needle="$2"
+  local item regime
+  for item in $text; do
+    regime="${item%%=*}"
+    if [[ "$regime" == "$needle" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+primary_attack_contains_regime() {
+  local aggregate_dir="$1"
+  local regime="$2"
+  "$PYTHON_BIN" - "$aggregate_dir" "$regime" <<'PY'
+from pathlib import Path
+import sys
+
+try:
+    import pandas as pd
+except Exception:
+    raise SystemExit(1)
+
+root = Path(sys.argv[1])
+regime = sys.argv[2].lower()
+if not root.exists():
+    raise SystemExit(1)
+paths = []
+if root.is_file():
+    paths = [root] if root.suffix == ".csv" else []
+else:
+    paths = sorted(root.rglob("*.csv"))
+for path in paths:
+    try:
+        frame = pd.read_csv(path, usecols=lambda column: column == "role_response_regime")
+    except Exception:
+        continue
+    if "role_response_regime" not in frame.columns:
+        continue
+    values = frame["role_response_regime"].dropna().astype(str).str.lower()
+    if (values == regime).any():
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+print_attack_regimes() {
+  local aggregate_dir="$1"
+  "$PYTHON_BIN" - "$aggregate_dir" <<'PY'
+from pathlib import Path
+import sys
+
+try:
+    import pandas as pd
+except Exception:
+    print("<unavailable:pandas>")
+    raise SystemExit(0)
+
+root = Path(sys.argv[1])
+if not root.exists():
+    print("<none>")
+    raise SystemExit(0)
+paths = [root] if root.is_file() else sorted(root.rglob("*.csv"))
+regimes = set()
+for path in paths:
+    try:
+        frame = pd.read_csv(path, usecols=lambda column: column == "role_response_regime")
+    except Exception:
+        continue
+    if "role_response_regime" in frame.columns:
+        regimes.update(frame["role_response_regime"].dropna().astype(str).str.lower())
+print(" ".join(sorted(regimes)) if regimes else "<none>")
+PY
 }
 
 write_command_txt() {
@@ -582,6 +691,24 @@ print_profile_clean_grid() {
   local regime dataset rounds seed total
   total="$(total_profile_clean_jobs)"
   echo "total_profile_clean_jobs=$total"
+  echo "array_index regime dataset R seed"
+  for regime in $ROLE_RESPONSE_REGIMES; do
+    for dataset in $DATASETS; do
+      for rounds in $ROUNDS; do
+        for seed in $SEEDS; do
+          echo "$index $regime $dataset $rounds $seed"
+          index=$((index + 1))
+        done
+      done
+    done
+  done
+}
+
+print_profile_estimate_grid() {
+  local index=0
+  local regime dataset rounds seed total
+  total="$(total_profile_estimate_jobs)"
+  echo "total_profile_estimate_jobs=$total"
   echo "array_index regime dataset R seed"
   for regime in $ROLE_RESPONSE_REGIMES; do
     for dataset in $DATASETS; do
@@ -1017,9 +1144,9 @@ run_aggregate_attack() {
 }
 
 run_compare() {
-  local dataset comparison_dir command_path manifest_path run_log profile_epsilon regimes_csv
+  local dataset comparison_dir command_path manifest_path run_log profile_epsilon regimes_csv item
   profile_epsilon="$(first_word "$ROLE_EPSILONS")"
-  regimes_csv="$(join_csv_words $ROLE_RESPONSE_REGIMES)"
+  regimes_csv="$(join_csv_words $COMPARE_REGIMES)"
   for dataset in $DATASETS; do
     comparison_dir="$OUT_ROOT/comparison/$dataset"
     command_path="$comparison_dir/command.txt"
@@ -1036,17 +1163,111 @@ run_compare() {
       --profile_epsilon "$profile_epsilon"
       --gain_quantile "$GAIN_QUANTILE"
       --attack_eps_mode "$ATTACK_EPS_MODE"
+      --neutral_profile_layout "$NEUTRAL_PROFILE_LAYOUT"
+      --force_neutral_baseline_regime "$FORCE_NEUTRAL_BASELINE_REGIME"
     )
+    if [[ -n "$NEUTRAL_ATTACK_AGGREGATE_DIR" ]]; then
+      cmd+=(--neutral_attack_aggregate_dir "$NEUTRAL_ATTACK_AGGREGATE_DIR")
+    fi
+    if [[ -n "$NEUTRAL_PROFILE_ROOT" ]]; then
+      cmd+=(--neutral_profile_root "$NEUTRAL_PROFILE_ROOT")
+    fi
+    for item in $EXTRA_ATTACK_AGGREGATE_DIRS; do
+      cmd+=(--extra_attack_aggregate_dir "$item")
+    done
+    for item in $EXTRA_PROFILE_ROOTS; do
+      cmd+=(--extra_profile_root "$item")
+    done
+    if [[ -n "$COMPARE_EXTRA_ARGS" ]]; then
+      read -r -a compare_extra_args_array <<< "$COMPARE_EXTRA_ARGS"
+      cmd+=("${compare_extra_args_array[@]}")
+    fi
     write_command_txt "$command_path" "${cmd[@]}"
     write_manifest_json "$manifest_path" \
       "stage=compare" "dataset=$dataset" "out_dir=$comparison_dir" \
-      "role_response_regimes=$ROLE_RESPONSE_REGIMES" "profile_epsilon=$profile_epsilon" \
-      "gain_quantile=$GAIN_QUANTILE" "attack_eps_mode=$ATTACK_EPS_MODE" "run_log=$run_log"
+      "role_response_regimes=$ROLE_RESPONSE_REGIMES" "compare_regimes=$COMPARE_REGIMES" \
+      "neutral_attack_aggregate_dir=$NEUTRAL_ATTACK_AGGREGATE_DIR" \
+      "neutral_profile_root=$NEUTRAL_PROFILE_ROOT" "neutral_profile_layout=$NEUTRAL_PROFILE_LAYOUT" \
+      "force_neutral_baseline_regime=$FORCE_NEUTRAL_BASELINE_REGIME" \
+      "extra_attack_aggregate_dirs=$EXTRA_ATTACK_AGGREGATE_DIRS" \
+      "extra_profile_roots=$EXTRA_PROFILE_ROOTS" "compare_extra_args=$COMPARE_EXTRA_ARGS" \
+      "profile_epsilon=$profile_epsilon" "gain_quantile=$GAIN_QUANTILE" \
+      "attack_eps_mode=$ATTACK_EPS_MODE" "run_log=$run_log"
+    if contains_regime_word "$COMPARE_REGIMES" "neutral"; then
+      if [[ ! -d "$OUT_ROOT/role_profile/neutral" && -z "$NEUTRAL_PROFILE_ROOT" ]] && ! extra_source_list_has_regime "$EXTRA_PROFILE_ROOTS" "neutral"; then
+        echo "[warning] neutral requested but no neutral profile source was found."
+      fi
+      if [[ -z "$NEUTRAL_ATTACK_AGGREGATE_DIR" ]] && ! extra_source_list_has_regime "$EXTRA_ATTACK_AGGREGATE_DIRS" "neutral"; then
+        if ! primary_attack_contains_regime "$OUT_ROOT/aggregate/attacks/$dataset" "neutral"; then
+          echo "[warning] neutral requested but no neutral attack source was provided."
+        fi
+      fi
+    fi
     echo "===== Experiment E compare :: dataset=$dataset ====="
     printf '[experiment_e] command:'
     printf ' %q' "${cmd[@]}"
     printf '\n'
     "${cmd[@]}" 2>&1 | tee "$run_log"
+  done
+}
+
+run_verify_sources() {
+  local dataset regime attack_dir profile_dir attack_file_count profile_count neutral_attack_csv_count neutral_profile_count profile_epsilon regimes_csv
+  profile_epsilon="$(first_word "$ROLE_EPSILONS")"
+  regimes_csv="$(join_csv_words $COMPARE_REGIMES)"
+  echo "[experiment_e] verify_sources out_root=$OUT_ROOT"
+  echo "[experiment_e] compare_regimes=$COMPARE_REGIMES"
+  for dataset in $DATASETS; do
+    attack_dir="$OUT_ROOT/aggregate/attacks/$dataset"
+    if [[ -d "$attack_dir" ]]; then
+      attack_file_count="$(find "$attack_dir" -type f \( -name '*per_condition.csv' -o -name '*epsilon50.csv' \) | wc -l | tr -d ' ')"
+    elif [[ -f "$attack_dir" ]]; then
+      attack_file_count=1
+    else
+      attack_file_count=0
+    fi
+    echo "dataset=$dataset"
+    echo "  Experiment E attack aggregate files: $attack_file_count"
+    echo "  Experiment E attack regimes: $(print_attack_regimes "$attack_dir")"
+    echo "  Experiment E role-profile summaries by regime:"
+    for regime in ${COMPARE_REGIMES//,/ }; do
+      profile_dir="$OUT_ROOT/role_profile/$regime/summaries/$dataset"
+      if [[ -d "$profile_dir" ]]; then
+        profile_count="$(find "$profile_dir" -path '*/R*/seed*/role_profile_summary.csv' -type f | wc -l | tr -d ' ')"
+      else
+        profile_count=0
+      fi
+      echo "    $regime: $profile_count"
+    done
+    if [[ -n "$NEUTRAL_ATTACK_AGGREGATE_DIR" && -e "$NEUTRAL_ATTACK_AGGREGATE_DIR" ]]; then
+      if [[ -d "$NEUTRAL_ATTACK_AGGREGATE_DIR" ]]; then
+        neutral_attack_csv_count="$(find "$NEUTRAL_ATTACK_AGGREGATE_DIR" -type f -name '*.csv' | wc -l | tr -d ' ')"
+      else
+        neutral_attack_csv_count=1
+      fi
+      echo "  Neutral attack source exists: yes ($neutral_attack_csv_count CSVs)"
+    else
+      echo "  Neutral attack source exists: no"
+    fi
+    if [[ -n "$NEUTRAL_PROFILE_ROOT" && -e "$NEUTRAL_PROFILE_ROOT" ]]; then
+      if [[ -d "$NEUTRAL_PROFILE_ROOT" ]]; then
+        neutral_profile_count="$(find "$NEUTRAL_PROFILE_ROOT" -type f -name 'role_profile_summary.csv' | wc -l | tr -d ' ')"
+      else
+        neutral_profile_count=0
+      fi
+      echo "  Neutral profile source exists: yes ($neutral_profile_count summaries)"
+    else
+      echo "  Neutral profile source exists: no"
+    fi
+    echo "  Recommended compare command:"
+    printf '    E_STAGE=compare ROLE_RESPONSE_REGIMES=%q COMPARE_REGIMES=%q DATASETS=%q' "$ROLE_RESPONSE_REGIMES" "$COMPARE_REGIMES" "$dataset"
+    if [[ -n "$NEUTRAL_ATTACK_AGGREGATE_DIR" ]]; then
+      printf ' NEUTRAL_ATTACK_AGGREGATE_DIR=%q' "$NEUTRAL_ATTACK_AGGREGATE_DIR"
+    fi
+    if [[ -n "$NEUTRAL_PROFILE_ROOT" ]]; then
+      printf ' NEUTRAL_PROFILE_ROOT=%q NEUTRAL_PROFILE_LAYOUT=%q' "$NEUTRAL_PROFILE_ROOT" "$NEUTRAL_PROFILE_LAYOUT"
+    fi
+    printf ' bash experiments/latent_contagion/run_experiment_e.sh\n'
   done
 }
 
@@ -1127,7 +1348,7 @@ case "$E_STAGE" in
     ;;
   profile_estimate_grid)
     echo "[experiment_e] stage=$E_STAGE out_root=$OUT_ROOT"
-    print_profile_clean_grid
+    print_profile_estimate_grid
     exit 0
     ;;
   aggregate_attack)
@@ -1138,6 +1359,11 @@ case "$E_STAGE" in
   compare)
     echo "[experiment_e] stage=$E_STAGE out_root=$OUT_ROOT"
     run_compare
+    exit 0
+    ;;
+  verify_sources)
+    echo "[experiment_e] stage=$E_STAGE out_root=$OUT_ROOT"
+    run_verify_sources
     exit 0
     ;;
 esac

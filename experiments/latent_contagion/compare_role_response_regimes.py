@@ -7,7 +7,7 @@ import argparse
 import math
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -54,12 +54,35 @@ ORDERING_COLUMNS = [
     "dataset",
     "R",
     "site",
+    "has_amplifying",
+    "has_neutral",
+    "has_corrective",
+    "n_regimes_present",
     "lambda_order",
     "asr_order",
     "lambda_rank_match_expected",
     "asr_rank_match_expected",
     "expected_order",
 ]
+SUMMARY_STAT_BY_QUANTILE = [
+    (0.5, "median"),
+    (0.75, "q75"),
+    (0.9, "q90"),
+    (0.95, "q95"),
+]
+
+
+class ForcedAttackSource(NamedTuple):
+    regime: str
+    path: Path
+    force_regime: bool = True
+
+
+class ForcedProfileSource(NamedTuple):
+    regime: str
+    root: Path
+    layout: str = "auto"
+    force_regime: bool = True
 
 
 def parse_args() -> argparse.Namespace:
@@ -69,6 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--dataset", default="math500")
     parser.add_argument("--regimes", default="neutral,amplifying,corrective")
+    parser.add_argument("--compare_regimes", default="")
     parser.add_argument("--profile_epsilon", type=float, default=1e-3)
     parser.add_argument("--gain_quantile", type=float, default=0.5)
     parser.add_argument(
@@ -76,11 +100,43 @@ def parse_args() -> argparse.Namespace:
         choices=["same_as_profile", "mean_positive", "max_positive"],
         default="mean_positive",
     )
+    parser.add_argument("--neutral_attack_aggregate_dir", default="")
+    parser.add_argument("--neutral_profile_root", default="")
+    parser.add_argument(
+        "--neutral_profile_layout",
+        choices=["auto", "experiment_d", "experiment_e", "direct"],
+        default="auto",
+    )
+    parser.add_argument("--force_neutral_baseline_regime", type=int, choices=[0, 1], default=1)
+    parser.add_argument("--extra_attack_aggregate_dir", action="append", default=[])
+    parser.add_argument("--extra_profile_root", action="append", default=[])
     return parser.parse_args()
 
 
 def parse_regimes(text: str) -> List[str]:
     return [item.strip().lower() for item in str(text or "").replace(" ", ",").split(",") if item.strip()]
+
+
+def add_warning(warnings: Optional[List[str]], message: str) -> None:
+    if warnings is not None and message not in warnings:
+        warnings.append(message)
+
+
+def parse_regime_path_item(item: str, *, label: str, warnings: Optional[List[str]] = None) -> Optional[Tuple[str, Path]]:
+    regime, sep, path_text = str(item or "").partition("=")
+    regime = regime.strip().lower()
+    path_text = path_text.strip()
+    if not sep or not regime or not path_text:
+        add_warning(warnings, f"Ignoring malformed {label} item {item!r}; expected regime=PATH.")
+        return None
+    return regime, Path(path_text)
+
+
+def is_finite_number(value: Any) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
 
 
 def read_csvs(paths: Sequence[Path]) -> pd.DataFrame:
@@ -133,35 +189,166 @@ def infer_regime_from_path(path: Path, default: str = "neutral") -> str:
     return default
 
 
-def ensure_regime_column(df: pd.DataFrame, paths_default: str = "neutral") -> pd.DataFrame:
+def ensure_regime_column(df: pd.DataFrame, paths_default: str = "neutral", *, force: bool = False) -> pd.DataFrame:
     if df.empty:
         return df
     out = df.copy()
-    if "role_response_regime" not in out.columns:
+    if force or "role_response_regime" not in out.columns:
         out["role_response_regime"] = paths_default
     out["role_response_regime"] = out["role_response_regime"].fillna(paths_default).astype(str).str.lower()
     return out
 
 
 def find_attack_files(attack_aggregate_dir: Path, dataset: str) -> Tuple[List[Path], List[Path]]:
+    if not attack_aggregate_dir.exists():
+        return [], []
     if attack_aggregate_dir.is_file():
-        per_condition = [attack_aggregate_dir]
-        epsilon50 = []
+        name = attack_aggregate_dir.name.lower()
+        per_condition = [attack_aggregate_dir] if "per_condition" in name else []
+        epsilon50 = [attack_aggregate_dir] if "epsilon50" in name else []
     else:
-        per_condition = sorted(attack_aggregate_dir.glob(f"{dataset}_*_per_condition.csv"))
-        epsilon50 = sorted(attack_aggregate_dir.glob(f"{dataset}_*_epsilon50.csv"))
-        if not per_condition:
-            per_condition = sorted(attack_aggregate_dir.rglob("*per_condition.csv"))
-        if not epsilon50:
-            epsilon50 = sorted(attack_aggregate_dir.rglob("*epsilon50.csv"))
+        per_condition = sorted(attack_aggregate_dir.rglob("*per_condition.csv"))
+        epsilon50 = sorted(attack_aggregate_dir.rglob("*epsilon50.csv"))
     return per_condition, epsilon50
 
 
-def load_attack_tables(attack_aggregate_dir: Path, dataset: str) -> Tuple[pd.DataFrame, pd.DataFrame, List[Path]]:
-    per_condition_paths, epsilon50_paths = find_attack_files(attack_aggregate_dir, dataset)
-    per_condition = ensure_regime_column(read_csvs(per_condition_paths))
-    epsilon50 = ensure_regime_column(read_csvs(epsilon50_paths))
-    return per_condition, epsilon50, per_condition_paths + epsilon50_paths
+def annotate_attack_source(
+    df: pd.DataFrame,
+    *,
+    dataset: str,
+    default_regime: str,
+    force_regime: bool,
+    source_name: str,
+    source_order: int,
+) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = ensure_regime_column(df, default_regime, force=force_regime)
+    if "dataset" not in out.columns:
+        out["dataset"] = dataset
+    out["__source_name"] = source_name
+    out["__source_order"] = source_order
+    return out
+
+
+def source_key_tuples(frame: pd.DataFrame, key_cols: Sequence[str]) -> set[Tuple[str, ...]]:
+    if frame.empty or not key_cols:
+        return set()
+    key_frame = frame.loc[:, list(key_cols)].fillna("<NA>").astype(str)
+    return set(map(tuple, key_frame.to_numpy()))
+
+
+def dedupe_attack_frame(
+    frame: pd.DataFrame,
+    *,
+    table_name: str,
+    warnings: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    out = frame.copy()
+    if "__source_order" not in out.columns:
+        return out
+
+    condition_cols = [
+        column
+        for column in ["dataset", "role_response_regime", "R", "site", "eps"]
+        if column in out.columns
+    ]
+    if condition_cols:
+        primary_keys = source_key_tuples(out[out["__source_order"] == 0], condition_cols)
+        forced = out[out["__source_order"] > 0]
+        overlap = source_key_tuples(forced, condition_cols) & primary_keys
+        if overlap:
+            add_warning(
+                warnings,
+                f"{table_name}: primary and forced attack sources overlap on "
+                f"{len(overlap)} {tuple(condition_cols)} keys; keeping primary rows.",
+            )
+
+    non_meta_cols = [
+        column
+        for column in out.columns
+        if column != "source_file" and not column.startswith("__")
+    ]
+    if non_meta_cols:
+        out = out.sort_values("__source_order", kind="stable").drop_duplicates(
+            subset=non_meta_cols,
+            keep="first",
+        )
+
+    if condition_cols:
+        primary_keys = source_key_tuples(out[out["__source_order"] == 0], condition_cols)
+        forced_mask = out["__source_order"] > 0
+        forced_keys = out.loc[forced_mask, condition_cols].fillna("<NA>").astype(str)
+        duplicate_forced = forced_keys.apply(lambda row: tuple(row) in primary_keys, axis=1)
+        drop_index = forced_keys.index[duplicate_forced]
+        if len(drop_index) > 0:
+            out = out.drop(index=drop_index)
+
+    return out.drop(columns=[column for column in out.columns if column.startswith("__")], errors="ignore")
+
+
+def load_attack_tables(
+    primary_attack_aggregate_dir: Path,
+    dataset: str,
+    forced_sources: Sequence[ForcedAttackSource] = (),
+    warnings: Optional[List[str]] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[Path]]:
+    per_frames: List[pd.DataFrame] = []
+    eps_frames: List[pd.DataFrame] = []
+    files_read: List[Path] = []
+
+    per_condition_paths, epsilon50_paths = find_attack_files(primary_attack_aggregate_dir, dataset)
+    primary_per = annotate_attack_source(
+        read_csvs(per_condition_paths),
+        dataset=dataset,
+        default_regime="neutral",
+        force_regime=False,
+        source_name="primary",
+        source_order=0,
+    )
+    primary_eps = annotate_attack_source(
+        read_csvs(epsilon50_paths),
+        dataset=dataset,
+        default_regime="neutral",
+        force_regime=False,
+        source_name="primary",
+        source_order=0,
+    )
+    per_frames.append(primary_per)
+    eps_frames.append(primary_eps)
+    files_read.extend(per_condition_paths + epsilon50_paths)
+
+    for source_order, source in enumerate(forced_sources, start=1):
+        source_per_paths, source_eps_paths = find_attack_files(source.path, dataset)
+        if not source_per_paths and not source_eps_paths:
+            add_warning(warnings, f"No attack aggregate CSVs found in forced source {source.regime}={source.path}.")
+        source_per = annotate_attack_source(
+            read_csvs(source_per_paths),
+            dataset=dataset,
+            default_regime=source.regime,
+            force_regime=source.force_regime,
+            source_name=source.regime,
+            source_order=source_order,
+        )
+        source_eps = annotate_attack_source(
+            read_csvs(source_eps_paths),
+            dataset=dataset,
+            default_regime=source.regime,
+            force_regime=source.force_regime,
+            source_name=source.regime,
+            source_order=source_order,
+        )
+        per_frames.append(source_per)
+        eps_frames.append(source_eps)
+        files_read.extend(source_per_paths + source_eps_paths)
+
+    per_condition = pd.concat([frame for frame in per_frames if not frame.empty], ignore_index=True, sort=False) if any(not frame.empty for frame in per_frames) else pd.DataFrame()
+    epsilon50 = pd.concat([frame for frame in eps_frames if not frame.empty], ignore_index=True, sort=False) if any(not frame.empty for frame in eps_frames) else pd.DataFrame()
+    per_condition = dedupe_attack_frame(per_condition, table_name="per_condition", warnings=warnings)
+    epsilon50 = dedupe_attack_frame(epsilon50, table_name="epsilon50", warnings=warnings)
+    return per_condition, epsilon50, files_read
 
 
 def first_value(df: pd.DataFrame, column: str, default: Any = "") -> Any:
@@ -173,15 +360,24 @@ def first_value(df: pd.DataFrame, column: str, default: Any = "") -> Any:
     return values.iloc[0]
 
 
-def mean_summary(
+def summary_stat_column(gain_quantile: float) -> str:
+    for quantile, column in SUMMARY_STAT_BY_QUANTILE:
+        if math.isclose(float(gain_quantile), quantile, rel_tol=1e-9, abs_tol=1e-12):
+            return column
+    return "mean"
+
+
+def select_summary_stat(
     summary: pd.DataFrame,
     *,
     quantity_type: str,
     epsilon: float,
+    gain_quantile: float,
     site: Optional[str] = None,
     sender_role: Optional[str] = None,
     receiver_role: Optional[str] = None,
     role: Optional[str] = None,
+    warnings: Optional[List[str]] = None,
 ) -> float:
     if summary.empty:
         return float("nan")
@@ -196,7 +392,18 @@ def mean_summary(
         frame = frame[frame["receiver_role"].astype(str) == receiver_role]
     if role is not None and "role" in frame.columns:
         frame = frame[frame["role"].astype(str) == role]
-    return finite_mean(frame.get("mean", pd.Series(dtype=float)))
+    desired_column = summary_stat_column(gain_quantile)
+    if desired_column in frame.columns:
+        stat_column = desired_column
+    elif math.isclose(float(gain_quantile), 0.5, rel_tol=1e-9, abs_tol=1e-12) and "median" in frame.columns:
+        stat_column = "median"
+    else:
+        stat_column = "mean"
+        add_warning(
+            warnings,
+            f"Summary statistic column {desired_column!r} is unavailable for gain_quantile={gain_quantile:g}; using mean.",
+        )
+    return finite_mean(frame.get(stat_column, pd.Series(dtype=float)))
 
 
 def lambda_value(lambdas: pd.DataFrame, site: str, epsilon: float, gain_quantile: float) -> float:
@@ -214,11 +421,72 @@ def lambda_value(lambdas: pd.DataFrame, site: str, epsilon: float, gain_quantile
     return finite_mean(frame.get("Lambda", pd.Series(dtype=float)))
 
 
-def load_profile_summary(profile_root: Path, dataset: str, regimes: Sequence[str], profile_epsilon: float, gain_quantile: float) -> Tuple[pd.DataFrame, List[Path]]:
+def dedupe_paths(paths: Iterable[Path]) -> List[Path]:
+    seen: set[str] = set()
+    out: List[Path] = []
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
+def discover_profile_summary_paths(root: Path, dataset: str, regime: str, layout: str) -> List[Path]:
+    layout = str(layout or "auto").lower()
+    if not root.exists():
+        return []
+
+    def experiment_e_paths() -> List[Path]:
+        return sorted((root / regime / "summaries" / dataset).glob("R*/seed*/role_profile_summary.csv"))
+
+    def experiment_d_paths() -> List[Path]:
+        return sorted((root / "summaries" / dataset).glob("R*/seed*/role_profile_summary.csv"))
+
+    def direct_paths() -> List[Path]:
+        return sorted((root / dataset).glob("R*/seed*/role_profile_summary.csv")) + sorted(
+            root.glob("R*/seed*/role_profile_summary.csv")
+        )
+
+    if layout == "experiment_e":
+        return experiment_e_paths()
+    if layout == "experiment_d":
+        return experiment_d_paths()
+    if layout == "direct":
+        return dedupe_paths(direct_paths())
+    if layout == "auto":
+        return dedupe_paths(experiment_e_paths() + experiment_d_paths() + direct_paths())
+    raise ValueError(f"Unsupported profile layout: {layout}")
+
+
+def load_profile_summary(
+    profile_root: Path,
+    dataset: str,
+    regimes: Sequence[str],
+    profile_epsilon: float,
+    gain_quantile: float,
+    forced_sources: Sequence[ForcedProfileSource] = (),
+    warnings: Optional[List[str]] = None,
+) -> Tuple[pd.DataFrame, List[Path]]:
     rows: List[Dict[str, Any]] = []
     files_read: List[Path] = []
-    for regime in regimes:
-        summary_paths = sorted((profile_root / regime / "summaries" / dataset).glob("R*/seed*/role_profile_summary.csv"))
+
+    def load_one_source(
+        *,
+        regime: str,
+        root: Path,
+        layout: str,
+        force_regime: bool,
+        source_label: str,
+        warn_if_missing: bool,
+    ) -> None:
+        summary_paths = discover_profile_summary_paths(root, dataset, regime, layout)
+        if warn_if_missing and not summary_paths:
+            add_warning(
+                warnings,
+                f"No role profile summaries found in forced source {source_label}={root} with layout={layout}.",
+            )
         for summary_path in summary_paths:
             summary_dir = summary_path.parent
             lambda_path = summary_dir / "lambda_predictions.csv"
@@ -233,51 +501,60 @@ def load_profile_summary(profile_root: Path, dataset: str, regimes: Sequence[str
             files_read.append(summary_path)
             if lambda_path.exists():
                 files_read.append(lambda_path)
-            summary = ensure_regime_column(summary, regime)
-            lambdas = ensure_regime_column(lambdas, regime) if not lambdas.empty else lambdas
+            summary = ensure_regime_column(summary, regime, force=force_regime)
+            lambdas = ensure_regime_column(lambdas, regime, force=force_regime) if not lambdas.empty else lambdas
+            row_regime = str(first_value(summary, "role_response_regime", regime)).lower()
             R = first_value(summary, "R", path_token(summary_dir, "R"))
             seed = first_value(summary, "seed", path_token(summary_dir, "seed"))
             p2c_lambda = lambda_value(lambdas, "p2c", profile_epsilon, gain_quantile)
             c2s_lambda = lambda_value(lambdas, "c2s", profile_epsilon, gain_quantile)
             s2p_lambda = lambda_value(lambdas, "s2p", profile_epsilon, gain_quantile)
             final_c2s_lambda = lambda_value(lambdas, "final_c2s", profile_epsilon, gain_quantile)
-            beta_critic = mean_summary(
+            beta_critic = select_summary_stat(
                 summary,
                 quantity_type="beta",
                 epsilon=profile_epsilon,
+                gain_quantile=gain_quantile,
                 site="p2c",
                 sender_role="planner",
                 receiver_role="critic",
+                warnings=warnings,
             )
-            beta_solver = mean_summary(
+            beta_solver = select_summary_stat(
                 summary,
                 quantity_type="beta",
                 epsilon=profile_epsilon,
+                gain_quantile=gain_quantile,
                 site="c2s",
                 sender_role="critic",
                 receiver_role="solver",
+                warnings=warnings,
             )
-            beta_planner = mean_summary(
+            beta_planner = select_summary_stat(
                 summary,
                 quantity_type="beta",
                 epsilon=profile_epsilon,
+                gain_quantile=gain_quantile,
                 site="s2p",
                 sender_role="solver",
                 receiver_role="planner",
+                warnings=warnings,
             )
-            q_solver = mean_summary(
+            q_solver = select_summary_stat(
                 summary,
                 quantity_type="q",
                 epsilon=profile_epsilon,
+                gain_quantile=gain_quantile,
                 site="final_c2s",
                 role="solver",
+                warnings=warnings,
             )
             lambda_values = [p2c_lambda, c2s_lambda, s2p_lambda]
             beta_values = [beta_critic, beta_solver, beta_planner]
             rows.append(
                 {
                     "dataset": dataset,
-                    "role_response_regime": regime,
+                    "role_response_regime": row_regime,
                     "R": int(R) if str(R).strip().isdigit() else R,
                     "seed": seed,
                     "profile_epsilon": float(profile_epsilon),
@@ -296,6 +573,25 @@ def load_profile_summary(profile_root: Path, dataset: str, regimes: Sequence[str
                     "n_beta_sites": int(sum(math.isfinite(x) for x in beta_values)),
                 }
             )
+
+    for regime in regimes:
+        load_one_source(
+            regime=regime,
+            root=profile_root,
+            layout="experiment_e",
+            force_regime=False,
+            source_label=f"primary:{regime}",
+            warn_if_missing=False,
+        )
+    for source in forced_sources:
+        load_one_source(
+            regime=source.regime,
+            root=source.root,
+            layout=source.layout,
+            force_regime=source.force_regime,
+            source_label=source.regime,
+            warn_if_missing=True,
+        )
     return pd.DataFrame(rows, columns=PROFILE_COLUMNS), files_read
 
 
@@ -418,20 +714,17 @@ def attack_with_mean_handoff(attack: pd.DataFrame) -> pd.DataFrame:
 
 
 def rank_order(values: Mapping[str, float]) -> str:
-    finite = [(regime, value) for regime, value in values.items() if math.isfinite(float(value))]
+    finite = [(regime, value) for regime, value in values.items() if is_finite_number(value)]
     finite.sort(key=lambda item: (-float(item[1]), item[0]))
     return " > ".join(regime for regime, _ in finite)
 
 
-def matches_expected(values: Mapping[str, float], tolerance: float = 1e-12) -> bool:
-    try:
-        amp = float(values["amplifying"])
-        neutral = float(values["neutral"])
-        corrective = float(values["corrective"])
-    except (KeyError, TypeError, ValueError):
-        return False
-    if not all(math.isfinite(x) for x in (amp, neutral, corrective)):
-        return False
+def rank_match_expected_or_nan(values: Mapping[str, float], tolerance: float = 1e-12) -> Any:
+    if not all(is_finite_number(values.get(regime)) for regime in EXPECTED_ORDER):
+        return np.nan
+    amp = float(values["amplifying"])
+    neutral = float(values["neutral"])
+    corrective = float(values["corrective"])
     return amp + tolerance >= neutral and neutral + tolerance >= corrective
 
 
@@ -453,15 +746,23 @@ def build_ordering(profile_l: pd.DataFrame, attack_m: pd.DataFrame, dataset: str
             regime: finite_mean(asr_group[asr_group["role_response_regime"] == regime]["excess_asrcc"])
             for regime in EXPECTED_ORDER
         }
+        has_regime = {
+            regime: is_finite_number(lambda_values.get(regime)) or is_finite_number(asr_values.get(regime))
+            for regime in EXPECTED_ORDER
+        }
         rows.append(
             {
                 "dataset": dataset_value,
                 "R": R,
                 "site": site,
+                "has_amplifying": has_regime["amplifying"],
+                "has_neutral": has_regime["neutral"],
+                "has_corrective": has_regime["corrective"],
+                "n_regimes_present": int(sum(has_regime.values())),
                 "lambda_order": rank_order(lambda_values),
                 "asr_order": rank_order(asr_values),
-                "lambda_rank_match_expected": matches_expected(lambda_values),
-                "asr_rank_match_expected": matches_expected(asr_values),
+                "lambda_rank_match_expected": rank_match_expected_or_nan(lambda_values),
+                "asr_rank_match_expected": rank_match_expected_or_nan(asr_values),
                 "expected_order": " > ".join(EXPECTED_ORDER),
             }
         )
@@ -535,7 +836,15 @@ def prediction_quality(profile: pd.DataFrame, attack_m: pd.DataFrame, joined: pd
 def write_readme(
     path: Path,
     *,
-    files_read: Sequence[Path],
+    primary_attack_aggregate_dir: Path,
+    neutral_attack_aggregate_dir: str,
+    primary_profile_root: Path,
+    neutral_profile_root: str,
+    neutral_profile_layout: str,
+    extra_attack_dirs: Sequence[str],
+    extra_profile_roots: Sequence[str],
+    attack_files_read: Sequence[Path],
+    profile_files_read: Sequence[Path],
     regimes: Sequence[str],
     present_regimes: Sequence[str],
     profile_epsilon: float,
@@ -547,10 +856,22 @@ def write_readme(
     lines = [
         "Experiment E role-response regime comparison",
         "",
-        "Files read:",
+        f"Primary attack aggregate dir: {primary_attack_aggregate_dir}",
+        f"Neutral attack aggregate dir: {neutral_attack_aggregate_dir or '<none>'}",
+        f"Primary profile root: {primary_profile_root}",
+        f"Neutral profile root: {neutral_profile_root or '<none>'}",
+        f"Neutral profile layout: {neutral_profile_layout}",
+        f"Extra attack dirs: {', '.join(extra_attack_dirs) if extra_attack_dirs else '<none>'}",
+        f"Extra profile roots: {', '.join(extra_profile_roots) if extra_profile_roots else '<none>'}",
+        "",
+        "Attack files read:",
     ]
-    lines.extend(f"- {file_path}" for file_path in files_read)
-    if not files_read:
+    lines.extend(f"- {file_path}" for file_path in attack_files_read)
+    if not attack_files_read:
+        lines.append("- <none>")
+    lines.extend(["", "Profile files read:"])
+    lines.extend(f"- {file_path}" for file_path in profile_files_read)
+    if not profile_files_read:
         lines.append("- <none>")
     lines.extend(
         [
@@ -574,20 +895,59 @@ def write_readme(
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def write_path_list(path: Path, paths: Sequence[Path]) -> None:
+    if paths:
+        path.write_text("\n".join(str(item) for item in paths) + "\n", encoding="utf-8")
+    else:
+        path.write_text("", encoding="utf-8")
+
+
 def main() -> int:
     args = parse_args()
-    regimes = parse_regimes(args.regimes)
+    regimes = parse_regimes(args.compare_regimes or args.regimes)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     warnings: List[str] = []
 
-    attack, epsilon50, attack_files = load_attack_tables(Path(args.attack_aggregate_dir), args.dataset)
+    force_neutral = bool(int(args.force_neutral_baseline_regime))
+    forced_attack_sources: List[ForcedAttackSource] = []
+    if args.neutral_attack_aggregate_dir:
+        forced_attack_sources.append(
+            ForcedAttackSource("neutral", Path(args.neutral_attack_aggregate_dir), force_neutral)
+        )
+    for item in args.extra_attack_aggregate_dir:
+        parsed = parse_regime_path_item(item, label="--extra_attack_aggregate_dir", warnings=warnings)
+        if parsed is None:
+            continue
+        regime, path = parsed
+        forced_attack_sources.append(ForcedAttackSource(regime, path, True))
+
+    forced_profile_sources: List[ForcedProfileSource] = []
+    if args.neutral_profile_root:
+        forced_profile_sources.append(
+            ForcedProfileSource("neutral", Path(args.neutral_profile_root), args.neutral_profile_layout, force_neutral)
+        )
+    for item in args.extra_profile_root:
+        parsed = parse_regime_path_item(item, label="--extra_profile_root", warnings=warnings)
+        if parsed is None:
+            continue
+        regime, path = parsed
+        forced_profile_sources.append(ForcedProfileSource(regime, path, "auto", True))
+
+    attack, epsilon50, attack_files = load_attack_tables(
+        Path(args.attack_aggregate_dir),
+        args.dataset,
+        forced_attack_sources,
+        warnings=warnings,
+    )
     profile, profile_files = load_profile_summary(
         Path(args.profile_root),
         args.dataset,
         regimes,
         float(args.profile_epsilon),
         float(args.gain_quantile),
+        forced_profile_sources,
+        warnings=warnings,
     )
     attack_summary = summarize_attacks(
         attack,
@@ -624,9 +984,19 @@ def main() -> int:
     joined.to_csv(out_dir / "role_regime_joined.csv", index=False)
     ordering.to_csv(out_dir / "role_regime_ordering.csv", index=False)
     quality.to_csv(out_dir / "role_regime_prediction_quality.csv", index=False)
+    write_path_list(out_dir / "files_read_attack.txt", attack_files)
+    write_path_list(out_dir / "files_read_profile.txt", profile_files)
     write_readme(
         out_dir / "README.txt",
-        files_read=attack_files + profile_files,
+        primary_attack_aggregate_dir=Path(args.attack_aggregate_dir),
+        neutral_attack_aggregate_dir=args.neutral_attack_aggregate_dir,
+        primary_profile_root=Path(args.profile_root),
+        neutral_profile_root=args.neutral_profile_root,
+        neutral_profile_layout=args.neutral_profile_layout,
+        extra_attack_dirs=args.extra_attack_aggregate_dir,
+        extra_profile_roots=args.extra_profile_root,
+        attack_files_read=attack_files,
+        profile_files_read=profile_files,
         regimes=regimes,
         present_regimes=present_regimes,
         profile_epsilon=float(args.profile_epsilon),
@@ -649,8 +1019,10 @@ def main() -> int:
     if ordering.empty:
         print("<none>")
     else:
-        lambda_ok = bool(ordering["lambda_rank_match_expected"].fillna(False).all())
-        asr_ok = bool(ordering["asr_rank_match_expected"].fillna(False).all())
+        lambda_series = ordering["lambda_rank_match_expected"].dropna()
+        asr_series = ordering["asr_rank_match_expected"].dropna()
+        lambda_ok = bool(lambda_series.all()) if not lambda_series.empty else float("nan")
+        asr_ok = bool(asr_series.all()) if not asr_series.empty else float("nan")
         print(f"lambda_all_match={lambda_ok} asr_all_match={asr_ok}")
     print(f"out_dir: {out_dir}")
     return 0

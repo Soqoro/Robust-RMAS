@@ -5,7 +5,10 @@ from pathlib import Path
 import re
 from typing import Dict, Optional
 
-from inference_utils.reflector_tool_notes import system_prompt as REFLECTOR_TOOL_SYSTEM_PROMPT
+try:
+    from inference_utils.reflector_tool_notes import system_prompt as REFLECTOR_TOOL_SYSTEM_PROMPT
+except ModuleNotFoundError:
+    from .inference_utils.reflector_tool_notes import system_prompt as REFLECTOR_TOOL_SYSTEM_PROMPT
 
 SYSTEM_PROMPT = "You are a helpful assistant."
 DELIBERATION_SYSTEM_PROMPT = REFLECTOR_TOOL_SYSTEM_PROMPT
