@@ -13,6 +13,9 @@
 # Slurm:
 #   CALIB_JOB=$(sbatch --parsable --array=0-1 experiments/latent_contagion/run_experiment_c_calibration.sh)
 #   CALIB_STAGE=extract sbatch --dependency=afterok:$CALIB_JOB experiments/latent_contagion/run_experiment_c_calibration.sh
+# Four-worker multi-depth array:
+#   DATASET=gpqa GPU_LIST="0 1 2 3" CALIBRATION_ROUNDS="1 2 3 4 5" \
+#     sbatch --array=0-3%4 experiments/latent_contagion/run_experiment_c_calibration_array.sh
 #
 # Local smoke:
 #   CALIB_STAGE=clean NUM_SAMPLES=2 bash experiments/latent_contagion/run_experiment_c_calibration.sh
