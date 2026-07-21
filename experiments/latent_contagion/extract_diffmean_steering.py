@@ -26,6 +26,7 @@ Example:
     --rounds 0 \\
     --filter clean_correct_attack_wrong \\
     --target_answer 999999999 \\
+    --dataset math500 \\
     --calibration_R 2 \\
     --steering_id diffmean_R2_math500_role_aligned_clean_correct_attack_wrong
 """
@@ -419,6 +420,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--target_answer", default="999999999")
     parser.add_argument("--min_pairs", type=int, default=1)
+    parser.add_argument("--dataset", default="math500")
     parser.add_argument("--calibration_R", type=int, default=2)
     parser.add_argument("--steering_id", default="diffmean_R2_math500_role_aligned")
     parser.add_argument("--role_response_regime", default="neutral")
@@ -568,7 +570,7 @@ def main() -> None:
 
     metadata = {
         "source": "attack-associated-diffmean",
-        "dataset": "math500",
+        "dataset": str(args.dataset),
         "calibration_R": int(args.calibration_R),
         "sites": sites,
         "rounds": rounds,

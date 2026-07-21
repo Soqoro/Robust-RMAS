@@ -40,9 +40,21 @@ TRACE_ROUNDS="${TRACE_ROUNDS:-all}"
 TRACE_DTYPE="${TRACE_DTYPE:-float16}"
 GPU_LIST="${GPU_LIST:-}"
 FILTER="${FILTER:-clean_correct_attack_wrong}"
-TARGET_ANSWER="${TARGET_ANSWER:-999999999}"
 MIN_PAIRS="${MIN_PAIRS:-1}"
-ATTACK_SUFFIX_PATH="${ATTACK_SUFFIX_PATH:-experiments/latent_contagion/attack_suffix_math_role_aligned.txt}"
+
+case "${DATASET,,}" in
+  gpqa|gpqa_diamond|idavidrein/gpqa)
+    DEFAULT_TARGET_ANSWER="A"
+    DEFAULT_ATTACK_SUFFIX_PATH="experiments/latent_contagion/attack_suffix_gpqa_role_aligned.txt"
+    ;;
+  *)
+    DEFAULT_TARGET_ANSWER="999999999"
+    DEFAULT_ATTACK_SUFFIX_PATH="experiments/latent_contagion/attack_suffix_math_role_aligned.txt"
+    ;;
+esac
+
+TARGET_ANSWER="${TARGET_ANSWER:-$DEFAULT_TARGET_ANSWER}"
+ATTACK_SUFFIX_PATH="${ATTACK_SUFFIX_PATH:-$DEFAULT_ATTACK_SUFFIX_PATH}"
 
 if ! [[ "$CALIBRATION_R" =~ ^[0-9]+$ ]] || (( CALIBRATION_R < 1 )); then
   echo "[error] CALIBRATION_R must be a positive integer, got: $CALIBRATION_R" >&2
@@ -198,6 +210,7 @@ if [[ "$CALIB_STAGE" == "extract" ]]; then
     --filter "$FILTER"
     --target_answer "$TARGET_ANSWER"
     --min_pairs "$MIN_PAIRS"
+    --dataset "$DATASET"
     --calibration_R "$CALIBRATION_R"
     --steering_id "$STEERING_ID"
     --role_response_regime "$ROLE_RESPONSE_REGIME"
