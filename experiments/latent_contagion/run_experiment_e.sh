@@ -7,15 +7,22 @@
 
 # Experiment E: prompt-induced role-response regimes.
 #
-# Print attack grid:
+# Print the self-contained attack grid. It starts with exactly two fixed clean
+# jobs (reference and control) per regime/dataset/R/seed, then contains only
+# numerically positive-epsilon attacks:
 #   E_STAGE=attack_grid ROLE_RESPONSE_REGIMES="neutral amplifying corrective" \
 #     ROUNDS="1 2 3 4 5" DATASETS="math500" \
 #     bash experiments/latent_contagion/run_experiment_e.sh
+# The default attack grid has 30 clean jobs + 294 attack jobs = 324 tasks.
+# Complete canonical clean JSONLs are reused. After changing code, models, or
+# generation/evaluation settings, use a fresh OUT_ROOT (recommended) or set
+# OVERWRITE_CLEAN=1 and rerun the matching attack jobs.
 #
 # Run attacks:
 #   GPU_LIST="0 1 2 3" E_STAGE=attack ROLE_RESPONSE_REGIMES="neutral amplifying corrective" \
 #     ROUNDS="1 2 3 4 5" DATASETS="math500" LC_ROUNDS="0" \
-#     sbatch --array=0-N%4 experiments/latent_contagion/run_experiment_e.sh
+#     sbatch --array=0-323%4 experiments/latent_contagion/run_experiment_e.sh
+# Recompute the final index with E_STAGE=attack_grid after changing grid variables.
 #
 # Role-profile clean:
 #   GPU_LIST="0 1 2 3" E_STAGE=profile_clean sbatch --array=0-N%4 experiments/latent_contagion/run_experiment_e.sh
@@ -97,12 +104,212 @@ COMPARE_EXTRA_ARGS="${COMPARE_EXTRA_ARGS:-}"
 GPU_LIST="${GPU_LIST:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 ESTIMATE_EXTRA_ARGS="${ESTIMATE_EXTRA_ARGS:-}"
+OVERWRITE_CLEAN="${OVERWRITE_CLEAN:-0}"
 
 TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 
 die() {
   echo "[error] $*" >&2
   exit 2
+}
+
+case "$OVERWRITE_CLEAN" in
+  0|1) ;;
+  *) die "OVERWRITE_CLEAN must be 0 or 1. Got: $OVERWRITE_CLEAN" ;;
+esac
+
+case "$STYLE" in
+  sequential_light|sequential_scaled) ;;
+  *) die "STYLE must use the sequential inference family (sequential_light or sequential_scaled). Got: $STYLE" ;;
+esac
+
+case "$METHOD" in
+  ours_recursive|ours_recursive_no_feedback) ;;
+  *) die "METHOD must be a recursive latent method (ours_recursive or ours_recursive_no_feedback). Got: $METHOD" ;;
+esac
+
+if ! POSITIVE_EPSILONS="$("$PYTHON_BIN" - "$EPSILONS" <<'PY'
+import math
+import sys
+
+seen = set()
+positive = []
+for token in sys.argv[1].split():
+    try:
+        value = float(token)
+    except ValueError:
+        print(f"invalid EPSILONS item: {token!r}", file=sys.stderr)
+        raise SystemExit(2)
+    if not math.isfinite(value) or value < 0.0:
+        print(f"EPSILONS item must be finite and non-negative: {token!r}", file=sys.stderr)
+        raise SystemExit(2)
+    if value > 0.0 and value not in seen:
+        seen.add(value)
+        positive.append(token)
+print(" ".join(positive))
+PY
+)"; then
+  die "EPSILONS items must be finite non-negative numbers."
+fi
+
+if ! ROLE_EPSILONS="$("$PYTHON_BIN" - "$ROLE_EPSILONS" <<'PY'
+import math
+import sys
+
+seen = set()
+normalized = []
+for token in sys.argv[1].split():
+    try:
+        value = float(token)
+    except ValueError:
+        print(f"invalid ROLE_EPSILONS item: {token!r}", file=sys.stderr)
+        raise SystemExit(2)
+    if not math.isfinite(value) or value < 0.0:
+        print(f"ROLE_EPSILONS item must be finite and non-negative: {token!r}", file=sys.stderr)
+        raise SystemExit(2)
+    if value not in seen:
+        seen.add(value)
+        normalized.append(token)
+print(" ".join(normalized))
+PY
+)"; then
+  die "ROLE_EPSILONS items must be finite non-negative numbers."
+fi
+
+clean_result_is_reusable() {
+  "$PYTHON_BIN" - "$@" <<'PY'
+import json
+import math
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+
+def reject(reason):
+    print(f"[clean-cache] {path}: {reason}", file=sys.stderr)
+    raise SystemExit(1)
+
+samples = []
+summaries = []
+try:
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                reject(f"line {line_number} is invalid JSON ({exc})")
+            if not isinstance(record, dict):
+                reject(f"line {line_number} is not a JSON object")
+            if str(record.get("type", "")).lower() == "summary":
+                summaries.append(record)
+            else:
+                samples.append(record)
+except OSError as exc:
+    reject(f"cannot be read ({exc})")
+
+if not samples:
+    reject("contains no sample rows")
+if len(summaries) != 1:
+    reject(f"requires exactly one summary row, found {len(summaries)}")
+summary = summaries[0]
+declared_total = summary.get("num_samples", summary.get("n_total"))
+if isinstance(declared_total, bool):
+    reject("summary sample count is invalid")
+try:
+    declared_total = int(declared_total)
+except (TypeError, ValueError):
+    reject("summary has no valid num_samples/n_total")
+if declared_total != len(samples):
+    reject(f"summary declares {declared_total} samples but file has {len(samples)}")
+
+expected_dataset, expected_style, expected_method = sys.argv[2:5]
+expected_rounds, expected_seed = sys.argv[5:7]
+expected_regime, requested_samples = sys.argv[7:9]
+for field, expected in (
+    ("dataset", expected_dataset),
+    ("style", expected_style),
+    ("method", expected_method),
+):
+    actual = str(summary.get(field, "")).strip()
+    if actual != expected:
+        reject(f"summary {field}={actual!r} does not match selected {expected!r}")
+actual_regime = str(summary.get("role_response_regime", "")).strip().lower()
+if actual_regime != expected_regime.lower():
+    reject(
+        f"summary role_response_regime={actual_regime!r} "
+        f"does not match selected {expected_regime.lower()!r}"
+    )
+for field, actual, expected in (
+    ("recursion_rounds", summary.get("recursion_rounds", summary.get("R")), expected_rounds),
+    ("seed", summary.get("seed"), expected_seed),
+):
+    try:
+        actual_int = int(actual)
+        expected_int = int(expected)
+    except (TypeError, ValueError):
+        reject(f"summary has invalid {field} metadata")
+    if actual_int != expected_int:
+        reject(f"summary {field}={actual_int} does not match selected {expected_int}")
+try:
+    requested_samples_int = int(requested_samples)
+except ValueError:
+    reject(f"selected NUM_SAMPLES={requested_samples!r} is invalid")
+if requested_samples_int >= 0 and declared_total != requested_samples_int:
+    reject(
+        f"summary num_samples={declared_total} does not match requested {requested_samples_int}"
+    )
+
+required_provenance = (
+    "provenance_schema_version",
+    "sample_cohort_sha256",
+    "sample_ids_sha256",
+    "questions_sha256",
+    "ground_truths_sha256",
+    "generation_config_sha256",
+    "evaluation_config_sha256",
+    "evaluation_protocol",
+    "attack_config_sha256",
+)
+for field in required_provenance:
+    values = [str(record.get(field, "")).strip() for record in [*samples, summary]]
+    if not all(values):
+        reject(f"is missing {field} provenance")
+    if len(set(values)) != 1:
+        reject(f"has inconsistent {field} provenance")
+
+sample_ids = [str(record.get("sample_id", "")).strip() for record in samples]
+if not all(sample_ids) or len(set(sample_ids)) != len(sample_ids):
+    reject("has missing or duplicate sample_id values")
+for record in samples:
+    if not str(record.get("sample_input_sha256", "")).strip():
+        reject("is missing per-sample input provenance")
+    try:
+        epsilon = float(record.get("lc_epsilon"))
+    except (TypeError, ValueError):
+        reject("has missing or invalid clean epsilon")
+    if not math.isfinite(epsilon) or epsilon != 0.0:
+        reject("contains a nonzero clean epsilon")
+    if bool(record.get("lc_enabled", False)):
+        reject("contains an enabled latent-contagion sample")
+if str(summary.get("question_suffix_path", "")).strip() or str(summary.get("prompt_footer_path", "")).strip():
+    reject("contains a direct prompt attack")
+attack_config = summary.get("attack_config")
+if not isinstance(attack_config, dict):
+    reject("is missing attack_config metadata")
+latent_config = attack_config.get("latent_contagion")
+probe_config = attack_config.get("role_profile_probe")
+if not isinstance(latent_config, dict) or str(latent_config.get("mode", "")).lower() != "none":
+    reject("contains a latent-contagion attack configuration")
+if float(latent_config.get("epsilon", float("nan"))) != 0.0:
+    reject("contains a nonzero latent-contagion attack configuration")
+if not isinstance(probe_config, dict) or str(probe_config.get("mode", "")).lower() != "none":
+    reject("contains a role-profile probe configuration")
+if float(probe_config.get("epsilon", float("nan"))) != 0.0:
+    reject("contains a nonzero role-profile probe configuration")
+PY
 }
 
 validate_positive_int() {
@@ -524,6 +731,14 @@ PY
 }
 
 append_common_optional_args() {
+  if [[ -n "$EXTRA_ARGS" ]]; then
+    local -a extra_args_array original_cmd
+    read -r -a extra_args_array <<< "$EXTRA_ARGS"
+    original_cmd=("${cmd[@]}")
+    # Keep grid/path-defining arguments authoritative: argparse takes the last
+    # value, so extras must precede the explicit command assembled above.
+    cmd=("${original_cmd[@]:0:2}" "${extra_args_array[@]}" "${original_cmd[@]:2}")
+  fi
   if [[ -n "${SAMPLE_SEED:-}" ]]; then
     cmd+=(--sample_seed "$SAMPLE_SEED")
   fi
@@ -538,10 +753,6 @@ append_common_optional_args() {
   fi
   if [[ -n "${DEVICE:-}" ]]; then
     cmd+=(--device "$DEVICE")
-  fi
-  if [[ -n "$EXTRA_ARGS" ]]; then
-    read -r -a extra_args_array <<< "$EXTRA_ARGS"
-    cmd+=("${extra_args_array[@]}")
   fi
 }
 
@@ -596,11 +807,22 @@ select_attack_bank() {
 
 total_attack_jobs() {
   local total=0
-  local regime dataset site eps rounds lc_round seed
+  local clean_role regime dataset site eps rounds lc_round seed
+  for clean_role in reference control; do
+    for regime in $ROLE_RESPONSE_REGIMES; do
+      for dataset in $DATASETS; do
+        for rounds in $ROUNDS; do
+          for seed in $SEEDS; do
+            total=$((total + 1))
+          done
+        done
+      done
+    done
+  done
   for regime in $ROLE_RESPONSE_REGIMES; do
     for dataset in $DATASETS; do
       for site in $SITES; do
-        for eps in $EPSILONS; do
+        for eps in $POSITIVE_EPSILONS; do
           for rounds in $ROUNDS; do
             for lc_round in $(candidate_lc_rounds_for_config "$site" "$rounds"); do
               for seed in $SEEDS; do
@@ -617,18 +839,30 @@ total_attack_jobs() {
 
 print_attack_grid() {
   local index=0
-  local regime dataset site eps rounds lc_round seed total
+  local clean_role regime dataset site eps rounds lc_round seed total
   total="$(total_attack_jobs)"
   echo "total_attack_jobs=$total"
-  echo "array_index regime dataset site epsilon R lc_round seed"
+  echo "array_index job_kind clean_role regime dataset site epsilon R lc_round seed"
+  for clean_role in reference control; do
+    for regime in $ROLE_RESPONSE_REGIMES; do
+      for dataset in $DATASETS; do
+        for rounds in $ROUNDS; do
+          for seed in $SEEDS; do
+            echo "$index clean $clean_role $regime $dataset - 0 $rounds - $seed"
+            index=$((index + 1))
+          done
+        done
+      done
+    done
+  done
   for regime in $ROLE_RESPONSE_REGIMES; do
     for dataset in $DATASETS; do
       for site in $SITES; do
-        for eps in $EPSILONS; do
+        for eps in $POSITIVE_EPSILONS; do
           for rounds in $ROUNDS; do
             for lc_round in $(candidate_lc_rounds_for_config "$site" "$rounds"); do
               for seed in $SEEDS; do
-                echo "$index $regime $dataset $site $eps $rounds $lc_round $seed"
+                echo "$index attack - $regime $dataset $site $eps $rounds $lc_round $seed"
                 index=$((index + 1))
               done
             done
@@ -642,15 +876,40 @@ print_attack_grid() {
 select_attack_config() {
   local target_index="$1"
   local index=0
-  local regime dataset site eps rounds lc_round seed
+  local clean_role regime dataset site eps rounds lc_round seed
+  for clean_role in reference control; do
+    for regime in $ROLE_RESPONSE_REGIMES; do
+      for dataset in $DATASETS; do
+        for rounds in $ROUNDS; do
+          for seed in $SEEDS; do
+            if (( index == target_index )); then
+              JOB_KIND="clean"
+              CLEAN_ROLE="$clean_role"
+              ROLE_RESPONSE_REGIME="$regime"
+              DATASET="$dataset"
+              SITE=""
+              EPS="0"
+              R="$rounds"
+              LC_ROUND_EFFECTIVE=""
+              SEED="$seed"
+              return 0
+            fi
+            index=$((index + 1))
+          done
+        done
+      done
+    done
+  done
   for regime in $ROLE_RESPONSE_REGIMES; do
     for dataset in $DATASETS; do
       for site in $SITES; do
-        for eps in $EPSILONS; do
+        for eps in $POSITIVE_EPSILONS; do
           for rounds in $ROUNDS; do
             for lc_round in $(candidate_lc_rounds_for_config "$site" "$rounds"); do
               for seed in $SEEDS; do
                 if (( index == target_index )); then
+                  JOB_KIND="attack"
+                  CLEAN_ROLE=""
                   ROLE_RESPONSE_REGIME="$regime"
                   DATASET="$dataset"
                   SITE="$site"
@@ -835,6 +1094,87 @@ total_profile_estimate_jobs() {
 
 select_profile_estimate_config() {
   select_profile_clean_config "$1"
+}
+
+run_attack_clean_config() {
+  local clean_role="$1"
+  local regime="$2"
+  local dataset="$3"
+  local rounds="$4"
+  local seed="$5"
+  local run_dir result_jsonl command_path manifest_path run_log clean_result_action
+  run_dir="$OUT_ROOT/attacks/clean/$clean_role/$regime/$dataset/R${rounds}/seed${seed}"
+  result_jsonl="$run_dir/result.jsonl"
+  command_path="$run_dir/command.txt"
+  manifest_path="$run_dir/manifest.json"
+  run_log="$run_dir/run.log"
+
+  clean_result_action="create"
+  if [[ -e "$result_jsonl" ]]; then
+    if [[ "$OVERWRITE_CLEAN" == "1" ]]; then
+      clean_result_action="overwrite"
+    elif clean_result_is_reusable \
+      "$result_jsonl" "$dataset" "$STYLE" "$METHOD" "$rounds" "$seed" "$regime" "$NUM_SAMPLES"; then
+      clean_result_action="reuse"
+    else
+      die "Existing canonical clean JSONL is incomplete, incompatible, or lacks provenance: $result_jsonl. Set OVERWRITE_CLEAN=1 to replace it."
+    fi
+  fi
+
+  if [[ "$clean_result_action" == "reuse" ]]; then
+    echo "[experiment_e] reusing complete compatible canonical clean JSONL: $result_jsonl"
+    return 0
+  fi
+
+  mkdir -p "$run_dir"
+
+  cmd=(
+    "$PYTHON_BIN" RecursiveMAS/run.py
+    --style "$STYLE"
+    --dataset "$dataset"
+    --method "$METHOD"
+    --num_recursive_rounds "$rounds"
+    --num_samples "$NUM_SAMPLES"
+    --batch_size "$BATCH_SIZE"
+    --latent_length "$LATENT_LENGTH"
+    --seed "$seed"
+    --trust_remote_code "$TRUST_REMOTE_CODE"
+    --deterministic 1
+    --role_response_regime "$regime"
+    --role_response_regime_path "$ROLE_RESPONSE_REGIME_PATH"
+    --result_jsonl "$result_jsonl"
+  )
+  append_common_optional_args
+  # These final arguments keep the fixed controls attack-free even when
+  # EXTRA_ARGS contains attack or determinism overrides.
+  cmd+=(
+    --deterministic 1
+    --question_suffix_path ""
+    --prompt_footer_path ""
+    --lc_mode none --lc_epsilon 0 --lc_seed "$seed" --lc_direction random
+    --role_profile_probe_mode none --role_profile_probe_target none
+    --role_profile_probe_site none --role_profile_probe_round -1
+    --role_profile_epsilon 0 --role_profile_seed "$seed"
+  )
+  write_command_txt "$command_path" "${cmd[@]}"
+  write_manifest_json "$manifest_path" \
+    "stage=attack_clean" "clean_role=$clean_role" "style=$STYLE" "method=$METHOD" \
+    "dataset=$dataset" "R=$rounds" "seed=$seed" \
+    "role_response_regime=$regime" "role_response_regime_path=$ROLE_RESPONSE_REGIME_PATH" \
+    "lc_mode=none" "lc_epsilon=0" "lc_direction=random" \
+    "overwrite_clean=$OVERWRITE_CLEAN" "clean_result_action=$clean_result_action" \
+    "result_jsonl=$result_jsonl" "run_log=$run_log" "num_samples=$NUM_SAMPLES" \
+    "batch_size=$BATCH_SIZE" "latent_length=$LATENT_LENGTH" \
+    "trust_remote_code=$TRUST_REMOTE_CODE" "gpu_list=$GPU_LIST" \
+    "cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-}" "extra_args=$EXTRA_ARGS"
+
+  echo "===== Experiment E attack clean :: role=$clean_role regime=$regime dataset=$dataset R=$rounds seed=$seed ====="
+  echo "[experiment_e] result_jsonl=$result_jsonl"
+  echo "[experiment_e] overwrite_clean=$OVERWRITE_CLEAN clean_result_action=$clean_result_action"
+  printf '[experiment_e] command:'
+  printf ' %q' "${cmd[@]}"
+  printf '\n'
+  "${cmd[@]}" 2>&1 | tee "$run_log"
 }
 
 run_attack_config() {
@@ -1128,12 +1468,16 @@ run_aggregate_attack() {
       --subdir "$ATTACK_RUN_SUBDIR"
       --out_dir "$aggregate_dir"
       --label "experiment_e_${ATTACK_RUN_SUBDIR}"
+      --clean_reference_root "$OUT_ROOT/attacks/clean/reference"
+      --clean_control_root "$OUT_ROOT/attacks/clean/control"
       --make_plots false
     )
     write_command_txt "$command_path" "${cmd[@]}"
     write_manifest_json "$manifest_path" \
       "stage=aggregate_attack" "dataset=$dataset" "out_dir=$aggregate_dir" \
       "attack_run_subdir=$ATTACK_RUN_SUBDIR" "role_response_regimes=$ROLE_RESPONSE_REGIMES" \
+      "clean_reference_root=$OUT_ROOT/attacks/clean/reference" \
+      "clean_control_root=$OUT_ROOT/attacks/clean/control" \
       "run_log=$run_log"
     echo "===== Experiment E aggregate attack :: dataset=$dataset ====="
     printf '[experiment_e] command:'
@@ -1272,11 +1616,22 @@ run_verify_sources() {
 }
 
 run_all_local() {
-  local regime dataset site eps rounds lc_round seed target probe_site probe_round role_eps
+  local clean_role regime dataset site eps rounds lc_round seed target probe_site probe_round role_eps
+  for clean_role in reference control; do
+    for regime in $ROLE_RESPONSE_REGIMES; do
+      for dataset in $DATASETS; do
+        for rounds in $ROUNDS; do
+          for seed in $SEEDS; do
+            run_attack_clean_config "$clean_role" "$regime" "$dataset" "$rounds" "$seed"
+          done
+        done
+      done
+    done
+  done
   for regime in $ROLE_RESPONSE_REGIMES; do
     for dataset in $DATASETS; do
       for site in $SITES; do
-        for eps in $EPSILONS; do
+        for eps in $POSITIVE_EPSILONS; do
           for rounds in $ROUNDS; do
             for lc_round in $(candidate_lc_rounds_for_config "$site" "$rounds"); do
               for seed in $SEEDS; do
@@ -1408,6 +1763,8 @@ if (( TASK_ID >= TOTAL_TASKS )); then
   die "Array index $TASK_ID is out of range for E_STAGE=$E_STAGE; total tasks: $TOTAL_TASKS"
 fi
 
+JOB_KIND=""
+CLEAN_ROLE=""
 ROLE_RESPONSE_REGIME=""
 DATASET=""
 R=""
@@ -1422,8 +1779,12 @@ PROBE_ROUND=""
 case "$E_STAGE" in
   attack)
     select_attack_config "$TASK_ID" || die "Failed to select attack config for task $TASK_ID"
-    echo "[experiment_e] task_id=$TASK_ID/$TOTAL_TASKS selected regime=$ROLE_RESPONSE_REGIME dataset=$DATASET site=$SITE eps=$EPS R=$R lc_round=$LC_ROUND_EFFECTIVE seed=$SEED"
-    run_attack_config "$ROLE_RESPONSE_REGIME" "$DATASET" "$SITE" "$EPS" "$R" "$LC_ROUND_EFFECTIVE" "$SEED"
+    echo "[experiment_e] task_id=$TASK_ID/$TOTAL_TASKS selected job_kind=$JOB_KIND clean_role=${CLEAN_ROLE:-<none>} regime=$ROLE_RESPONSE_REGIME dataset=$DATASET site=${SITE:-<none>} eps=$EPS R=$R lc_round=${LC_ROUND_EFFECTIVE:-<none>} seed=$SEED"
+    if [[ "$JOB_KIND" == "clean" ]]; then
+      run_attack_clean_config "$CLEAN_ROLE" "$ROLE_RESPONSE_REGIME" "$DATASET" "$R" "$SEED"
+    else
+      run_attack_config "$ROLE_RESPONSE_REGIME" "$DATASET" "$SITE" "$EPS" "$R" "$LC_ROUND_EFFECTIVE" "$SEED"
+    fi
     ;;
   profile_clean)
     select_profile_clean_config "$TASK_ID" || die "Failed to select profile_clean config for task $TASK_ID"

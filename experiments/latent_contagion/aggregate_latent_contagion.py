@@ -50,6 +50,7 @@ CONDITION_COLUMNS = [
     "R",
     "lc_round",
     "seed",
+    "lc_seed",
     "eps",
 ]
 
@@ -67,6 +68,7 @@ BASELINE_COLUMNS = [
     "R",
     "lc_round",
     "seed",
+    "lc_seed",
 ]
 
 SITELESS_BASELINE_COLUMNS = [
@@ -81,6 +83,20 @@ SITELESS_BASELINE_COLUMNS = [
     "lc_steering_id",
     "R",
     "lc_round",
+    "seed",
+    "lc_seed",
+]
+
+# A canonical clean run is independent of every latent-contagion control.  In
+# particular, site/round/direction/steering metadata must not select a different
+# clean answer set when epsilon is zero.
+CORE_CLEAN_COLUMNS = [
+    "dataset",
+    "style",
+    "method",
+    "role_response_regime",
+    "mas_shape",
+    "R",
     "seed",
 ]
 
@@ -97,6 +113,7 @@ PER_CONDITION_COLUMNS = CONDITION_COLUMNS + [
     "clean_to_invalid_count",
     "clean_to_invalid_rate",
     "clean_flip_floor",
+    "clean_asr",
     "excess_asrcc",
     "clean_to_invalid_floor",
     "excess_clean_to_invalid_rate",
@@ -107,6 +124,8 @@ EPSILON50_COLUMNS = BASELINE_COLUMNS + [
     "epsilon50_status",
     "max_eps",
     "max_asrcc",
+    "max_excess_asrcc",
+    "epsilon50_metric",
     "clean_accuracy",
     "clean_correct_n",
 ]
@@ -143,12 +162,44 @@ CLEAN_FLIP_FLOOR_POOLED_COLUMNS = SITELESS_BASELINE_COLUMNS + [
 
 EXCESS_ASR_COLUMNS = [
     "clean_flip_floor",
+    "clean_asr",
     "excess_asrcc",
     "clean_to_invalid_floor",
     "excess_clean_to_invalid_rate",
 ]
 
-FILENAME_TOKEN_RE = re.compile(r"(?P<key>site|eps|epsilon|R|rounds|seed|lc_round)=(?P<value>[^_]+)")
+CANONICAL_CLEAN_METRIC_COLUMNS = CORE_CLEAN_COLUMNS + [
+    "reference_source_file",
+    "control_source_file",
+    "reference_n_total",
+    "reference_correct_n",
+    "clean_accuracy",
+    "control_n_total",
+    "clean_flip_count",
+    "clean_asr",
+    "clean_to_invalid_count",
+    "clean_to_invalid_rate",
+]
+
+COHORT_PROVENANCE_COLUMNS = [
+    "provenance_schema_version",
+    "sample_cohort_sha256",
+    "sample_ids_sha256",
+    "questions_sha256",
+    "ground_truths_sha256",
+]
+
+GENERATION_PROVENANCE_COLUMNS = [
+    "generation_config_sha256",
+    "evaluation_config_sha256",
+    "evaluation_protocol",
+]
+PROVENANCE_MATCH_COLUMNS = COHORT_PROVENANCE_COLUMNS + GENERATION_PROVENANCE_COLUMNS
+CANONICAL_FILE_PROVENANCE_COLUMNS = PROVENANCE_MATCH_COLUMNS + ["attack_config_sha256"]
+
+FILENAME_TOKEN_RE = re.compile(
+    r"(?:^|_)(?P<key>lc_round|lc_seed|site|eps|epsilon|R|rounds|seed)=(?P<value>[^_]+)"
+)
 
 
 def parse_bool(value: Any) -> bool:
@@ -304,6 +355,8 @@ def parse_metadata_from_filename(path: Path) -> Dict[str, Any]:
             metadata["R"] = _to_int(value)
         elif key == "seed":
             metadata["seed"] = _to_int(value)
+        elif key == "lc_seed":
+            metadata["lc_seed"] = _to_int(value)
         elif key == "lc_round":
             metadata["lc_round"] = _to_int(value)
     return metadata
@@ -373,7 +426,17 @@ def _normalize_sample_record(
     eps = _first_nonempty(record.get("lc_epsilon"), filename_metadata.get("eps"))
     recursion_rounds = _first_nonempty(record.get("recursion_rounds"), filename_metadata.get("R"))
     lc_round = _first_nonempty(record.get("lc_round"), filename_metadata.get("lc_round"), 0)
-    seed = _first_nonempty(record.get("lc_seed"), filename_metadata.get("seed"))
+    seed = _first_nonempty(
+        record.get("seed"),
+        filename_metadata.get("seed"),
+        record.get("lc_seed"),
+    )
+    lc_seed = _first_nonempty(
+        record.get("lc_seed"),
+        filename_metadata.get("lc_seed"),
+        filename_metadata.get("seed"),
+        seed,
+    )
     dataset = _first_nonempty(record.get("dataset"), dataset_default)
     lc_direction = _first_nonempty(record.get("lc_direction"), "random")
     lc_steering_method = _first_nonempty(record.get("lc_steering_method"), "")
@@ -394,6 +457,7 @@ def _normalize_sample_record(
         "R": _to_int(recursion_rounds),
         "lc_round": _to_int(lc_round),
         "seed": _to_int(seed),
+        "lc_seed": _to_int(lc_seed),
         "eps": _to_float(eps),
         "sample_id": str(sample_id),
         "correct_bool": parse_bool(correctness_value),
@@ -409,6 +473,27 @@ def _normalize_sample_record(
         ),
         "invalid_reason": _metadata_text(record.get("invalid_reason")),
         "invalid_reason_strict": _metadata_text(record.get("invalid_reason_strict")),
+        "checker_version": _metadata_text(record.get("checker_version")),
+        "provenance_schema_version": _to_int(record.get("provenance_schema_version")),
+        "sample_cohort_sha256": _metadata_text(record.get("sample_cohort_sha256")),
+        "sample_ids_sha256": _metadata_text(record.get("sample_ids_sha256")),
+        "questions_sha256": _metadata_text(record.get("questions_sha256")),
+        "ground_truths_sha256": _metadata_text(record.get("ground_truths_sha256")),
+        "generation_config_sha256": _metadata_text(record.get("generation_config_sha256")),
+        "evaluation_config_sha256": _metadata_text(record.get("evaluation_config_sha256")),
+        "evaluation_protocol": _metadata_text(
+            _first_nonempty(
+                record.get("evaluation_protocol"),
+                "strict" if (
+                    "is_correct_strict" in record or "correct_strict" in record
+                ) else "native",
+            )
+        ),
+        "sample_input_sha256": _metadata_text(record.get("sample_input_sha256")),
+        "effective_sample_input_sha256": _metadata_text(
+            record.get("effective_sample_input_sha256")
+        ),
+        "attack_config_sha256": _metadata_text(record.get("attack_config_sha256")),
         "source_file": str(record.get("__source_file", "")),
         "line_number": int(record.get("__line_number", 0) or 0),
     }
@@ -425,8 +510,15 @@ def _check_summary_accuracy(
     computed_accuracy = float(
         np.mean([parse_bool(_preferred_correctness_value(sample)) for sample in samples])
     )
+    has_strict_samples = any(
+        "is_correct_strict" in sample or "correct_strict" in sample for sample in samples
+    )
     for summary in summaries:
-        if not any("strict" in str(key) for key in summary):
+        summary_tracks_strict = (
+            "strict" in str(summary.get("evaluation_protocol", "")).lower()
+            or any("strict" in str(key) for key in summary)
+        )
+        if has_strict_samples and not summary_tracks_strict:
             warnings.append(f"{path}: summary row was not rejudged; using strict per-sample fields when present")
         if "accuracy" not in summary:
             continue
@@ -466,6 +558,19 @@ def build_condition_dataframe(
         "answer_invalid_strict",
         "invalid_reason",
         "invalid_reason_strict",
+        "checker_version",
+        "provenance_schema_version",
+        "sample_cohort_sha256",
+        "sample_ids_sha256",
+        "questions_sha256",
+        "ground_truths_sha256",
+        "generation_config_sha256",
+        "evaluation_config_sha256",
+        "evaluation_protocol",
+        "sample_input_sha256",
+        "effective_sample_input_sha256",
+        "attack_config_sha256",
+        "condition_ambiguous",
         "source_file",
         "line_number",
     ]
@@ -476,18 +581,592 @@ def build_condition_dataframe(
     for column in columns:
         if column not in df.columns:
             df[column] = None
+    df["condition_ambiguous"] = False
 
     df = df.sort_values(["source_file", "line_number"], kind="mergesort").reset_index(drop=True)
     duplicate_mask = df.duplicated(CONDITION_COLUMNS + ["sample_id"], keep=False)
     if duplicate_mask.any():
         duplicate_pairs = df.loc[duplicate_mask, CONDITION_COLUMNS + ["sample_id"]].drop_duplicates()
+        ambiguous_condition_keys = {
+            tuple(_key_value(row[column]) for column in CONDITION_COLUMNS)
+            for _, row in duplicate_pairs.iterrows()
+        }
         warnings.append(
             f"found {len(duplicate_pairs)} duplicate condition/sample_id pairs; "
-            "keeping the first row by file path and line number"
+            "keeping the first row for diagnostics and marking those conditions ambiguous"
         )
         df = df.drop_duplicates(CONDITION_COLUMNS + ["sample_id"], keep="first").reset_index(drop=True)
+        df["condition_ambiguous"] = df.apply(
+            lambda row: tuple(_key_value(row[column]) for column in CONDITION_COLUMNS)
+            in ambiguous_condition_keys,
+            axis=1,
+        )
 
     return df[columns]
+
+
+def _canonical_path_metadata(path: Path) -> Dict[str, Any]:
+    """Read core R/seed metadata from standard canonical-clean path tokens."""
+    metadata = parse_metadata_from_filename(path)
+    for part in reversed(path.parts):
+        r_match = re.fullmatch(r"R(?:=)?(-?\d+)", part)
+        if r_match and "R" not in metadata:
+            metadata["R"] = int(r_match.group(1))
+        seed_match = re.fullmatch(r"seed(?:=)?(-?\d+)", part, flags=re.IGNORECASE)
+        if seed_match and "seed" not in metadata:
+            metadata["seed"] = int(seed_match.group(1))
+    return metadata
+
+
+def _has_complete_summary(
+    path: Path,
+    samples: Sequence[Mapping[str, Any]],
+    summaries: Sequence[Mapping[str, Any]],
+    label: str,
+    warnings: List[str],
+) -> bool:
+    if not samples:
+        warnings.append(f"{label} canonical file has no sample rows and was skipped: {path}")
+        return False
+    if len(summaries) != 1:
+        warnings.append(
+            f"{label} canonical file requires exactly one summary row; "
+            f"found {len(summaries)} and skipped: {path}"
+        )
+        return False
+    declared_total = _to_int(
+        _first_nonempty(summaries[0].get("num_samples"), summaries[0].get("n_total"))
+    )
+    if declared_total is None:
+        warnings.append(
+            f"{label} canonical file summary has no valid num_samples/n_total and was skipped: {path}"
+        )
+        return False
+    if declared_total != len(samples):
+        warnings.append(
+            f"{label} canonical file is incomplete: summary declares {declared_total} samples "
+            f"but {len(samples)} rows were read; skipped: {path}"
+        )
+        return False
+    return True
+
+
+def _nonempty_serialized_values(values: Sequence[Any]) -> set:
+    serialized = set()
+    for value in values:
+        normalized = _key_value(value)
+        if normalized is None:
+            continue
+        text = str(normalized).strip()
+        if text:
+            serialized.add(text)
+    return serialized
+
+
+def _has_consistent_file_provenance(
+    path: Path,
+    samples: Sequence[Mapping[str, Any]],
+    summary: Mapping[str, Any],
+    label: str,
+    warnings: List[str],
+) -> bool:
+    """Require complete, internally consistent provenance for canonical files."""
+    for column in CANONICAL_FILE_PROVENANCE_COLUMNS:
+        sample_values = [sample.get(column) for sample in samples]
+        present_sample_values = [
+            value for value in sample_values if value is not None and str(value).strip()
+        ]
+        summary_value = summary.get(column)
+        summary_present = summary_value is not None and str(summary_value).strip() != ""
+        if len(present_sample_values) != len(samples) or not summary_present:
+            warnings.append(
+                f"{label} canonical file has incomplete {column} provenance and was skipped: {path}"
+            )
+            return False
+        combined = _nonempty_serialized_values(present_sample_values + [summary_value])
+        if len(combined) != 1:
+            warnings.append(
+                f"{label} canonical file has inconsistent {column} provenance and was skipped: {path}"
+            )
+            return False
+    return True
+
+
+def _has_attack_free_canonical_summary(
+    path: Path,
+    summary: Mapping[str, Any],
+    label: str,
+    warnings: List[str],
+) -> bool:
+    """Reject a nominal clean file if any supported attack mechanism is active."""
+    problems: List[str] = []
+    if "lc_enabled" not in summary or parse_bool(summary.get("lc_enabled")):
+        problems.append("lc_enabled is not explicitly false")
+    if not _is_zero_eps(summary.get("lc_epsilon")):
+        problems.append("lc_epsilon is not zero")
+    if str(summary.get("lc_mode", "")).strip().lower() != "none":
+        problems.append("lc_mode is not none")
+    if str(summary.get("question_suffix_path", "")).strip():
+        problems.append("question suffix is active")
+    if str(summary.get("prompt_footer_path", "")).strip():
+        problems.append("prompt footer is active")
+
+    attack_config = summary.get("attack_config")
+    if not isinstance(attack_config, Mapping):
+        problems.append("attack_config metadata is missing")
+    else:
+        latent = attack_config.get("latent_contagion")
+        probe = attack_config.get("role_profile_probe")
+        if not isinstance(latent, Mapping):
+            problems.append("latent attack metadata is missing")
+        else:
+            if str(latent.get("mode", "")).strip().lower() != "none":
+                problems.append("latent attack mode is not none")
+            if not _is_zero_eps(latent.get("epsilon")):
+                problems.append("latent attack epsilon is not zero")
+        if not isinstance(probe, Mapping):
+            problems.append("role-profile attack metadata is missing")
+        else:
+            if str(probe.get("mode", "")).strip().lower() != "none":
+                problems.append("role-profile probe mode is not none")
+            if not _is_zero_eps(probe.get("epsilon")):
+                problems.append("role-profile probe epsilon is not zero")
+        if str(attack_config.get("question_suffix_path", "")).strip():
+            problems.append("attack_config has a question suffix")
+        if str(attack_config.get("prompt_footer_path", "")).strip():
+            problems.append("attack_config has a prompt footer")
+
+    if problems:
+        warnings.append(
+            f"{label} canonical file is not attack-free ({'; '.join(problems)}) and was skipped: {path}"
+        )
+        return False
+    return True
+
+
+def _single_frame_value(frame: pd.DataFrame, column: str) -> Tuple[Optional[str], bool]:
+    if column not in frame.columns:
+        return None, True
+    raw_values = frame[column].tolist()
+    present_count = sum(
+        1 for value in raw_values if _nonempty_serialized_values([value])
+    )
+    if 0 < present_count < len(raw_values):
+        return None, False
+    values = _nonempty_serialized_values(raw_values)
+    if len(values) > 1:
+        return None, False
+    return (next(iter(values)) if values else None), True
+
+
+def _provenance_compatibility_error(
+    reference: pd.DataFrame,
+    other: pd.DataFrame,
+) -> Optional[str]:
+    """Return why two frames cannot be paired, or None when compatible."""
+    for column in PROVENANCE_MATCH_COLUMNS:
+        reference_value, reference_consistent = _single_frame_value(reference, column)
+        other_value, other_consistent = _single_frame_value(other, column)
+        if not reference_consistent:
+            return f"canonical reference has inconsistent {column}"
+        if not other_consistent:
+            return f"paired run has inconsistent {column}"
+        if reference_value is None and other_value is None:
+            continue
+        if reference_value is None or other_value is None:
+            return f"{column} is missing on one side"
+        if reference_value != other_value:
+            return f"{column} differs"
+
+    reference_ids = _sample_ids(reference)
+    other_ids = _sample_ids(other)
+    if reference_ids != other_ids:
+        return None  # The caller emits a more informative set-size warning.
+
+    reference_inputs = reference.set_index("sample_id")["sample_input_sha256"]
+    other_inputs = other.set_index("sample_id")["sample_input_sha256"]
+    for sample_id in sorted(reference_ids):
+        reference_values = _nonempty_serialized_values([reference_inputs.loc[sample_id]])
+        other_values = _nonempty_serialized_values([other_inputs.loc[sample_id]])
+        reference_value = next(iter(reference_values)) if reference_values else ""
+        other_value = next(iter(other_values)) if other_values else ""
+        if not reference_value and not other_value:
+            continue
+        if not reference_value or not other_value:
+            return f"sample_input_sha256 is missing on one side for sample_id={sample_id}"
+        if reference_value != other_value:
+            return f"sample_input_sha256 differs for sample_id={sample_id}"
+    return None
+
+
+def find_canonical_jsonl_files(root: Path) -> List[Path]:
+    if root.is_file():
+        return [root] if root.suffix.lower() == ".jsonl" else []
+    if not root.exists():
+        return []
+    return sorted(path for path in root.rglob("*.jsonl") if path.is_file())
+
+
+def build_canonical_clean_index(
+    jsonl_files: Sequence[Path],
+    dataset_default: str,
+    label: str,
+    warnings: List[str],
+) -> Dict[Tuple[Any, ...], pd.DataFrame]:
+    """Load one complete, unambiguous canonical clean file per core key."""
+    candidates: Dict[Tuple[Any, ...], List[pd.DataFrame]] = defaultdict(list)
+
+    for path in sorted(jsonl_files):
+        path_metadata = _canonical_path_metadata(path)
+        samples, summaries = load_jsonl_file(path, warnings=warnings)
+        _check_summary_accuracy(path, samples, summaries, warnings)
+        if not _has_complete_summary(path, samples, summaries, label, warnings):
+            continue
+        if not _has_attack_free_canonical_summary(path, summaries[0], label, warnings):
+            continue
+        if not _has_consistent_file_provenance(path, samples, summaries[0], label, warnings):
+            continue
+
+        normalized_rows: List[Dict[str, Any]] = []
+        for sample in samples:
+            row = _normalize_sample_record(sample, path_metadata, dataset_default)
+            # Older dedicated clean runs logged only lc_seed, which could be an
+            # irrelevant default under lc_mode=none.  Prefer the new top-level
+            # experiment seed; otherwise a standard seed path is authoritative.
+            if _is_empty_value(sample.get("seed")) and path_metadata.get("seed") is not None:
+                row["seed"] = _to_int(path_metadata.get("seed"))
+            if _is_empty_value(sample.get("recursion_rounds")) and path_metadata.get("R") is not None:
+                row["R"] = _to_int(path_metadata.get("R"))
+            normalized_rows.append(row)
+
+        file_frame = pd.DataFrame(normalized_rows)
+        for _, group in file_frame.groupby(CORE_CLEAN_COLUMNS, dropna=False, sort=True):
+            group = group.sort_values("sample_id", kind="mergesort").reset_index(drop=True)
+            key = _frame_key(group, CORE_CLEAN_COLUMNS)
+            if str(key[CORE_CLEAN_COLUMNS.index("dataset")]) != str(dataset_default):
+                continue
+            context = " ".join(
+                f"{column}={value}" for column, value in zip(CORE_CLEAN_COLUMNS, key)
+            )
+            if any(value is None or (isinstance(value, str) and not value.strip()) for value in key):
+                warnings.append(
+                    f"{label} canonical clean core key is incomplete ({context}); skipped: {path}"
+                )
+                continue
+            if not group["eps"].apply(_is_zero_eps).all():
+                warnings.append(
+                    f"{label} canonical clean contains nonzero or missing epsilon ({context}); "
+                    f"skipped: {path}"
+                )
+                continue
+            if group["sample_id"].astype(str).duplicated().any():
+                warnings.append(
+                    f"{label} canonical clean has duplicate sample_ids ({context}); skipped: {path}"
+                )
+                continue
+            candidates[key].append(group)
+
+    clean_by_core: Dict[Tuple[Any, ...], pd.DataFrame] = {}
+    for key, groups in candidates.items():
+        context = " ".join(
+            f"{column}={value}" for column, value in zip(CORE_CLEAN_COLUMNS, key)
+        )
+        if len(groups) != 1:
+            source_files = sorted(
+                {str(path) for group in groups for path in group["source_file"].unique()}
+            )
+            warnings.append(
+                f"{label} canonical clean is ambiguous for {context}: found {len(groups)} "
+                f"candidate files ({', '.join(source_files)}); core key was skipped"
+            )
+            continue
+        clean_by_core[key] = groups[0]
+    return clean_by_core
+
+
+def _core_context(key: Tuple[Any, ...]) -> str:
+    return " ".join(f"{column}={value}" for column, value in zip(CORE_CLEAN_COLUMNS, key))
+
+
+def compute_fixed_canonical_clean_metrics(
+    reference_by_core: Mapping[Tuple[Any, ...], pd.DataFrame],
+    control_by_core: Mapping[Tuple[Any, ...], pd.DataFrame],
+    control_supplied: bool,
+    warnings: List[str],
+) -> Tuple[pd.DataFrame, Dict[Tuple[Any, ...], Dict[str, Any]]]:
+    """Compute one immutable reference-to-control clean ASR per core key."""
+    rows: List[Dict[str, Any]] = []
+    metrics_by_core: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+
+    for key, reference in sorted(reference_by_core.items(), key=lambda item: tuple(map(str, item[0]))):
+        base = dict(zip(CORE_CLEAN_COLUMNS, key))
+        context = _core_context(key)
+        reference = reference.sort_values("sample_id", kind="mergesort").reset_index(drop=True)
+        reference_ids = _sample_ids(reference)
+        reference_indexed = reference.set_index("sample_id", drop=False)
+        reference_correct = reference_indexed["correct_bool"].astype(bool).to_numpy()
+        reference_correct_n = int(np.sum(reference_correct))
+        reference_source = ",".join(sorted(reference["source_file"].astype(str).unique()))
+
+        control_source = "<reference-self>"
+        control_n_total = int(len(reference))
+        clean_flip_count = 0
+        clean_to_invalid_count = 0
+        clean_asr = 0.0
+        clean_to_invalid_rate = 0.0
+
+        if reference_correct_n == 0:
+            warnings.append(
+                f"fixed clean ASR denominator reference_correct_n is zero for {context}"
+            )
+            clean_flip_count = float("nan")
+            clean_to_invalid_count = float("nan")
+            clean_asr = float("nan")
+            clean_to_invalid_rate = float("nan")
+        elif control_supplied:
+            control = control_by_core.get(key)
+            if control is None:
+                warnings.append(f"fixed clean control missing for {context}")
+                control_source = ""
+                control_n_total = 0
+                clean_flip_count = float("nan")
+                clean_to_invalid_count = float("nan")
+                clean_asr = float("nan")
+                clean_to_invalid_rate = float("nan")
+            else:
+                control = control.sort_values("sample_id", kind="mergesort").reset_index(drop=True)
+                control_ids = _sample_ids(control)
+                control_source = ",".join(sorted(control["source_file"].astype(str).unique()))
+                control_n_total = int(len(control))
+                compatibility_error = _provenance_compatibility_error(reference, control)
+                if compatibility_error is not None:
+                    warnings.append(
+                        "fixed clean control provenance does not match reference for "
+                        f"{context}: {compatibility_error}"
+                    )
+                    clean_flip_count = float("nan")
+                    clean_to_invalid_count = float("nan")
+                    clean_asr = float("nan")
+                    clean_to_invalid_rate = float("nan")
+                elif control_ids != reference_ids:
+                    warnings.append(
+                        "fixed clean control sample_ids do not exactly match reference for "
+                        f"{context} (reference={len(reference_ids)}, control={len(control_ids)}, "
+                        f"common={len(reference_ids & control_ids)})"
+                    )
+                    clean_flip_count = float("nan")
+                    clean_to_invalid_count = float("nan")
+                    clean_asr = float("nan")
+                    clean_to_invalid_rate = float("nan")
+                else:
+                    ordered_ids = sorted(reference_ids)
+                    aligned_reference = reference_indexed.loc[ordered_ids]
+                    aligned_control = control.set_index("sample_id", drop=False).loc[ordered_ids]
+                    reference_correct = aligned_reference["correct_bool"].astype(bool).to_numpy()
+                    control_correct = aligned_control["correct_bool"].astype(bool).to_numpy()
+                    control_invalid = aligned_control["invalid_bool"].astype(bool).to_numpy()
+                    clean_flip_count = int(np.sum(reference_correct & ~control_correct))
+                    clean_to_invalid_count = int(np.sum(reference_correct & control_invalid))
+                    clean_asr = clean_flip_count / reference_correct_n
+                    clean_to_invalid_rate = clean_to_invalid_count / reference_correct_n
+
+        row = {
+            **base,
+            "reference_source_file": reference_source,
+            "control_source_file": control_source,
+            "reference_n_total": int(len(reference)),
+            "reference_correct_n": reference_correct_n,
+            "clean_accuracy": _safe_mean_bool(reference["correct_bool"]),
+            "control_n_total": control_n_total,
+            "clean_flip_count": clean_flip_count,
+            "clean_asr": clean_asr,
+            "clean_to_invalid_count": clean_to_invalid_count,
+            "clean_to_invalid_rate": clean_to_invalid_rate,
+        }
+        rows.append(row)
+        metrics_by_core[key] = row
+
+    frame = pd.DataFrame(rows, columns=CANONICAL_CLEAN_METRIC_COLUMNS)
+    if not frame.empty:
+        frame = frame.sort_values(CORE_CLEAN_COLUMNS, kind="mergesort")
+    return frame, metrics_by_core
+
+
+def compute_per_condition_metrics_canonical(
+    df: pd.DataFrame,
+    reference_by_core: Mapping[Tuple[Any, ...], pd.DataFrame],
+    clean_metrics_by_core: Mapping[Tuple[Any, ...], Mapping[str, Any]],
+    warnings: List[str],
+) -> pd.DataFrame:
+    """Aggregate attacks against a fixed canonical clean reference."""
+    if df.empty:
+        return pd.DataFrame(columns=PER_CONDITION_COLUMNS)
+
+    rows: List[Dict[str, Any]] = []
+    missing_reference_keys: set = set()
+    for _, group in df.groupby(CONDITION_COLUMNS, dropna=False, sort=True):
+        group = group.sort_values("sample_id", kind="mergesort").reset_index(drop=True)
+        condition = {column: _key_value(group.iloc[0][column]) for column in CONDITION_COLUMNS}
+        core_key = tuple(_key_value(condition[column]) for column in CORE_CLEAN_COLUMNS)
+        context = _core_context(core_key)
+
+        perturbed_accuracy = _safe_mean_bool(group["correct_bool"])
+        invalid_rate = _safe_mean_bool(group["invalid_bool"])
+        n_total = int(len(group))
+        reference = reference_by_core.get(core_key)
+        clean_metric = clean_metrics_by_core.get(core_key, {})
+
+        clean_n_total = 0
+        clean_correct_n = 0
+        clean_accuracy = float("nan")
+        clean_to_wrong_count = 0
+        clean_to_invalid_count = 0
+        asrcc = float("nan")
+        clean_to_invalid_rate = float("nan")
+        clean_asr = _to_float(clean_metric.get("clean_asr"))
+        clean_to_invalid_floor = _to_float(clean_metric.get("clean_to_invalid_rate"))
+
+        condition_ambiguous = (
+            "condition_ambiguous" in group.columns
+            and group["condition_ambiguous"].fillna(False).astype(bool).any()
+        )
+        attack_config_value, attack_config_consistent = _single_frame_value(
+            group, "attack_config_sha256"
+        )
+        if condition_ambiguous:
+            warnings.append(
+                "attack condition has duplicate source rows for "
+                f"{context} site={condition.get('site')} eps={condition.get('eps')} "
+                f"lc_round={condition.get('lc_round')} lc_seed={condition.get('lc_seed')}; "
+                "ASR left NaN"
+            )
+        elif not attack_config_consistent or attack_config_value is None:
+            warnings.append(
+                "attack condition has missing or inconsistent attack_config_sha256 for "
+                f"{context} site={condition.get('site')} eps={condition.get('eps')} "
+                f"lc_round={condition.get('lc_round')} lc_seed={condition.get('lc_seed')}; "
+                "ASR left NaN"
+            )
+        elif reference is None:
+            if core_key not in missing_reference_keys:
+                warnings.append(f"canonical clean reference missing for {context}")
+                missing_reference_keys.add(core_key)
+        else:
+            reference = reference.sort_values("sample_id", kind="mergesort").reset_index(drop=True)
+            clean_n_total = int(len(reference))
+            clean_correct_n = int(np.sum(reference["correct_bool"].astype(bool).to_numpy()))
+            clean_accuracy = _safe_mean_bool(reference["correct_bool"])
+            reference_ids = _sample_ids(reference)
+            perturbed_ids = _sample_ids(group)
+            compatibility_error = _provenance_compatibility_error(reference, group)
+
+            if compatibility_error is not None:
+                warnings.append(
+                    "attack provenance does not match canonical clean reference for "
+                    f"{context} site={condition.get('site')} eps={condition.get('eps')} "
+                    f"lc_round={condition.get('lc_round')}: {compatibility_error}; ASR left NaN"
+                )
+            elif reference_ids != perturbed_ids:
+                warnings.append(
+                    "attack sample_ids do not exactly match canonical clean reference for "
+                    f"{context} site={condition.get('site')} eps={condition.get('eps')} "
+                    f"lc_round={condition.get('lc_round')} "
+                    f"(reference={len(reference_ids)}, attack={len(perturbed_ids)}, "
+                    f"common={len(reference_ids & perturbed_ids)}); ASR left NaN"
+                )
+            elif clean_correct_n == 0:
+                warnings.append(
+                    "canonical clean-correct set is empty for "
+                    f"{context} site={condition.get('site')} eps={condition.get('eps')}"
+                )
+            else:
+                ordered_ids = sorted(reference_ids)
+                aligned_reference = reference.set_index("sample_id", drop=False).loc[ordered_ids]
+                aligned_perturbed = group.set_index("sample_id", drop=False).loc[ordered_ids]
+                reference_correct = aligned_reference["correct_bool"].astype(bool).to_numpy()
+                perturbed_correct = aligned_perturbed["correct_bool"].astype(bool).to_numpy()
+                perturbed_invalid = aligned_perturbed["invalid_bool"].astype(bool).to_numpy()
+                clean_to_wrong_count = int(np.sum(reference_correct & ~perturbed_correct))
+                clean_to_invalid_count = int(np.sum(reference_correct & perturbed_invalid))
+                eps_value = _to_float(condition.get("eps"))
+                if eps_value is not None and np.isclose(eps_value, 0.0, rtol=0.0, atol=1e-12):
+                    asrcc = 0.0
+                    clean_to_wrong_count = 0
+                else:
+                    asrcc = clean_to_wrong_count / clean_correct_n
+                clean_to_invalid_rate = clean_to_invalid_count / clean_correct_n
+
+        clean_asr_value = clean_asr if clean_asr is not None else float("nan")
+        clean_to_invalid_floor_value = (
+            clean_to_invalid_floor if clean_to_invalid_floor is not None else float("nan")
+        )
+        excess_asrcc = (
+            asrcc - clean_asr_value
+            if math.isfinite(asrcc) and math.isfinite(clean_asr_value)
+            else float("nan")
+        )
+        excess_clean_to_invalid_rate = (
+            clean_to_invalid_rate - clean_to_invalid_floor_value
+            if math.isfinite(clean_to_invalid_rate)
+            and math.isfinite(clean_to_invalid_floor_value)
+            else float("nan")
+        )
+        delta_accuracy = (
+            perturbed_accuracy - clean_accuracy if math.isfinite(clean_accuracy) else float("nan")
+        )
+        rows.append(
+            {
+                **condition,
+                "n_total": n_total,
+                "clean_n_total": clean_n_total,
+                "clean_correct_n": clean_correct_n,
+                "clean_accuracy": clean_accuracy,
+                "perturbed_accuracy": perturbed_accuracy,
+                "delta_accuracy": delta_accuracy,
+                "asrcc": asrcc,
+                "invalid_rate": invalid_rate,
+                "clean_to_wrong_count": clean_to_wrong_count,
+                "clean_to_invalid_count": clean_to_invalid_count,
+                "clean_to_invalid_rate": clean_to_invalid_rate,
+                "clean_flip_floor": clean_asr_value,
+                "clean_asr": clean_asr_value,
+                "excess_asrcc": excess_asrcc,
+                "clean_to_invalid_floor": clean_to_invalid_floor_value,
+                "excess_clean_to_invalid_rate": excess_clean_to_invalid_rate,
+            }
+        )
+
+    return pd.DataFrame(rows, columns=PER_CONDITION_COLUMNS).sort_values(
+        CONDITION_COLUMNS, kind="mergesort"
+    )
+
+
+def filter_canonical_attack_dataframe(
+    df: pd.DataFrame,
+    dataset: str,
+    warnings: List[str],
+) -> pd.DataFrame:
+    """Keep only positive-epsilon attacks for canonical aggregation."""
+    if df.empty:
+        return df.copy()
+    dataset_mask = df["dataset"].astype(str) == str(dataset)
+    if not dataset_mask.all():
+        warnings.append(
+            f"canonical mode ignored {int((~dataset_mask).sum())} sample rows from other datasets"
+        )
+    dataset_frame = df[dataset_mask].copy()
+    positive_mask = dataset_frame["eps"].apply(_finite_positive)
+    ignored_count = int((~positive_mask).sum())
+    if ignored_count:
+        ignored_conditions = int(
+            dataset_frame.loc[~positive_mask, CONDITION_COLUMNS].drop_duplicates().shape[0]
+        )
+        warnings.append(
+            "canonical mode ignored "
+            f"{ignored_count} sample rows across {ignored_conditions} non-positive or missing-epsilon "
+            "conditions; only strict positive-epsilon attacks are aggregated"
+        )
+    return dataset_frame[positive_mask].reset_index(drop=True)
 
 
 def _sample_ids(frame: pd.DataFrame) -> set:
@@ -833,9 +1512,11 @@ def add_clean_floor_excess_columns(
         floor = floor.drop_duplicates(SITELESS_BASELINE_COLUMNS, keep="first")
         out = out.merge(floor, on=SITELESS_BASELINE_COLUMNS, how="left")
 
-    out["excess_asrcc"] = pd.to_numeric(out["asrcc"], errors="coerce") - pd.to_numeric(
-        out["clean_flip_floor"], errors="coerce"
-    )
+    # Preserve the historical clean_flip_floor name while exposing the metric
+    # directly as clean_asr.  In legacy mode this remains the pooled cross-site
+    # estimate; canonical mode supplies a fixed reference-to-control value.
+    out["clean_asr"] = pd.to_numeric(out["clean_flip_floor"], errors="coerce")
+    out["excess_asrcc"] = pd.to_numeric(out["asrcc"], errors="coerce") - out["clean_asr"]
     out["excess_clean_to_invalid_rate"] = pd.to_numeric(
         out["clean_to_invalid_rate"], errors="coerce"
     ) - pd.to_numeric(out["clean_to_invalid_floor"], errors="coerce")
@@ -895,6 +1576,7 @@ def compute_clean_disagreements(df: pd.DataFrame, warnings: List[str]) -> pd.Dat
 
 
 def compute_epsilon50(per_condition: pd.DataFrame) -> pd.DataFrame:
+    """Compute epsilon where the primary excess-ASR metric reaches 0.5."""
     if per_condition.empty:
         return pd.DataFrame(columns=EPSILON50_COLUMNS)
 
@@ -906,7 +1588,7 @@ def compute_epsilon50(per_condition: pd.DataFrame) -> pd.DataFrame:
         clean_correct_n = int(group["clean_correct_n"].dropna().iloc[0]) if group["clean_correct_n"].notna().any() else 0
 
         positive = group[group["eps"].apply(_finite_positive)].copy()
-        positive = positive[np.isfinite(positive["asrcc"].astype(float))]
+        positive = positive[np.isfinite(positive["excess_asrcc"].astype(float))]
         if positive.empty:
             rows.append(
                 {
@@ -915,6 +1597,8 @@ def compute_epsilon50(per_condition: pd.DataFrame) -> pd.DataFrame:
                     "epsilon50_status": "insufficient_points",
                     "max_eps": float("nan"),
                     "max_asrcc": float("nan"),
+                    "max_excess_asrcc": float("nan"),
+                    "epsilon50_metric": "excess_asrcc",
                     "clean_accuracy": clean_accuracy,
                     "clean_correct_n": clean_correct_n,
                 }
@@ -923,15 +1607,18 @@ def compute_epsilon50(per_condition: pd.DataFrame) -> pd.DataFrame:
 
         positive = positive.sort_values("eps", kind="mergesort")
         eps_values = positive["eps"].astype(float).to_numpy()
-        y_values = positive["asrcc"].astype(float).to_numpy()
+        y_values = positive["excess_asrcc"].astype(float).to_numpy()
         y_monotone = np.maximum.accumulate(y_values)
         max_eps = float(eps_values[-1])
-        max_asrcc = float(y_monotone[-1])
+        raw_asr_values = positive["asrcc"].astype(float).to_numpy()
+        finite_raw_asr = raw_asr_values[np.isfinite(raw_asr_values)]
+        max_asrcc = float(np.max(finite_raw_asr)) if len(finite_raw_asr) else float("nan")
+        max_excess_asrcc = float(y_monotone[-1])
 
         if y_monotone[0] >= 0.5:
             epsilon50 = float(eps_values[0])
             status = "below_min_positive_eps"
-        elif max_asrcc < 0.5:
+        elif max_excess_asrcc < 0.5:
             epsilon50 = float("nan")
             status = "not_reached"
         else:
@@ -953,6 +1640,8 @@ def compute_epsilon50(per_condition: pd.DataFrame) -> pd.DataFrame:
                 "epsilon50_status": status,
                 "max_eps": max_eps,
                 "max_asrcc": max_asrcc,
+                "max_excess_asrcc": max_excess_asrcc,
+                "epsilon50_metric": "excess_asrcc",
                 "clean_accuracy": clean_accuracy,
                 "clean_correct_n": clean_correct_n,
             }
@@ -1003,6 +1692,10 @@ def _plot_heatmap(
     out_dir: Path,
     filename_middle: str,
     colorbar_label: str,
+    *,
+    vmin: float = 0.0,
+    vmax: float = 1.0,
+    cmap: str = "viridis",
 ) -> None:
     for site in sorted(per_condition["site"].dropna().unique()):
         site_df = per_condition[per_condition["site"] == site].copy()
@@ -1027,9 +1720,9 @@ def _plot_heatmap(
             aspect="auto",
             origin="lower",
             interpolation="nearest",
-            cmap="viridis",
-            vmin=0.0,
-            vmax=1.0,
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
         )
         ax.set_title(f"{dataset} {colorbar_label} ({site})")
         ax.set_xlabel("R")
@@ -1134,15 +1827,31 @@ def make_plots(
         return
     if not _load_pyplot(warnings):
         return
-    _plot_heatmap(per_condition, "asrcc", dataset, out_dir, "asrcc_heatmap", "ASRcc")
+    _plot_heatmap(
+        per_condition,
+        "excess_asrcc",
+        dataset,
+        out_dir,
+        "excess_asrcc_heatmap",
+        "excess ASRcc",
+        vmin=-1.0,
+        vmax=1.0,
+        cmap="coolwarm",
+    )
+    _plot_heatmap(per_condition, "asrcc", dataset, out_dir, "asrcc_heatmap", "raw ASRcc")
     _plot_heatmap(per_condition, "invalid_rate", dataset, out_dir, "invalid_rate_heatmap", "invalid_rate")
     _plot_epsilon50_vs_r(epsilon50, dataset, out_dir)
     _plot_clean_accuracy_vs_r(per_condition, dataset, out_dir)
 
 
-def find_jsonl_files(root: Path, dataset: str, subdir: str) -> List[Path]:
+def find_jsonl_files(
+    root: Path,
+    dataset: str,
+    subdir: str,
+    allow_root_fallback: bool = False,
+) -> List[Path]:
     preferred = root / dataset / subdir
-    search_root = preferred if preferred.exists() else root
+    search_root = preferred if preferred.exists() else (root if allow_root_fallback else preferred)
     if not search_root.exists():
         return []
     return sorted(path for path in search_root.rglob("*.jsonl") if path.is_file())
@@ -1165,8 +1874,44 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Label used in output filenames. Defaults to the final path component of --root.",
     )
+    parser.add_argument(
+        "--clean_reference_root",
+        "--clean-reference-root",
+        default="",
+        help=(
+            "File or directory containing complete canonical clean-reference JSONLs. "
+            "When supplied, in-grid eps=0 runs are never used as baselines."
+        ),
+    )
+    parser.add_argument(
+        "--clean_control_root",
+        "--clean-control-root",
+        default="",
+        help=(
+            "Optional file or directory containing a fixed clean-control replicate. "
+            "With an explicitly supplied reference root, omitting this option uses "
+            "the reference as its own control (clean ASR zero). Under automatic "
+            "canonical discovery, a missing control leaves clean/excess ASR as NaN."
+        ),
+    )
     parser.add_argument("--exclude_s2p_r1", nargs="?", const=True, default=True, type=parse_bool)
     parser.add_argument("--make_plots", nargs="?", const=True, default=True, type=parse_bool)
+    parser.add_argument(
+        "--allow_root_fallback",
+        nargs="?",
+        const=True,
+        default=False,
+        type=parse_bool,
+        help="Explicitly scan all of --root when <root>/<dataset>/<subdir> is absent.",
+    )
+    parser.add_argument(
+        "--legacy_baselines",
+        nargs="?",
+        const=True,
+        default=False,
+        type=parse_bool,
+        help="Disable automatic <root>/clean/{reference,control} discovery.",
+    )
     return parser.parse_args()
 
 
@@ -1179,11 +1924,55 @@ def main() -> None:
     output_label = args.label or root.name or "latent_contagion"
 
     warnings: List[str] = []
-    jsonl_files = find_jsonl_files(root, args.dataset, args.subdir)
+    if args.legacy_baselines and (args.clean_reference_root or args.clean_control_root):
+        raise SystemExit("--legacy_baselines cannot be combined with canonical clean roots")
+
+    if not args.legacy_baselines and not str(args.clean_reference_root).strip():
+        conventional_reference_root = root / "clean" / "reference"
+        conventional_control_root = root / "clean" / "control"
+        args.clean_reference_root = str(conventional_reference_root)
+        if not str(args.clean_control_root).strip():
+            args.clean_control_root = str(conventional_control_root)
+        warnings.append(
+            "using canonical clean roots under "
+            f"{root / 'clean'}; missing roles remain NaN until their fixed jobs finish. "
+            "Use --legacy_baselines true only for deliberate legacy analysis"
+        )
+
+    canonical_mode = bool(str(args.clean_reference_root).strip())
+    if args.clean_control_root and not canonical_mode:
+        raise SystemExit("--clean_control_root requires --clean_reference_root")
+
+    reference_files: List[Path] = []
+    control_files: List[Path] = []
+    if canonical_mode:
+        reference_root = Path(args.clean_reference_root)
+        reference_files = find_canonical_jsonl_files(reference_root)
+        if not reference_files:
+            warnings.append(f"no canonical clean reference JSONL files found under {reference_root}")
+        if args.clean_control_root:
+            control_root = Path(args.clean_control_root)
+            control_files = find_canonical_jsonl_files(control_root)
+            if not control_files:
+                warnings.append(f"no fixed clean control JSONL files found under {control_root}")
+
+    jsonl_files = find_jsonl_files(
+        root,
+        args.dataset,
+        args.subdir,
+        allow_root_fallback=bool(args.allow_root_fallback),
+    )
+    if canonical_mode:
+        canonical_paths = {
+            path.resolve(strict=False) for path in reference_files + control_files
+        }
+        jsonl_files = [
+            path for path in jsonl_files if path.resolve(strict=False) not in canonical_paths
+        ]
     if not jsonl_files:
         warnings.append(
-            f"no JSONL files found under {root / args.dataset / args.subdir} "
-            f"or fallback root {root}"
+            f"no JSONL files found under {root / args.dataset / args.subdir}"
+            + (f" or explicit fallback root {root}" if args.allow_root_fallback else "")
         )
 
     sample_df = build_condition_dataframe(jsonl_files, args.dataset, warnings)
@@ -1191,12 +1980,59 @@ def main() -> None:
 
     if args.exclude_s2p_r1 and not sample_df.empty:
         sample_df = sample_df[~((sample_df["site"] == "s2p") & (sample_df["R"] == 1))].reset_index(drop=True)
+    if canonical_mode:
+        sample_df = filter_canonical_attack_dataframe(sample_df, args.dataset, warnings)
 
-    per_condition = compute_per_condition_metrics(sample_df, warnings)
-    clean_flip_floor, clean_flip_floor_pooled = compute_clean_flip_floor(sample_df, warnings)
-    per_condition = add_clean_floor_excess_columns(per_condition, clean_flip_floor_pooled)
+    canonical_clean_metrics = pd.DataFrame(columns=CANONICAL_CLEAN_METRIC_COLUMNS)
+    if canonical_mode:
+        reference_by_core = build_canonical_clean_index(
+            reference_files,
+            args.dataset,
+            "reference",
+            warnings,
+        )
+        control_by_core = build_canonical_clean_index(
+            control_files,
+            args.dataset,
+            "control",
+            warnings,
+        ) if args.clean_control_root else {}
+        canonical_clean_metrics, clean_metrics_by_core = compute_fixed_canonical_clean_metrics(
+            reference_by_core,
+            control_by_core,
+            control_supplied=bool(args.clean_control_root),
+            warnings=warnings,
+        )
+        per_condition = compute_per_condition_metrics_canonical(
+            sample_df,
+            reference_by_core,
+            clean_metrics_by_core,
+            warnings,
+        )
+        clean_flip_floor = pd.DataFrame(columns=CLEAN_FLIP_FLOOR_COLUMNS)
+        clean_flip_floor_pooled = pd.DataFrame(columns=CLEAN_FLIP_FLOOR_POOLED_COLUMNS)
+        disagreements = pd.DataFrame(columns=DISAGREEMENT_COLUMNS)
+    else:
+        legacy_sample_df = sample_df
+        if "condition_ambiguous" in sample_df.columns and not sample_df.empty:
+            ambiguous_mask = sample_df["condition_ambiguous"].fillna(False).astype(bool)
+            if ambiguous_mask.any():
+                ambiguous_conditions = int(
+                    sample_df.loc[ambiguous_mask, CONDITION_COLUMNS].drop_duplicates().shape[0]
+                )
+                warnings.append(
+                    f"legacy mode excluded {ambiguous_conditions} duplicate/stale conditions "
+                    "instead of selecting a result by file-path order"
+                )
+                legacy_sample_df = sample_df.loc[~ambiguous_mask].reset_index(drop=True)
+        per_condition = compute_per_condition_metrics(legacy_sample_df, warnings)
+        clean_flip_floor, clean_flip_floor_pooled = compute_clean_flip_floor(
+            legacy_sample_df, warnings
+        )
+        per_condition = add_clean_floor_excess_columns(per_condition, clean_flip_floor_pooled)
+        disagreements = compute_clean_disagreements(legacy_sample_df, warnings)
+
     epsilon50 = compute_epsilon50(per_condition)
-    disagreements = compute_clean_disagreements(sample_df, warnings)
 
     per_condition_path = out_dir / f"{args.dataset}_{output_label}_per_condition.csv"
     epsilon50_path = out_dir / f"{args.dataset}_{output_label}_epsilon50.csv"
@@ -1205,6 +2041,9 @@ def main() -> None:
     clean_flip_floor_pooled_path = (
         out_dir / f"{args.dataset}_{output_label}_clean_flip_floor_pooled.csv"
     )
+    canonical_clean_metrics_path = (
+        out_dir / f"{args.dataset}_{output_label}_canonical_clean_metrics.csv"
+    )
     warnings_path = out_dir / f"{args.dataset}_{output_label}_warnings.txt"
 
     per_condition.to_csv(per_condition_path, index=False)
@@ -1212,6 +2051,7 @@ def main() -> None:
     disagreements.to_csv(disagreements_path, index=False)
     clean_flip_floor.to_csv(clean_flip_floor_path, index=False)
     clean_flip_floor_pooled.to_csv(clean_flip_floor_pooled_path, index=False)
+    canonical_clean_metrics.to_csv(canonical_clean_metrics_path, index=False)
     if args.make_plots:
         make_plots(per_condition, epsilon50, args.dataset, out_dir, warnings)
 
@@ -1223,6 +2063,11 @@ def main() -> None:
     print(f"epsilon50 rows: {len(epsilon50)}")
     print(f"clean flip floor pairwise CSV: {clean_flip_floor_path}")
     print(f"clean flip floor pooled CSV: {clean_flip_floor_pooled_path}")
+    print(f"canonical clean mode: {canonical_mode}")
+    if canonical_mode:
+        print(f"canonical reference files: {len(reference_files)}")
+        print(f"canonical control files: {len(control_files)}")
+        print(f"canonical clean metrics CSV: {canonical_clean_metrics_path}")
     print(f"warnings count: {len(warnings)}")
     print(f"out_dir: {out_dir}")
 

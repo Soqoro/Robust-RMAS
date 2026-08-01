@@ -16,7 +16,10 @@ PARENT_DIR = THIS_DIR.parent
 if str(PARENT_DIR) not in sys.path:
     sys.path.insert(0, str(PARENT_DIR))
 
-os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+# cuBLAS reads this when its CUDA workspace is initialized.  Set it
+# unconditionally before importing inference modules (which import torch), so a
+# stale inherited value cannot silently weaken --deterministic 1.
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 from hf_resolver import (
     resolve_inner_adapter,
@@ -160,7 +163,7 @@ def _has_cli_flag(flag: str) -> bool:
 
 def configure_reproducibility(seed: int, deterministic: bool) -> None:
     if deterministic:
-        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
     random.seed(int(seed))
     try:
@@ -170,27 +173,22 @@ def configure_reproducibility(seed: int, deterministic: bool) -> None:
     except Exception:
         pass
 
-    try:
-        import torch
+    import torch
 
-        torch.manual_seed(int(seed))
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(int(seed))
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
 
-        if deterministic:
-            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-            torch.backends.cudnn.benchmark = False
-            torch.backends.cudnn.deterministic = True
-            if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
-                torch.backends.cuda.matmul.allow_tf32 = False
-            if hasattr(torch.backends, "cudnn") and hasattr(torch.backends.cudnn, "allow_tf32"):
-                torch.backends.cudnn.allow_tf32 = False
-            try:
-                torch.use_deterministic_algorithms(True, warn_only=True)
-            except TypeError:
-                torch.use_deterministic_algorithms(True)
-    except Exception as exc:
-        print(f"[warn] failed to configure reproducibility: {exc}")
+    if deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+            torch.backends.cuda.matmul.allow_tf32 = False
+        if hasattr(torch.backends, "cudnn") and hasattr(torch.backends.cudnn, "allow_tf32"):
+            torch.backends.cudnn.allow_tf32 = False
+        # Strict mode is intentional: a nondeterministic operation should fail
+        # the job rather than produce a different clean baseline with a warning.
+        torch.use_deterministic_algorithms(True)
 
 
 def apply_recommended_settings(args: argparse.Namespace) -> None:
@@ -408,6 +406,7 @@ def build_cli_for_style(
             "--method", str(args.method),
             "--style", str(args.style),
             "--mas_shape", "chain",
+            "--dataset_label", str(args.dataset),
             "--agent1_model_name_or_path", str(paths["planner"]),
             "--agent2_model_name_or_path", str(paths["critic"]),
             "--agent3_model_name_or_path", str(paths["solver"]),
@@ -417,6 +416,7 @@ def build_cli_for_style(
             "--outer_12_path", str(paths["outer_12"]),
             "--outer_23_path", str(paths["outer_23"]),
             "--outer_31_path", str(paths["outer_31"]),
+            "--deterministic", str(args.deterministic),
             "--choice_old_prompt", str(choice_old_prompt),
             "--solver_pre_question", "0",
             "--inner_adapter_type_fallback", "ln_res_adapter",

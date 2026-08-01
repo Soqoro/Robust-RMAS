@@ -5,9 +5,14 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+import errno
+import hashlib
 import json
+import os
 from pathlib import Path
+import stat
 import sys
+import tempfile
 from typing import Any, Dict, Iterable, List, Mapping, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -18,6 +23,57 @@ from RecursiveMAS.inference_utils.answer_utils import (  # noqa: E402
     MATH500_CHECKER_VERSION,
     compare_answers_detailed,
 )
+
+
+EVALUATION_PROTOCOL = "math500_strict_rejudge"
+ANSWER_UTILS_PATH = REPO_ROOT / "RecursiveMAS" / "inference_utils" / "answer_utils.py"
+
+
+def normalize_math500_dataset(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"math500", "math-500", "huggingfaceh4/math-500"}:
+        return "math500"
+    raise ValueError(
+        "rejudge_math500_jsonl.py only supports Math500 "
+        f"(math500, math-500, or HuggingFaceH4/MATH-500); got {value!r}"
+    )
+
+
+def validate_record_dataset(record: Mapping[str, Any], source: Path, row_number: int) -> None:
+    """Reject labelled non-Math500 rows before applying the Math500 checker.
+
+    Older result files may omit these fields, so missing/blank labels remain
+    supported.  When labels are present, both must identify Math500.
+    """
+    for field in ("dataset", "dataset_name"):
+        value = record.get(field)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        try:
+            normalize_math500_dataset(str(value))
+        except ValueError as exc:
+            raise ValueError(
+                f"{source}: record {row_number} has non-Math500 {field}={value!r}; "
+                "refusing to apply the Math500 checker"
+            ) from exc
+
+
+def build_evaluation_provenance(dataset: str) -> Tuple[Dict[str, Any], str]:
+    normalized_dataset = normalize_math500_dataset(dataset)
+    config = {
+        "protocol": EVALUATION_PROTOCOL,
+        "dataset": normalized_dataset,
+        "checker_version": MATH500_CHECKER_VERSION,
+        "answer_utils_sha256": hashlib.sha256(ANSWER_UTILS_PATH.read_bytes()).hexdigest(),
+        "rejudge_script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+    }
+    payload = json.dumps(
+        config,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return config, hashlib.sha256(payload).hexdigest()
 
 
 def parse_bool(value: Any) -> bool:
@@ -83,7 +139,12 @@ def read_jsonl(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
-def build_summary(original: Mapping[str, Any], samples: List[Mapping[str, Any]]) -> Dict[str, Any]:
+def build_summary(
+    original: Mapping[str, Any],
+    samples: List[Mapping[str, Any]],
+    evaluation_config: Mapping[str, Any],
+    evaluation_config_sha256: str,
+) -> Dict[str, Any]:
     strict_correct = [parse_bool(row.get("is_correct_strict", row.get("correct_strict"))) for row in samples]
     num_correct = sum(1 for value in strict_correct if value)
     num_total = len(strict_correct)
@@ -93,6 +154,9 @@ def build_summary(original: Mapping[str, Any], samples: List[Mapping[str, Any]])
             out[f"original_{key}"] = original.get(key)
     out["type"] = "summary"
     out["checker_version"] = MATH500_CHECKER_VERSION
+    out["evaluation_protocol"] = EVALUATION_PROTOCOL
+    out["evaluation_config_sha256"] = evaluation_config_sha256
+    out["evaluation_config"] = dict(evaluation_config)
     out["num_samples"] = num_total
     out["num_correct"] = num_correct
     out["num_wrong"] = num_total - num_correct
@@ -104,6 +168,7 @@ def rejudge_record(
     record: Mapping[str, Any],
     dataset: str,
     preserve_original_canonical: bool,
+    evaluation_config_sha256: str,
 ) -> Tuple[Dict[str, Any], bool, bool, bool]:
     out = dict(record)
     original_correct_value = first_nonempty(record.get("is_correct"), record.get("correct"))
@@ -126,6 +191,8 @@ def rejudge_record(
     out["answer_invalid_strict"] = bool(detail.get("answer_invalid", False))
     out["invalid_reason_strict"] = detail.get("invalid_reason", "")
     out["checker_version"] = detail.get("checker_version", MATH500_CHECKER_VERSION)
+    out["evaluation_protocol"] = EVALUATION_PROTOCOL
+    out["evaluation_config_sha256"] = evaluation_config_sha256
     out["gold_answer_parsed_strict"] = detail.get("gold_answer_parsed")
     out["pred_answer_parsed_strict"] = detail.get("pred_answer_parsed")
 
@@ -148,9 +215,45 @@ def rejudge_record(
 
 def write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    fd, temporary_path = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    try:
+        try:
+            target_mode = stat.S_IMODE(path.stat().st_mode)
+        except FileNotFoundError:
+            target_mode = None
+        if target_mode is not None:
+            os.fchmod(fd, target_mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            for row in rows:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        try:
+            directory_fd = os.open(
+                str(path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError as exc:
+            unsupported = {errno.EACCES, errno.EINVAL, errno.EROFS}
+            if hasattr(errno, "ENOTSUP"):
+                unsupported.add(errno.ENOTSUP)
+            if exc.errno not in unsupported:
+                raise
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def rejudge_file(
@@ -162,6 +265,8 @@ def rejudge_file(
         raise FileExistsError(f"output exists; pass --overwrite true to replace: {dst}")
 
     rows = read_jsonl(src)
+    evaluation_config, evaluation_config_sha256 = build_evaluation_provenance(args.dataset)
+    normalized_dataset = str(evaluation_config["dataset"])
     sample_rows: List[Dict[str, Any]] = []
     output_rows: List[Dict[str, Any]] = []
     summaries: List[Dict[str, Any]] = []
@@ -173,14 +278,16 @@ def rejudge_file(
     original_correct: List[bool] = []
     strict_correct: List[bool] = []
 
-    for row in rows:
+    for row_number, row in enumerate(rows, start=1):
+        validate_record_dataset(row, src, row_number)
         if is_summary(row):
             summaries.append(row)
             continue
         rejudged, false_positive, false_negative, invalid = rejudge_record(
             row,
-            dataset=args.dataset,
+            dataset=normalized_dataset,
             preserve_original_canonical=args.preserve_original_canonical,
+            evaluation_config_sha256=evaluation_config_sha256,
         )
         sample_rows.append(rejudged)
         output_rows.append(rejudged)
@@ -194,9 +301,24 @@ def rejudge_file(
 
     if args.summary:
         if summaries:
-            output_rows.extend(build_summary(summary, sample_rows) for summary in summaries)
+            output_rows.extend(
+                build_summary(
+                    summary,
+                    sample_rows,
+                    evaluation_config,
+                    evaluation_config_sha256,
+                )
+                for summary in summaries
+            )
         else:
-            output_rows.append(build_summary({"type": "summary", "dataset": args.dataset}, sample_rows))
+            output_rows.append(
+                build_summary(
+                    {"type": "summary", "dataset": normalized_dataset},
+                    sample_rows,
+                    evaluation_config,
+                    evaluation_config_sha256,
+                )
+            )
 
     write_jsonl(dst, output_rows)
 

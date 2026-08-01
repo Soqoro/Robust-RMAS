@@ -2,13 +2,18 @@
 
 import argparse
 from collections.abc import Mapping
+import errno
 import gc
 import json
 import hashlib
+from importlib import metadata as importlib_metadata
 import importlib.util
 import os
+import platform
 import random
 import re
+import stat
+import tempfile
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -25,7 +30,10 @@ def _patched_find_spec(name: str, *args, **kwargs):
 if os.environ.get("MAS_FORCE_DISABLE_TORCHVISION", "1") == "1":
     importlib.util.find_spec = _patched_find_spec
 
-os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+# This module is normally imported by RecursiveMAS/run.py, but establish the
+# deterministic cuBLAS workspace here as well for direct module entry points.
+# It must be set before torch is imported.
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 import torch
 from datasets import load_dataset
@@ -176,6 +184,314 @@ def build_sample_id(
             if value not in (None, ""):
                 return f"{dataset_name}:{dataset_split}:{value}"
     return f"{dataset_name}:{dataset_split}:{sample_idx}"
+
+
+PROVENANCE_SCHEMA_VERSION = 2
+
+
+def stable_json_sha256(value: Any) -> str:
+    """Hash a JSON-compatible value with a stable, compact serialization."""
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def source_tree_sha256() -> str:
+    """Fingerprint the local inference implementation used by this run."""
+    source_root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+    digest = hashlib.sha256()
+    for directory, directory_names, filenames in os.walk(source_root):
+        directory_names[:] = sorted(
+            name for name in directory_names if name not in {"__pycache__", ".git"}
+        )
+        for filename in sorted(name for name in filenames if name.endswith(".py")):
+            path = os.path.join(directory, filename)
+            relative_path = os.path.relpath(path, source_root).replace(os.sep, "/")
+            digest.update(relative_path.encode("utf-8"))
+            digest.update(b"\0")
+            with open(path, "rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(block)
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def artifact_identity(value: Any) -> Optional[Dict[str, Any]]:
+    """Return a stable-enough identity for a resolved model/adapter artifact.
+
+    Hugging Face snapshots resolve to revision-bearing paths.  For mutable local
+    artifacts, size/mtime metadata and hashes of small configuration files make
+    accidental clean/attack mixing fail closed without re-hashing multi-GB
+    checkpoints for every array task.
+    """
+    if value is None or str(value).strip() == "":
+        return None
+    requested = str(value)
+    expanded = os.path.expanduser(requested)
+    requested_absolute = os.path.abspath(expanded)
+    requested_portable = requested_absolute.replace(os.sep, "/")
+    resolved = os.path.realpath(expanded)
+    snapshot_match = re.search(
+        r"(?:^|/)(?P<repo>models--[^/]+)/snapshots/"
+        r"(?P<revision>[^/]+)(?:/(?P<relative>.*))?$",
+        requested_portable,
+    )
+    blob_match = re.search(
+        r"(?:^|/)(?P<repo>models--[^/]+)/blobs/(?P<blob>[^/]+)$",
+        requested_portable,
+    )
+    if snapshot_match:
+        repo_cache_name = snapshot_match.group("repo").removeprefix("models--")
+        identity: Dict[str, Any] = {
+            "kind": "hf_snapshot",
+            "repo_id": repo_cache_name.replace("--", "/"),
+            "snapshot_revision": snapshot_match.group("revision"),
+            "snapshot_relative_path": snapshot_match.group("relative") or ".",
+            "exists": os.path.exists(resolved),
+        }
+    elif blob_match:
+        repo_cache_name = blob_match.group("repo").removeprefix("models--")
+        identity = {
+            "kind": "hf_blob",
+            "repo_id": repo_cache_name.replace("--", "/"),
+            "blob_id": blob_match.group("blob"),
+            "exists": os.path.exists(resolved),
+        }
+    else:
+        identity = {
+            "kind": "local",
+            "requested": requested,
+            "resolved": resolved,
+            "exists": os.path.exists(resolved),
+        }
+    if not identity["exists"]:
+        return identity
+
+    artifact_stat = os.stat(resolved)
+    identity["artifact_type"] = (
+        "directory" if stat.S_ISDIR(artifact_stat.st_mode) else "file"
+    )
+    if (snapshot_match is None and blob_match is None) or stat.S_ISREG(artifact_stat.st_mode):
+        identity["size"] = int(artifact_stat.st_size)
+    if snapshot_match is None and blob_match is None:
+        identity["mtime_ns"] = int(artifact_stat.st_mtime_ns)
+    if stat.S_ISREG(artifact_stat.st_mode):
+        # Configuration-sized artifacts are cheap to hash byte-for-byte.  Large
+        # checkpoint files retain resolved path + size + nanosecond mtime.
+        if artifact_stat.st_size <= 16 * 1024 * 1024:
+            identity["sha256"] = file_sha256(resolved)
+        return identity
+
+    marker_hashes: Dict[str, str] = {}
+    marker_names = {
+        "adapter_config.json",
+        "config.json",
+        "generation_config.json",
+        "tokenizer_config.json",
+    }
+    manifest: List[Tuple[str, int, Optional[int]]] = []
+    for directory, directory_names, filenames in os.walk(resolved):
+        directory_names[:] = sorted(name for name in directory_names if name != "__pycache__")
+        for filename in sorted(filenames):
+            path = os.path.join(directory, filename)
+            try:
+                item_stat = os.stat(path)
+            except OSError:
+                continue
+            relative_path = os.path.relpath(path, resolved).replace(os.sep, "/")
+            manifest.append(
+                (
+                    relative_path,
+                    int(item_stat.st_size),
+                    int(item_stat.st_mtime_ns)
+                    if snapshot_match is None and blob_match is None
+                    else None,
+                )
+            )
+            if filename in marker_names and item_stat.st_size <= 16 * 1024 * 1024:
+                marker_hashes[relative_path] = file_sha256(path)
+    identity["manifest_sha256"] = stable_json_sha256(manifest)
+    identity["marker_sha256"] = marker_hashes
+    return identity
+
+
+def resolve_model_artifact(value: Optional[str]) -> Optional[str]:
+    """Resolve an HF repo identifier to a revision-pinned local snapshot."""
+    if value is None or not str(value).strip():
+        return value
+    requested = str(value)
+    expanded = os.path.expanduser(requested)
+    if os.path.exists(expanded):
+        return os.path.realpath(expanded)
+    try:
+        from huggingface_hub import snapshot_download
+
+        return os.path.realpath(snapshot_download(repo_id=requested, repo_type="model"))
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not resolve model to a revision-pinned snapshot for provenance: "
+            f"{requested!r}"
+        ) from exc
+
+
+def optional_file_content_sha256(path: str) -> str:
+    if not str(path or "").strip():
+        return stable_json_sha256("")
+    return file_sha256(os.path.realpath(os.path.expanduser(path)))
+
+
+def configure_runtime_reproducibility(seed: int, deterministic: bool) -> None:
+    """Apply the same reproducibility contract for direct and release entry points."""
+    random.seed(int(seed))
+    try:
+        import numpy as numpy_module
+
+        numpy_module.random.seed(int(seed) % (2**32 - 1))
+    except Exception:
+        pass
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+    torch.use_deterministic_algorithms(bool(deterministic))
+    if deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+            torch.backends.cuda.matmul.allow_tf32 = False
+        if hasattr(torch.backends, "cudnn") and hasattr(torch.backends.cudnn, "allow_tf32"):
+            torch.backends.cudnn.allow_tf32 = False
+
+
+def runtime_environment_identity(device: torch.device) -> Dict[str, Any]:
+    package_versions: Dict[str, Optional[str]] = {}
+    for package in (
+        "datasets",
+        "evalplus",
+        "huggingface-hub",
+        "numpy",
+        "sympy",
+        "torch",
+        "transformers",
+    ):
+        try:
+            package_versions[package] = importlib_metadata.version(package)
+        except importlib_metadata.PackageNotFoundError:
+            package_versions[package] = None
+
+    cuda_identity: Dict[str, Any] = {
+        "torch_cuda_version": torch.version.cuda,
+        "cudnn_version": torch.backends.cudnn.version(),
+    }
+    if device.type == "cuda" and torch.cuda.is_available():
+        device_index = device.index if device.index is not None else torch.cuda.current_device()
+        cuda_identity.update(
+            {
+                # Deliberately omit index/UUID: fixed controls may be scheduled
+                # on different, but equivalent, GPUs in the same array.
+                "device_name": torch.cuda.get_device_name(device_index),
+                "compute_capability": list(torch.cuda.get_device_capability(device_index)),
+            }
+        )
+    return {
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "packages": package_versions,
+        "cuda": cuda_identity,
+    }
+
+
+def build_sample_cohort_provenance(
+    sample_ids: Sequence[str],
+    questions: Sequence[Any],
+    gold_answers: Sequence[Any],
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Return ordered-cohort hashes and an input hash for every sample."""
+    if not (len(sample_ids) == len(questions) == len(gold_answers)):
+        raise ValueError(
+            "Cannot build sample cohort provenance from sequences with different lengths: "
+            f"sample_ids={len(sample_ids)}, questions={len(questions)}, "
+            f"gold_answers={len(gold_answers)}"
+        )
+
+    normalized_ids = [str(value) for value in sample_ids]
+    normalized_questions = [str(value) for value in questions]
+    normalized_golds = [str(value) for value in gold_answers]
+    ordered_samples = [
+        {
+            "sample_id": normalized_ids[idx],
+            "question": normalized_questions[idx],
+            "ground_truth": normalized_golds[idx],
+        }
+        for idx in range(len(normalized_ids))
+    ]
+    sample_input_hashes = [stable_json_sha256(sample) for sample in ordered_samples]
+    provenance = {
+        "provenance_schema_version": PROVENANCE_SCHEMA_VERSION,
+        "sample_cohort_sha256": stable_json_sha256(ordered_samples),
+        "sample_ids_sha256": stable_json_sha256(normalized_ids),
+        "questions_sha256": stable_json_sha256(normalized_questions),
+        "ground_truths_sha256": stable_json_sha256(normalized_golds),
+    }
+    return provenance, sample_input_hashes
+
+
+def write_jsonl_atomic(path: str, records: Iterable[Mapping[str, Any]]) -> None:
+    """Publish a complete JSONL file with a same-directory atomic replace."""
+    output_path = os.path.abspath(path)
+    output_dir = os.path.dirname(output_path)
+    os.makedirs(output_dir, exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(output_path)}.",
+        suffix=".tmp",
+        dir=output_dir,
+    )
+    try:
+        try:
+            target_mode = stat.S_IMODE(os.stat(output_path).st_mode)
+        except FileNotFoundError:
+            target_mode = None
+        if target_mode is not None:
+            os.fchmod(fd, target_mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, output_path)
+        try:
+            directory_fd = os.open(output_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError as exc:
+            unsupported = {errno.EACCES, errno.EINVAL, errno.EROFS}
+            if hasattr(errno, "ENOTSUP"):
+                unsupported.add(errno.ENOTSUP)
+            if exc.errno not in unsupported:
+                raise
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def latent_tensor_stats(latent: Optional[torch.Tensor]) -> Optional[Dict[str, Any]]:
@@ -2106,6 +2422,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--system_name", type=str, default="")
     parser.add_argument("--mas_shape", type=str, default="chain", choices=["chain"])
     parser.add_argument("--dataset", type=str, default="openai/gsm8k")
+    parser.add_argument(
+        "--dataset_label",
+        type=str,
+        default="",
+        help="Stable logical dataset name for logs when --dataset is a resolved local path.",
+    )
     parser.add_argument("--dataset_split", type=str, default="test")
     parser.add_argument("--question_suffix_path", type=str, default="")
     parser.add_argument("--prompt_footer_path", type=str, default="")
@@ -2325,6 +2647,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--trust_remote_code", type=int, default=1, choices=[0, 1])
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--deterministic", type=int, default=1, choices=[0, 1])
     parser.add_argument(
         "--enable_thinking",
         type=int,
@@ -2347,8 +2670,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    dataset_label = args.dataset_label.strip() or args.dataset
     run_wall_start = time.time()
     global _GEN_TOP_K, _GEN_MIN_P, _GEN_REPETITION_PENALTY
+
+    configure_runtime_reproducibility(args.seed, bool(args.deterministic))
 
     if args.mas_shape != "chain":
         raise ValueError(f"Unsupported --mas_shape: {args.mas_shape}")
@@ -2380,9 +2706,9 @@ def main() -> None:
         f"custom_path={args.role_response_regime_path or '<empty>'}"
     )
 
-    planner_model = args.agent1_model_name_or_path
-    refiner_model = args.agent2_model_name_or_path
-    solver_model = args.agent3_model_name_or_path
+    planner_model = resolve_model_artifact(args.agent1_model_name_or_path)
+    refiner_model = resolve_model_artifact(args.agent2_model_name_or_path)
+    solver_model = resolve_model_artifact(args.agent3_model_name_or_path)
     if args.method == "single":
         if not solver_model:
             raise ValueError("Please provide --agent3_model_name_or_path for --method single.")
@@ -2547,7 +2873,21 @@ def main() -> None:
         mbppplus_num_prompt_tests=int(args.mbppplus_num_prompt_tests),
     )
 
+    # Canonical pairing is based on the untouched evaluation cohort.  Direct
+    # prompt attacks intentionally mutate questions/prompts below and therefore
+    # receive separate attack/effective-input hashes.
+    run_sample_ids = [
+        build_sample_id(dataset_name, args.dataset_split, sample_idx, sample_metadata)
+        for sample_idx in range(len(questions))
+    ]
+    cohort_provenance, sample_input_sha256 = build_sample_cohort_provenance(
+        run_sample_ids,
+        questions,
+        gold_answers,
+    )
+
     question_suffix_path = args.question_suffix_path.strip()
+    question_suffix = ""
     if question_suffix_path:
         with open(question_suffix_path, "r", encoding="utf-8") as f:
             question_suffix = f.read().rstrip()
@@ -2561,9 +2901,16 @@ def main() -> None:
             prompt_footer = f.read().rstrip()
         print(f"[direct-attack] appended prompt footer from {prompt_footer_path}")
 
-    run_sample_ids = [
-        build_sample_id(dataset_name, args.dataset_split, sample_idx, sample_metadata)
-        for sample_idx in range(len(questions))
+    effective_sample_input_sha256 = [
+        stable_json_sha256(
+            {
+                "sample_id": run_sample_ids[idx],
+                "question": str(questions[idx]),
+                "ground_truth": str(gold_answers[idx]),
+                "prompt_footer_sha256": stable_json_sha256(prompt_footer),
+            }
+        )
+        for idx in range(len(run_sample_ids))
     ]
     trace_recorder: Optional[LatentTraceRecorder] = None
     if args.lc_trace_path:
@@ -2573,7 +2920,7 @@ def main() -> None:
         trace_recorder = LatentTraceRecorder(
             path=args.lc_trace_path,
             metadata={
-                "dataset": args.dataset,
+                "dataset": dataset_label,
                 "style": args.style,
                 "method": args.method,
                 "mas_shape": args.mas_shape,
@@ -2608,7 +2955,7 @@ def main() -> None:
             "schema_version": 1,
             "style": args.style,
             "method": args.method,
-            "dataset": args.dataset,
+            "dataset": dataset_label,
             "dataset_name": dataset_name,
             "dataset_split": args.dataset_split,
             "R": recursion_rounds_for_log(args.method, args.num_recursive_rounds),
@@ -2675,6 +3022,133 @@ def main() -> None:
             print("[warn] --num_rollouts > 1 but --do_sample is disabled; outputs may be identical.")
 
     base_sample_seed = args.sample_seed if args.sample_seed >= 0 else args.seed
+    inference_source_sha256 = source_tree_sha256()
+    evaluation_protocol = "native"
+    evaluation_config_provenance = {
+        "protocol": evaluation_protocol,
+        "dataset": str(dataset_label),
+        "dataset_source": str(args.dataset),
+        "dataset_name": str(dataset_name),
+        "dataset_split": str(args.dataset_split),
+        "lcb_use_private_tests": bool(args.lcb_use_private_tests),
+        "lcb_timeout_s": int(args.lcb_timeout_s),
+        "mbppplus_timeout_s": int(args.mbppplus_timeout_s),
+        "mbppplus_subset": str(args.mbppplus_subset),
+        "mbppplus_num_prompt_tests": int(args.mbppplus_num_prompt_tests),
+        "source_tree_sha256": inference_source_sha256,
+    }
+    evaluation_config_sha256 = stable_json_sha256(evaluation_config_provenance)
+    effective_role_response_path = (
+        str(args.role_response_regime_path)
+        if str(args.role_response_regime).strip().lower() == "custom"
+        else ""
+    )
+    generation_config_provenance = {
+        "provenance_schema_version": PROVENANCE_SCHEMA_VERSION,
+        "source_tree_sha256": inference_source_sha256,
+        "experiment": {
+            "style": str(args.style),
+            "method": str(args.method),
+            "mas_shape": str(args.mas_shape),
+            "num_recursive_rounds": int(args.num_recursive_rounds),
+            "latent_steps": args.latent_steps if args.method in LATENT_METHODS else None,
+            "choice_old_prompt": int(args.choice_old_prompt),
+            "solver_pre_question": int(args.solver_pre_question),
+        },
+        "dataset": {
+            "label": str(dataset_label),
+            "source": str(args.dataset),
+            "resolved": str(dataset_name),
+            "split": str(args.dataset_split),
+            "requested_num_samples": int(args.num_samples),
+            "actual_num_samples": len(questions),
+            "shuffle": bool(args.shuffle),
+            "gpqa_option_shuffle": not bool(args.gpqa_no_option_shuffle),
+            "mbppplus_subset": str(args.mbppplus_subset),
+            "mbppplus_num_prompt_tests": int(args.mbppplus_num_prompt_tests),
+        },
+        "models": {
+            "planner": artifact_identity(planner_model),
+            "critic": artifact_identity(refiner_model),
+            "solver": artifact_identity(solver_model),
+        },
+        "inner_aligners": {
+            "planner": artifact_identity(args.agent1_inner_aligner_path),
+            "critic": artifact_identity(args.agent2_inner_aligner_path),
+            "solver": artifact_identity(args.agent3_inner_aligner_path),
+            "fallback_type": str(args.inner_adapter_type_fallback),
+        },
+        "outer_aligners": {
+            "p2c": artifact_identity(outer_12_path),
+            "c2s": artifact_identity(outer_23_path),
+            "s2p": artifact_identity(outer_31_path),
+            "fallback_type": str(args.outer_adapter_type_fallback),
+        },
+        "generation": {
+            "seed": int(args.seed),
+            "sample_seed_base": int(base_sample_seed),
+            "num_rollouts": int(args.num_rollouts),
+            "batch_size": int(args.batch_size),
+            "max_new_tokens": int(args.max_new_tokens),
+            "do_sample": bool(args.do_sample),
+            "temperature": float(args.temperature),
+            "top_p": float(args.top_p),
+            "top_k": int(args.top_k),
+            "min_p": float(args.min_p),
+            "repetition_penalty": float(args.repetition_penalty),
+            "presence_penalty": float(args.presence_penalty),
+            "ans": bool(args.ans),
+            "ans_max_new_tokens": int(args.ans_max_new_tokens),
+            "enable_thinking": bool(args.enable_thinking),
+        },
+        "runtime": {
+            "deterministic": bool(args.deterministic),
+            "deterministic_algorithms": bool(torch.are_deterministic_algorithms_enabled()),
+            "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG", ""),
+            "device_type": str(device.type),
+            "requested_dtype": str(args.dtype),
+            "effective_dtype": str(model_dtype),
+            "requested_outer_dtype": str(args.outer_dtype),
+            "effective_outer_dtype": str(outer_dtype),
+            "trust_remote_code": bool(args.trust_remote_code),
+            "environment": runtime_environment_identity(device),
+        },
+        "role_response": {
+            "regime": str(args.role_response_regime),
+            "custom_path": effective_role_response_path,
+            "custom_content_sha256": optional_file_content_sha256(
+                effective_role_response_path
+            ),
+        },
+    }
+    generation_config_sha256 = stable_json_sha256(generation_config_provenance)
+    attack_config_provenance = {
+        "question_suffix_path": str(args.question_suffix_path),
+        "question_suffix_sha256": stable_json_sha256(question_suffix),
+        "prompt_footer_path": str(args.prompt_footer_path),
+        "prompt_footer_sha256": stable_json_sha256(prompt_footer),
+        "latent_contagion": {
+            "mode": str(args.lc_mode),
+            "site": str(args.lc_site),
+            "epsilon": float(args.lc_epsilon),
+            "round": int(args.lc_round),
+            "seed": int(args.lc_seed),
+            "direction": str(args.lc_direction),
+            "steering_method": str(args.lc_steering_method),
+            "steering_id": str(args.lc_steering_id),
+            "steering_bank": artifact_identity(args.lc_steering_bank),
+        },
+        "role_profile_probe": {
+            "mode": str(args.role_profile_probe_mode),
+            "target": str(args.role_profile_probe_target),
+            "site": str(args.role_profile_probe_site),
+            "round": int(args.role_profile_probe_round),
+            "epsilon": float(args.role_profile_epsilon),
+            "seed": int(args.role_profile_seed),
+            "direction": str(args.role_profile_direction),
+        },
+    }
+    attack_config_sha256 = stable_json_sha256(attack_config_provenance)
 
     planner_questions = list(questions)
     is_text_method = args.method in {"text", "text_recursive"}
@@ -3959,9 +4433,12 @@ def main() -> None:
 
     def baseline_record_fields(sample_idx: int, final_answer: Any, is_correct: bool) -> Dict[str, Any]:
         fields: Dict[str, Any] = {
-            "sample_id": build_sample_id(dataset_name, args.dataset_split, sample_idx, sample_metadata),
+            "sample_id": run_sample_ids[sample_idx],
             "sample_idx": sample_idx,
-            "dataset": args.dataset,
+            **cohort_provenance,
+            "sample_input_sha256": sample_input_sha256[sample_idx],
+            "effective_sample_input_sha256": effective_sample_input_sha256[sample_idx],
+            "dataset": dataset_label,
             "dataset_name": dataset_name,
             "dataset_split": args.dataset_split,
             "system": system_name,
@@ -4000,6 +4477,14 @@ def main() -> None:
             ),
             "rollout_idx": 0,
             "sample_seed": rollout_seeds[0],
+            "seed": int(args.seed),
+            "sample_seed_base": int(base_sample_seed),
+            "batch_size": int(args.batch_size),
+            "do_sample": bool(args.do_sample),
+            "generation_config_sha256": generation_config_sha256,
+            "evaluation_config_sha256": evaluation_config_sha256,
+            "evaluation_protocol": evaluation_protocol,
+            "attack_config_sha256": attack_config_sha256,
         }
         if latent_stats_by_round_for_log is not None:
             fields["latent_stats_by_round"] = latent_stats_by_round_for_log[sample_idx]
@@ -4203,51 +4688,56 @@ def main() -> None:
 
 
     if result_jsonl_path:
-        out_dir = os.path.dirname(result_jsonl_path)
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
-        with open(result_jsonl_path, "w", encoding="utf-8") as f:
-            for record in sample_records:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            summary_record = {
-                "type": "summary",
-                "dataset": args.dataset,
-                "dataset_name": dataset_name,
-                "dataset_split": args.dataset_split,
-                "system": system_name,
-                "style": args.style or None,
-                "method": args.method,
-                "mas_shape": args.mas_shape,
-                "role_response_regime": args.role_response_regime,
-                "role_response_regime_path": args.role_response_regime_path,
-                "recursion_rounds": recursion_rounds_for_log(args.method, args.num_recursive_rounds),
-                "feedback_enabled": feedback_enabled_for_log(args.method),
-                "latent_steps": args.latent_steps if args.method in LATENT_METHODS else None,
-                "lc_mode": args.lc_mode,
-                "lc_site": args.lc_site,
-                "lc_epsilon": float(args.lc_epsilon),
-                "lc_round": int(args.lc_round),
-                "lc_seed": int(args.lc_seed),
-                "lc_direction": args.lc_direction,
-                "lc_steering_method": args.lc_steering_method,
-                "lc_steering_id": args.lc_steering_id,
-                "lc_steering_bank": args.lc_steering_bank,
-                "lc_enabled": bool(perturb_cfg.enabled),
-                "question_suffix_path": args.question_suffix_path,
-                "prompt_footer_path": args.prompt_footer_path,
-                "num_samples": total,
-                "num_rollouts": args.num_rollouts,
-                "sample_seed_base": base_sample_seed,
-                "runtime_total_sec": round(runtime_total_sec, 4),
-                "per_rollout_num_correct": rollout_correct_counts,
-                "per_rollout_accuracy": [
-                    (100.0 * n / total if total > 0 else 0.0) for n in rollout_correct_counts
-                ],
-                "num_correct": pass_correct_total if args.num_rollouts > 1 else rollout_correct_counts[0],
-                "accuracy": accuracy,
-                "pass_at_k": pass_at_k,
-            }
-            f.write(json.dumps(summary_record, ensure_ascii=False) + "\n")
+        summary_record = {
+            "type": "summary",
+            **cohort_provenance,
+            "dataset": dataset_label,
+            "dataset_name": dataset_name,
+            "dataset_split": args.dataset_split,
+            "system": system_name,
+            "style": args.style or None,
+            "method": args.method,
+            "mas_shape": args.mas_shape,
+            "role_response_regime": args.role_response_regime,
+            "role_response_regime_path": args.role_response_regime_path,
+            "recursion_rounds": recursion_rounds_for_log(args.method, args.num_recursive_rounds),
+            "feedback_enabled": feedback_enabled_for_log(args.method),
+            "latent_steps": args.latent_steps if args.method in LATENT_METHODS else None,
+            "lc_mode": args.lc_mode,
+            "lc_site": args.lc_site,
+            "lc_epsilon": float(args.lc_epsilon),
+            "lc_round": int(args.lc_round),
+            "lc_seed": int(args.lc_seed),
+            "lc_direction": args.lc_direction,
+            "lc_steering_method": args.lc_steering_method,
+            "lc_steering_id": args.lc_steering_id,
+            "lc_steering_bank": args.lc_steering_bank,
+            "lc_enabled": bool(perturb_cfg.enabled),
+            "question_suffix_path": args.question_suffix_path,
+            "prompt_footer_path": args.prompt_footer_path,
+            "num_samples": total,
+            "num_rollouts": args.num_rollouts,
+            "seed": int(args.seed),
+            "sample_seed_base": int(base_sample_seed),
+            "batch_size": int(args.batch_size),
+            "do_sample": bool(args.do_sample),
+            "generation_config_sha256": generation_config_sha256,
+            "generation_config": generation_config_provenance,
+            "evaluation_config_sha256": evaluation_config_sha256,
+            "evaluation_config": evaluation_config_provenance,
+            "evaluation_protocol": evaluation_protocol,
+            "attack_config_sha256": attack_config_sha256,
+            "attack_config": attack_config_provenance,
+            "runtime_total_sec": round(runtime_total_sec, 4),
+            "per_rollout_num_correct": rollout_correct_counts,
+            "per_rollout_accuracy": [
+                (100.0 * n / total if total > 0 else 0.0) for n in rollout_correct_counts
+            ],
+            "num_correct": pass_correct_total if args.num_rollouts > 1 else rollout_correct_counts[0],
+            "accuracy": accuracy,
+            "pass_at_k": pass_at_k,
+        }
+        write_jsonl_atomic(result_jsonl_path, [*sample_records, summary_record])
         print(f"[jsonl] wrote {len(sample_records)} sample records to {result_jsonl_path}")
 
     if trace_recorder is not None:
