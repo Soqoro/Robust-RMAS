@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -586,6 +587,49 @@ class SlurmGridTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("total_tasks\t12", completed.stdout)
         self.assertNotIn("s2p@1", completed.stdout)
+
+    def test_slurm_spool_copies_resolve_common_from_submit_directory(self) -> None:
+        cases = (
+            ("run_linkradius_engineering.sh", "grid", 0, "total_tasks\t2"),
+            ("run_linkradius_smoke.sh", "probe_grid", 0, "total_tasks\t12"),
+            ("run_linkradius_pilot.sh", "probe_calibration_grid", 0, "total_tasks\t60"),
+            ("run_linkradius_attacks.sh", "train_grid", 0, "total_tasks\t20"),
+            ("run_linkradius_expansion.sh", "grid", 0, "total_tasks\t5"),
+            ("run_linkradius_aggregate.sh", "invalid_stage", 2, "unsupported LR_STAGE"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_root = Path(directory)
+            for index, (name, stage, returncode, marker) in enumerate(cases):
+                spool = temporary_root / f"job-{index}"
+                spool.mkdir()
+                source = REPO_ROOT / "experiments" / "linkradius" / name
+                copied_script = spool / "slurm_script"
+                copied_script.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+                env = dict(os.environ)
+                env.pop("PYTHONPATH", None)
+                env.update(
+                    {
+                        "SLURM_JOB_ID": str(9000 + index),
+                        "SLURM_SUBMIT_DIR": str(REPO_ROOT),
+                        "PYTHON_BIN": sys.executable,
+                        "LR_STAGE": stage,
+                        "NUM_BATCHES": "1",
+                        "BATCH_COUNTS": "attack_train=1 validation=1 test=1",
+                        "OUT_ROOT": str(temporary_root / f"outputs-{index}"),
+                    }
+                )
+                completed = subprocess.run(
+                    ["bash", str(copied_script)],
+                    cwd=spool,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                combined = completed.stdout + completed.stderr
+                self.assertEqual(completed.returncode, returncode, (name, combined))
+                self.assertIn(marker, combined, (name, combined))
+                self.assertNotIn("linkradius_common.sh: No such file", combined)
 
     def test_frozen_test_grid_is_blocked_before_attack_freeze_gate(self) -> None:
         completed = subprocess.run(

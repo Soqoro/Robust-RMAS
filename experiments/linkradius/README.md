@@ -19,17 +19,20 @@ for `0 <= r < R-1`. Thus R=2 has exactly five edges and never `s2p@1`.
 
 ## Before running
 
-Run commands from anywhere; each script resolves and enters the repository
-root, unsets `PYTHONPATH`, and invokes the package with `python -m`. Create the
-SLURM log directory **before** submission because SLURM opens output files
-before the script starts:
+Direct `bash` commands may run from anywhere; each script resolves and enters
+the repository root, unsets `PYTHONPATH`, and invokes the package with
+`python -m`. Because SLURM executes a spool copy of an `sbatch` script, submit
+from the repository root so `SLURM_SUBMIT_DIR` identifies the checkout. If that
+is not possible, export `LINKRADIUS_REPO_ROOT=/absolute/path/to/Robust-RMAS`
+before submission. Create the SLURM log directory **before** submission because
+SLURM opens output files before the script starts:
 
 ```bash
 cd /path/to/Robust-RMAS
 mkdir -p logs
 ```
 
-Important environment variables are `PYTHON_BIN`, `STYLE`, `METHOD`,
+Important environment variables are `PYTHON_BIN`, `LINKRADIUS_REPO_ROOT`, `STYLE`, `METHOD`,
 `DATASETS`, `ROUNDS`, `SEEDS`, `BATCH_SIZE`, `LATENT_LENGTH`, `OUT_ROOT`,
 `GPU_LIST`, `PROBE_RADII`, `PROBE_SEEDS`, `K`, and `SUBSPACE`. `GPU_LIST` is a
 whitespace-separated physical-device list. If it is empty, scheduler-provided

@@ -22,6 +22,20 @@ K="${K:-8}"
 PROBE_RADII="${PROBE_RADII:-1e-3 3e-3}"
 PROBE_SEEDS="${PROBE_SEEDS:-101}"
 
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/linkradius_common.sh"
+lr_entrypoint_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+  lr_submit_root="${LINKRADIUS_REPO_ROOT:-${SLURM_SUBMIT_DIR:-}}"
+  if [[ -z "$lr_submit_root" ]]; then
+    echo "[error] SLURM_SUBMIT_DIR is unavailable; export LINKRADIUS_REPO_ROOT" >&2
+    exit 2
+  fi
+  lr_entrypoint_dir="$lr_submit_root/experiments/linkradius"
+fi
+if [[ ! -f "$lr_entrypoint_dir/linkradius_common.sh" ]]; then
+  echo "[error] cannot find linkradius_common.sh under $lr_entrypoint_dir" >&2
+  exit 2
+fi
+source "$lr_entrypoint_dir/linkradius_common.sh"
+unset lr_entrypoint_dir lr_submit_root
 lr_validate_stage "$LR_STAGE" split discover freeze_execution clean replay probe gradient validate all grid
 lr_run_entrypoint engineering "$LR_STAGE"
