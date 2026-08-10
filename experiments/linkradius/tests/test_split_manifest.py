@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 from RecursiveMAS.inference_utils.linkradius import largest_remainder_counts, split_raw_ids
+from experiments.linkradius.io_utils import atomic_write_json, load_json
+from experiments.linkradius.make_split_manifest import build_split_manifest, verify_split_manifest
 
 
 class RawSplitTests(unittest.TestCase):
@@ -30,7 +34,23 @@ class RawSplitTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             split_raw_ids(["same", "same"])
 
+    def test_serialized_manifest_accepts_canonical_json_key_order(self) -> None:
+        manifest = build_split_manifest(
+            [
+                {"raw_sample_id": f"raw-{index:03d}", "raw_index": index}
+                for index in range(10)
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "split_manifest.json"
+            atomic_write_json(path, manifest)
+            reloaded = load_json(path)
+        self.assertEqual(
+            tuple(reloaded["partitions"]),
+            ("attack_train", "test", "validation"),
+        )
+        self.assertEqual(verify_split_manifest(reloaded), manifest["content_hash"])
+
 
 if __name__ == "__main__":
     unittest.main()
-

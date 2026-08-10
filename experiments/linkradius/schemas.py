@@ -81,8 +81,8 @@ def validate_split_manifest(manifest: Mapping[str, Any]) -> None:
     if manifest["schema_version"] != SPLIT_MANIFEST_VERSION:
         raise ContractError(f"unsupported split manifest schema: {manifest['schema_version']!r}")
     partitions = manifest["partitions"]
-    if not isinstance(partitions, Mapping) or tuple(partitions.keys()) != PARTITIONS:
-        raise ContractError(f"split partitions must appear exactly in order {PARTITIONS!r}")
+    if not isinstance(partitions, Mapping) or set(partitions) != set(PARTITIONS):
+        raise ContractError(f"split partitions must contain exactly {PARTITIONS!r}")
     all_ids: list[str] = []
     for name in PARTITIONS:
         rows = partitions[name]
