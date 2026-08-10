@@ -10,6 +10,7 @@ from experiments.linkradius.probe_validation import (
     select_causally_useful_edges,
     stability_checks,
 )
+from experiments.linkradius.run_linkradius import _bind_probe_run_ids
 from experiments.linkradius.schemas import ContractError
 
 
@@ -120,6 +121,24 @@ def _probe_rows() -> list[dict]:
 
 
 class ProbeValidationTests(unittest.TestCase):
+    def test_task_bound_probe_ids_override_runtime_local_ids(self) -> None:
+        signed = _bind_probe_run_ids(
+            {"run_id": "runtime-signed", "realized_signed_coordinate": 0.1},
+            run_id="task-signed",
+        )
+        pair = _bind_probe_run_ids(
+            {
+                "plus_run_id": "runtime-plus",
+                "minus_run_id": "runtime-minus",
+                "realized_separation": 0.2,
+            },
+            plus_run_id="task-plus",
+            minus_run_id="task-minus",
+        )
+        self.assertEqual(signed["run_id"], "task-signed")
+        self.assertEqual(pair["plus_run_id"], "task-plus")
+        self.assertEqual(pair["minus_run_id"], "task-minus")
+
     def test_validation_thresholds_and_stability_are_recomputed(self) -> None:
         calibration, pairs = calibrate_probe_configuration(
             _probe_rows(), candidate_K=(4, 8), minimum_acceptance=0.5

@@ -229,6 +229,31 @@ def _to_plain(value: Any) -> Any:
     return value
 
 
+def _bind_probe_run_ids(
+    diagnostics: Any,
+    *,
+    run_id: str | None = None,
+    plus_run_id: str | None = None,
+    minus_run_id: str | None = None,
+) -> dict[str, Any]:
+    """Replace runtime-local probe IDs with canonical task-bound row IDs."""
+
+    plain = _to_plain(diagnostics)
+    if not isinstance(plain, Mapping):
+        raise ContractError("probe diagnostics must be a mapping")
+    result = dict(plain)
+    for field, value in (
+        ("run_id", run_id),
+        ("plus_run_id", plus_run_id),
+        ("minus_run_id", minus_run_id),
+    ):
+        if value is not None:
+            if not str(value):
+                raise ContractError(f"canonical probe {field} must be nonempty")
+            result[field] = str(value)
+    return result
+
+
 def _cached_source_hash(args: argparse.Namespace, repo_root: Path) -> str:
     """Compute the immutable per-process experiment source identity once."""
 
@@ -1925,7 +1950,19 @@ def _replay_stage(args: argparse.Namespace, task_dir: Path, task: Mapping[str, A
                     minus_rows[index]["q"] = int(probe.subspace["q"])
                     plus_rows[index]["subspace_id"] = probe.subspace["subspace_id"]
                     minus_rows[index]["subspace_id"] = probe.subspace["subspace_id"]
-                    pair_diagnostics = _to_plain(probe.pair_diagnostics[index])
+                    plus_diagnostics = _bind_probe_run_ids(
+                        probe.plus_diagnostics[index], run_id=plus_run_id
+                    )
+                    minus_diagnostics = _bind_probe_run_ids(
+                        probe.minus_diagnostics[index], run_id=minus_run_id
+                    )
+                    pair_diagnostics = _bind_probe_run_ids(
+                        probe.pair_diagnostics[index],
+                        plus_run_id=plus_run_id,
+                        minus_run_id=minus_run_id,
+                    )
+                    plus_rows[index]["realized_intervention"] = plus_diagnostics
+                    minus_rows[index]["realized_intervention"] = minus_diagnostics
                     derivatives: dict[str, float | None] = {}
                     derivative_error = None
                     try:
@@ -1953,8 +1990,8 @@ def _replay_stage(args: argparse.Namespace, task_dir: Path, task: Mapping[str, A
                             ) from exc
                     rows.extend(
                         [
-                            {**plus_rows[index], "edge_id": edge, "sign": 1, "direction_id": direction_id, "probe_seed": task["probe_seed"], "h": task["h"], "diagnostics": _to_plain(probe.plus_diagnostics[index])},
-                            {**minus_rows[index], "edge_id": edge, "sign": -1, "direction_id": direction_id, "probe_seed": task["probe_seed"], "h": task["h"], "diagnostics": _to_plain(probe.minus_diagnostics[index])},
+                            {**plus_rows[index], "edge_id": edge, "sign": 1, "direction_id": direction_id, "probe_seed": task["probe_seed"], "h": task["h"], "diagnostics": plus_diagnostics},
+                            {**minus_rows[index], "edge_id": edge, "sign": -1, "direction_id": direction_id, "probe_seed": task["probe_seed"], "h": task["h"], "diagnostics": minus_diagnostics},
                             {
                                 **_row_envelope(
                                     args=args,
@@ -1964,7 +2001,7 @@ def _replay_stage(args: argparse.Namespace, task_dir: Path, task: Mapping[str, A
                                     repo_root=repo_root,
                                     intervention_mode="additive_antithetic_pair",
                                     requested={"h": task["h"], "probe_seed": task["probe_seed"], "direction_id": direction_id, "subspace": task["subspace"]},
-                                    realized=_to_plain(probe.pair_diagnostics[index]),
+                                    realized=pair_diagnostics,
                                 ),
                                 "record_type": "probe_pair",
                                 "run_id": content_hash(
