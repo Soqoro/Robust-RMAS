@@ -6,14 +6,24 @@ from typing import Any, Dict
 
 import torch
 
-from hf_resolver import (
-    resolve_inner_adapter,
-    resolve_outer_paths,
-    snapshot_repo,
-    task_for_inner_repo,
-)
-from inference_utils import inference_mas as base
-from load_from_repo import STYLE_SPECS
+try:  # Package import, used by the LinkRadius entrypoints.
+    from .hf_resolver import (
+        resolve_inner_adapter,
+        resolve_outer_paths,
+        snapshot_repo,
+        task_for_inner_repo,
+    )
+    from .inference_utils import inference_mas as base
+    from .load_from_repo import STYLE_SPECS
+except ImportError:  # Backward-compatible direct import from RecursiveMAS/run.py.
+    from hf_resolver import (
+        resolve_inner_adapter,
+        resolve_outer_paths,
+        snapshot_repo,
+        task_for_inner_repo,
+    )
+    from inference_utils import inference_mas as base
+    from load_from_repo import STYLE_SPECS
 
 
 INNER_ADAPTER_TYPE_FALLBACK = "ln_res_adapter"
@@ -235,11 +245,25 @@ def load_mas_system(
 
 
 def unload_mas_system(system: LoadedMASSystem) -> None:
+    """Release a persistent MAS system without retaining module references.
+
+    ``release_resources`` cannot reclaim modules while ``system`` still owns them.
+    Clear those references first, then hand the detached objects to the legacy
+    cleanup helper.  The path/provenance metadata remains available after unload.
+    """
     modules = []
     for agent in system.agents.values():
         modules.extend([agent.model, agent.tokenizer, agent.inner_adapter])
+        agent.model = None
+        agent.tokenizer = None
+        agent.inner_adapter = None
     modules.extend(system.outer_adapters.values())
-    base.release_resources(*modules)
+    system.agents.clear()
+    system.outer_adapters.clear()
+    # Drop our final strong references before asking the legacy helper to run
+    # garbage collection and clear the CUDA allocator cache.
+    modules.clear()
+    base.release_resources()
 
 
 def summarize_mas_paths(paths: ResolvedMASPaths) -> Dict[str, Dict[str, str]]:
@@ -248,4 +272,3 @@ def summarize_mas_paths(paths: ResolvedMASPaths) -> Dict[str, Dict[str, str]]:
         "inner_adapter_paths": {k: str(v) for k, v in paths.inner_adapter_paths.items()},
         "outer_adapter_paths": {k: str(v) for k, v in paths.outer_adapter_paths.items()},
     }
-

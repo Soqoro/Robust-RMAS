@@ -71,6 +71,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--system_name", default="", help="Display name to store in JSONL logs.")
     p.add_argument("--num_samples", type=int, default=-1)
+    p.add_argument(
+        "--sample_indices",
+        default="",
+        help=(
+            "Optional comma-separated raw source indices for a frozen equivalence "
+            "audit. Empty preserves the release loader behavior."
+        ),
+    )
     p.add_argument("--result_jsonl", default="")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--sample_seed", type=int, default=-1)
@@ -305,6 +313,8 @@ def build_common_cli(args: argparse.Namespace, dataset_arg: str, dataset_split: 
         out.extend(["--device", str(args.device)])
     if args.result_jsonl:
         out.extend(["--result_jsonl", str(args.result_jsonl)])
+    if args.sample_indices:
+        out.extend(["--sample_indices", str(args.sample_indices)])
     if str(STYLE_SPECS[args.style]["family"]) == "sequential":
         if args.question_suffix_path:
             out.extend(["--question_suffix_path", str(args.question_suffix_path)])

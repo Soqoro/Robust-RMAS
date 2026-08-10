@@ -683,10 +683,37 @@ def build_math_planner_prompt(question: str) -> str:
     )
 
 
-def build_math_planner_prompt_with_feedback_slot(question: str) -> str:
+PLANNER_FEEDBACK_ROUND_LABEL_MODES = {"legacy", "actual"}
+
+
+def build_math_planner_prompt_with_feedback_slot(
+    question: str,
+    *,
+    round_idx: Optional[int] = None,
+    round_label_mode: str = "legacy",
+) -> str:
+    """Build the recursive planner prompt with an auditable round label.
+
+    ``legacy`` deliberately preserves the released hard-coded ``round 2`` text.
+    LinkRadius expansion can opt into ``actual`` and must provide the zero-based
+    code round, which is rendered as the corresponding one-based paper round.
+    """
+    mode = str(round_label_mode or "legacy").strip().lower()
+    if mode not in PLANNER_FEEDBACK_ROUND_LABEL_MODES:
+        raise ValueError(
+            f"Unsupported planner feedback round-label mode: {round_label_mode!r}"
+        )
+    if mode == "legacy":
+        paper_round = 2
+    else:
+        if round_idx is None or isinstance(round_idx, bool) or int(round_idx) < 1:
+            raise ValueError(
+                "round_label_mode='actual' requires a zero-based feedback round_idx >= 1"
+            )
+        paper_round = int(round_idx) + 1
     return (
         "You are a planner agent in a recursive multi-agent system.\n"
-        "This is round 2.\n"
+        f"This is round {paper_round}.\n"
         "Question:\n"
         f"{question}\n"
         "Feedback signal from the previous solver round:\n"

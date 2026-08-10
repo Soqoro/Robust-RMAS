@@ -56,27 +56,50 @@ from .answer_utils import (
     strip_choice_instruction_lines,
     truncate_text_chars,
 )
-from prompts import (
-    FEEDBACK_SLOT,
-    PLANNER_SLOT,
-    REFINED_SLOT,
-    SYSTEM_PROMPT,
-    apply_role_response_regime,
-    build_code_single_solver_prompt,
-    build_code_planner_prompt,
-    build_code_planner_prompt_with_feedback_slot,
-    build_code_refiner_prompt,
-    build_code_refiner_prompt_with_slot,
-    build_code_solver_prompt,
-    build_code_solver_prompt_with_slots,
-    build_math_planner_prompt,
-    build_math_planner_prompt_with_feedback_slot,
-    build_math_refiner_prompt,
-    build_math_refiner_prompt_with_slot,
-    build_math_single_solver_prompt,
-    build_math_solver_prompt,
-    build_math_solver_prompt_with_slots,
-)
+try:
+    from ..prompts import (
+        FEEDBACK_SLOT,
+        PLANNER_SLOT,
+        REFINED_SLOT,
+        SYSTEM_PROMPT,
+        apply_role_response_regime,
+        build_code_single_solver_prompt,
+        build_code_planner_prompt,
+        build_code_planner_prompt_with_feedback_slot,
+        build_code_refiner_prompt,
+        build_code_refiner_prompt_with_slot,
+        build_code_solver_prompt,
+        build_code_solver_prompt_with_slots,
+        build_math_planner_prompt,
+        build_math_planner_prompt_with_feedback_slot,
+        build_math_refiner_prompt,
+        build_math_refiner_prompt_with_slot,
+        build_math_single_solver_prompt,
+        build_math_solver_prompt,
+        build_math_solver_prompt_with_slots,
+    )
+except ImportError:  # Legacy direct import with RecursiveMAS on sys.path.
+    from prompts import (
+        FEEDBACK_SLOT,
+        PLANNER_SLOT,
+        REFINED_SLOT,
+        SYSTEM_PROMPT,
+        apply_role_response_regime,
+        build_code_single_solver_prompt,
+        build_code_planner_prompt,
+        build_code_planner_prompt_with_feedback_slot,
+        build_code_refiner_prompt,
+        build_code_refiner_prompt_with_slot,
+        build_code_solver_prompt,
+        build_code_solver_prompt_with_slots,
+        build_math_planner_prompt,
+        build_math_planner_prompt_with_feedback_slot,
+        build_math_refiner_prompt,
+        build_math_refiner_prompt_with_slot,
+        build_math_single_solver_prompt,
+        build_math_solver_prompt,
+        build_math_solver_prompt_with_slots,
+    )
 from .lcb_utils import (
     build_code_reparse_suffix,
     build_mbppplus_sample_meta,
@@ -97,15 +120,26 @@ from .role_profile import (
     state_site_to_role,
 )
 
-from modeling import (
-    Adapter,
-    CrossModelAdapter,
-    infer_inner_adapter_type_from_state_dict,
-    infer_outer_adapter_type_from_state_dict,
-    normalize_inner_adapter_type,
-    normalize_outer_adapter_type,
-    resolve_local_pretrained_path,
-)
+try:
+    from ..modeling import (
+        Adapter,
+        CrossModelAdapter,
+        infer_inner_adapter_type_from_state_dict,
+        infer_outer_adapter_type_from_state_dict,
+        normalize_inner_adapter_type,
+        normalize_outer_adapter_type,
+        resolve_local_pretrained_path,
+    )
+except ImportError:  # Legacy direct import with RecursiveMAS on sys.path.
+    from modeling import (
+        Adapter,
+        CrossModelAdapter,
+        infer_inner_adapter_type_from_state_dict,
+        infer_outer_adapter_type_from_state_dict,
+        normalize_inner_adapter_type,
+        normalize_outer_adapter_type,
+        resolve_local_pretrained_path,
+    )
 
 _CHAT_TEMPLATE_IDS_FALLBACK_WARNED = False
 _GEN_TOP_K: Optional[int] = None
@@ -759,7 +793,15 @@ def load_eval_questions_and_answers(
     mbppplus_subset: str = "",
     mbppplus_cache_dir: str = "",
     mbppplus_num_prompt_tests: int = 3,
+    sample_indices: Optional[Sequence[int]] = None,
 ):
+    selected_source_indices = tuple(int(value) for value in (sample_indices or ()))
+    if len(selected_source_indices) != len(set(selected_source_indices)):
+        raise ValueError("--sample_indices cannot contain duplicates.")
+    if any(value < 0 for value in selected_source_indices):
+        raise ValueError("--sample_indices must contain non-negative source indices.")
+    if selected_source_indices and shuffle:
+        raise ValueError("--sample_indices is incompatible with --shuffle.")
     dataset_name, dataset_config = resolve_dataset(dataset)
     key = dataset.strip().lower()
     if dataset_name == dataset and os.path.isfile(dataset) and dataset.lower().endswith(".json"):
@@ -768,6 +810,8 @@ def load_eval_questions_and_answers(
     sample_metadata: Optional[List[Dict[str, Any]]] = None
 
     if dataset_name == "__mbppplus__":
+        if selected_source_indices:
+            raise ValueError("--sample_indices is currently supported only for Hugging Face datasets.")
         records = load_mbppplus_records(
             split=dataset_split,
             subset=(mbppplus_subset or None),
@@ -799,6 +843,8 @@ def load_eval_questions_and_answers(
         return "mbppplus", questions, gold_answers
 
     if dataset_name == "__local_medqa__":
+        if selected_source_indices:
+            raise ValueError("--sample_indices is currently supported only for Hugging Face datasets.")
         medqa_path = dataset
         if not os.path.isfile(medqa_path):
             medqa_path = "dataset/medqa.json"
@@ -836,9 +882,16 @@ def load_eval_questions_and_answers(
     ds = load_dataset(dataset_name, dataset_config, split=dataset_split)
     if len(ds) == 0:
         raise ValueError("Loaded dataset is empty.")
-    if shuffle:
+    if selected_source_indices:
+        out_of_range = [value for value in selected_source_indices if value >= len(ds)]
+        if out_of_range:
+            raise ValueError(
+                f"--sample_indices contains indices outside 0..{len(ds) - 1}: {out_of_range}"
+            )
+        ds = ds.select(list(selected_source_indices))
+    elif shuffle:
         ds = ds.shuffle(seed=seed)
-    if num_samples > 0:
+    if num_samples > 0 and not selected_source_indices:
         ds = ds.select(range(min(num_samples, len(ds))))
 
     if is_gpqa_dataset(key):
@@ -853,7 +906,14 @@ def load_eval_questions_and_answers(
             questions.append(q)
             gold_answers.append(ans)
         if return_metadata:
-            return "gpqa_diamond", questions, gold_answers, None
+            metadata = None
+            if selected_source_indices:
+                # Preserve the positional sample identity the unchanged legacy
+                # loader would have assigned before sub-selection.  The optional
+                # selector is used only for a one-row release-equivalence audit;
+                # the default loader path and IDs remain byte-for-byte unchanged.
+                metadata = [{"id": int(value)} for value in selected_source_indices]
+            return "gpqa_diamond", questions, gold_answers, metadata
         return "gpqa_diamond", questions, gold_answers
 
     question_column = None
@@ -2027,7 +2087,13 @@ def run_planner_feedback_latent_stage(
                 fn_name=fn_name,
             )
         else:
-            user_prompt = build_math_planner_prompt_with_feedback_slot(question)
+            user_prompt = build_math_planner_prompt_with_feedback_slot(
+                question,
+                round_idx=round_idx,
+                round_label_mode=getattr(
+                    args, "planner_feedback_round_label_mode", "legacy"
+                ),
+            )
         user_prompt = apply_role_regime_to_prompt(user_prompt, "planner", args)
         user_prompt = append_prompt_footer(user_prompt, prompt_footer)
         prompt_segments.append(
@@ -2439,10 +2505,30 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--role_response_regime_path", type=str, default="")
     parser.add_argument("--num_samples", type=int, default=100)
+    parser.add_argument(
+        "--sample_indices",
+        type=str,
+        default="",
+        help=(
+            "Optional comma-separated raw source indices to run without shuffling. "
+            "This is intended for frozen one-example equivalence audits; an empty "
+            "value preserves the release loader exactly."
+        ),
+    )
     parser.add_argument("--shuffle", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--choice_old_prompt", type=int, default=0, choices=[0, 1, 2, 3])
     parser.add_argument("--gpqa_no_option_shuffle", type=int, default=0, choices=[0, 1])
+    parser.add_argument(
+        "--planner_feedback_round_label_mode",
+        type=str,
+        default="legacy",
+        choices=["legacy", "actual"],
+        help=(
+            "Keep the released hard-coded round-2 planner feedback label, or "
+            "record the true one-based round label. The default is backward compatible."
+        ),
+    )
     parser.add_argument(
         "--sample_seed",
         type=int,
@@ -2859,6 +2945,19 @@ def main() -> None:
             outer_31_path=args.outer_31_path,
         )
 
+    selected_source_indices: List[int] = []
+    if args.sample_indices.strip():
+        try:
+            selected_source_indices = [
+                int(value.strip())
+                for value in args.sample_indices.split(",")
+                if value.strip()
+            ]
+        except ValueError as exc:
+            raise ValueError("--sample_indices must be a comma-separated integer list.") from exc
+        if not selected_source_indices:
+            raise ValueError("--sample_indices did not contain an index.")
+
     dataset_name, questions, gold_answers, sample_metadata = load_eval_questions_and_answers(
         dataset=args.dataset,
         dataset_split=args.dataset_split,
@@ -2871,6 +2970,7 @@ def main() -> None:
         mbppplus_subset=args.mbppplus_subset,
         mbppplus_cache_dir=args.mbppplus_cache_dir,
         mbppplus_num_prompt_tests=int(args.mbppplus_num_prompt_tests),
+        sample_indices=selected_source_indices,
     )
 
     # Canonical pairing is based on the untouched evaluation cohort.  Direct
@@ -2936,7 +3036,11 @@ def main() -> None:
                 "role_response_regime_path": args.role_response_regime_path,
             },
             sample_ids=run_sample_ids,
-            sample_indices=list(range(len(questions))),
+            sample_indices=(
+                list(selected_source_indices)
+                if selected_source_indices
+                else list(range(len(questions)))
+            ),
             sites=trace_sites,
             rounds=trace_rounds,
             dtype=trace_dtype,
@@ -2987,7 +3091,11 @@ def main() -> None:
             path=args.role_profile_trace_path,
             metadata=role_profile_metadata,
             sample_ids=run_sample_ids,
-            sample_indices=list(range(len(questions))),
+            sample_indices=(
+                list(selected_source_indices)
+                if selected_source_indices
+                else list(range(len(questions)))
+            ),
             dtype=role_profile_dtype,
             trace_messages=bool(args.role_profile_trace_messages),
             trace_states=bool(args.role_profile_trace_states),
@@ -3054,6 +3162,9 @@ def main() -> None:
             "latent_steps": args.latent_steps if args.method in LATENT_METHODS else None,
             "choice_old_prompt": int(args.choice_old_prompt),
             "solver_pre_question": int(args.solver_pre_question),
+            "planner_feedback_round_label_mode": str(
+                args.planner_feedback_round_label_mode
+            ),
         },
         "dataset": {
             "label": str(dataset_label),
