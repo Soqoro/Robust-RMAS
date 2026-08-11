@@ -153,7 +153,12 @@ def source_hash(repo_root: str | os.PathLike[str]) -> str:
         if not base.is_dir():
             continue
         for path in base.rglob("*"):
-            if not path.is_file() or "__pycache__" in path.parts:
+            relative_path = path.relative_to(base)
+            if (
+                not path.is_file()
+                or "__pycache__" in relative_path.parts
+                or any(part.startswith(".") for part in relative_path.parts)
+            ):
                 continue
             if path.suffix not in {".py", ".sh", ".json", ".txt", ".md"}:
                 continue

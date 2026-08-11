@@ -1584,16 +1584,19 @@ def _mismatch_intervention(
 
 
 def _capture_stage(args: argparse.Namespace, task_dir: Path, task: Mapping[str, Any], repo_root: Path) -> None:
+    is_clean = task.get("stage") == "clean"
+    execution_path = (
+        _execution_manifest_path(args, str(task["partition"]), task)
+        if is_clean
+        else ""
+    )
+    if is_clean and not execution_path:
+        raise ContractError("clean capture requires a frozen execution manifest")
     records = _records_for_task(args, task, repo_root)
     execution_hash = "screening_unfrozen"
     eligibility = [True] * len(records)
     execution = None
     frozen_slice: slice | None = None
-    execution_path = (
-        _execution_manifest_path(args, str(task["partition"]), task)
-        if task.get("stage") == "clean"
-        else ""
-    )
     if execution_path:
         _, execution, execution_hash = _authenticated_execution_manifest(
             args, str(task["partition"]), task, repo_root

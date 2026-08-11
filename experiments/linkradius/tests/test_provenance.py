@@ -103,6 +103,28 @@ class ProvenanceTests(unittest.TestCase):
             runtime.write_text("changed too", encoding="utf-8")
             self.assertNotEqual(second, source_hash(root))
 
+    def test_source_hash_ignores_hidden_editor_checkpoints(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "RecursiveMAS" / "runtime.py"
+            shell = root / "experiments" / "linkradius" / "run.sh"
+            runtime.parent.mkdir(parents=True)
+            shell.parent.mkdir(parents=True)
+            runtime.write_text("runtime", encoding="utf-8")
+            shell.write_text("launcher", encoding="utf-8")
+            expected = source_hash(root)
+
+            checkpoint = (
+                shell.parent
+                / ".ipynb_checkpoints"
+                / "run-checkpoint.sh"
+            )
+            checkpoint.parent.mkdir()
+            checkpoint.write_text("first editor copy", encoding="utf-8")
+            self.assertEqual(source_hash(root), expected)
+            checkpoint.write_text("changed editor copy", encoding="utf-8")
+            self.assertEqual(source_hash(root), expected)
+
 
 if __name__ == "__main__":
     unittest.main()

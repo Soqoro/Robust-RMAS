@@ -22,6 +22,8 @@ class StrictChoiceTests(unittest.TestCase):
     def test_declared_terminal_forms(self) -> None:
         cases = {
             r"Reasoning. Therefore \boxed{B}": "B",
+            r"Reasoning. Therefore the correct option is \(\boxed{A}\).": "A",
+            r"Reasoning. Therefore the correct option is \[\boxed{D}\]": "D",
             "Reasoning mentions A.\nFinal Choice: C": "C",
             "Reasoning mentions A and D.\n(D)": "D",
             "Answer: a.": "A",
@@ -35,6 +37,7 @@ class StrictChoiceTests(unittest.TestCase):
     def test_boxed_labels_mentioned_in_reasoning_are_not_answers(self) -> None:
         cases = (
             r"I considered \boxed{A}, but it is wrong; no final answer.",
+            r"I considered \(\boxed{D}\), but did not choose it.",
             "Answer: B\nThat was only a guess, so no final answer.",
             "Quoted reasoning: `\\boxed{C}` is one candidate.",
         )

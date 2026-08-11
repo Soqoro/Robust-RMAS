@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from experiments.linkradius.grid import GridConfig, build_grid, canonical_edge_pairs, select_task
 from experiments.linkradius.io_utils import atomic_write_json, atomic_write_text, publish_completion, source_hash, verify_completion
@@ -42,6 +43,31 @@ class SlurmGridTests(unittest.TestCase):
         tasks = build_grid(GridConfig(workflow="smoke", stage="probe", num_batches=1))
         self.assertEqual({task.edge_id for task in tasks}, {"p2c@0", "c2s@0", "s2p@0"})
         self.assertNotIn("s2p@1", {task.edge_id for task in tasks})
+
+    def test_clean_capture_rejects_missing_execution_manifest_before_loading_data(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args = build_parser().parse_args(
+                [
+                    "--workflow",
+                    "smoke",
+                    "--stage",
+                    "clean",
+                    "--out-root",
+                    directory,
+                ]
+            )
+            task = build_grid(_build_grid_config(args))[0].as_dict()
+            with mock.patch.object(runner, "_records_for_task") as records:
+                with self.assertRaisesRegex(
+                    ContractError, "clean capture requires a frozen execution manifest"
+                ):
+                    runner._capture_stage(
+                        args,
+                        Path(directory) / "clean-task",
+                        task,
+                        REPO_ROOT,
+                    )
+            records.assert_not_called()
 
     def test_pilot_validate_is_the_same_canonical_task_as_validate_probe(self) -> None:
         validate = build_parser().parse_args(

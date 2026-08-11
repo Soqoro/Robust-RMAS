@@ -34,7 +34,7 @@ REPLAY_SCHEDULE_VERSION = "linkradius_replay_schedule_v1"
 GPQA_RAW_ID_VERSION = "linkradius_gpqa_raw_id_v1"
 GPQA_OPTION_PERMUTATION_VERSION = "gpqa_md5_stem_seed_v1"
 GPQA_SPLIT_VERSION = "linkradius_gpqa_split_v1"
-STRICT_CHOICE_VERSION = "linkradius_choice_v1"
+STRICT_CHOICE_VERSION = "linkradius_choice_v2"
 SUBSPACE_VERSION = "linkradius_subspace_v1"
 DIRECTION_VERSION = "linkradius_direction_v1"
 INTERVENTION_SEED_VERSION = "linkradius_intervention_seed_v1"
@@ -587,6 +587,9 @@ _STANDALONE_CHOICE_RE = re.compile(
     r"^\s*(?:[\(\[]\s*)?([A-D])(?:\s*[\)\]])?\s*[.!]?\s*$",
     re.IGNORECASE,
 )
+_TERMINAL_BOX_SUFFIX_RE = re.compile(
+    r"(?:\\[)\]]\s*)?[\s.!?]*"
+)
 
 
 def parse_strict_choice(text: Any) -> StrictChoiceResult:
@@ -634,7 +637,9 @@ def parse_strict_choice(text: Any) -> StrictChoiceResult:
             add_match(standalone, "standalone_terminal", offset=line_offset)
             continue
         boxed = list(_BOXED_CHOICE_RE.finditer(line))
-        if boxed and re.fullmatch(r"[\s.!?]*", line[boxed[-1].end() :]):
+        if boxed and _TERMINAL_BOX_SUFFIX_RE.fullmatch(
+            line[boxed[-1].end() :]
+        ):
             for match in boxed:
                 add_match(match, "boxed_terminal", offset=line_offset)
             continue
