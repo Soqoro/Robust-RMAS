@@ -2954,6 +2954,7 @@ def _engineering_validate_stage(
     evidence = assemble_engineering_evidence(
         artifact_root,
         legacy_equivalence_path=args.legacy_equivalence or None,
+        expected_latent_steps=args.latent_length,
     )
     report, checks = validate_engineering_evidence(evidence)
     engineering_grid_checks = [

@@ -69,6 +69,43 @@ class SlurmGridTests(unittest.TestCase):
                     )
             records.assert_not_called()
 
+    def test_engineering_validation_uses_configured_latent_length(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args = build_parser().parse_args(
+                [
+                    "--workflow",
+                    "engineering",
+                    "--stage",
+                    "validate",
+                    "--out-root",
+                    directory,
+                    "--latent-length",
+                    "48",
+                ]
+            )
+            task = build_grid(_build_grid_config(args))[0].as_dict()
+            evidence = {"sentinel": True}
+            with mock.patch(
+                "experiments.linkradius.validate_engineering.assemble_engineering_evidence",
+                return_value=evidence,
+            ) as assemble:
+                with mock.patch(
+                    "experiments.linkradius.validate_engineering.validate_engineering_evidence",
+                    side_effect=RuntimeError("stop after assembly"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "stop after assembly"):
+                        runner._engineering_validate_stage(
+                            args,
+                            Path(directory) / "validation-task",
+                            task,
+                            REPO_ROOT,
+                        )
+            assemble.assert_called_once_with(
+                Path(directory).resolve() / "engineering" / "gpqa" / "R2",
+                legacy_equivalence_path=None,
+                expected_latent_steps=48,
+            )
+
     def test_pilot_validate_is_the_same_canonical_task_as_validate_probe(self) -> None:
         validate = build_parser().parse_args(
             ["--workflow", "pilot", "--stage", "validate"]
