@@ -42,6 +42,13 @@ EXPECTED_R2_EDGES = frozenset({"p2c@0", "c2s@0", "s2p@0", "p2c@1", "c2s@1"})
 ENGINEERING_PROBE_RADII = frozenset({1e-3, 3e-3})
 ENGINEERING_PROBE_K = 8
 ENGINEERING_AUTOGRAD_FD_RELATIVE_TOLERANCE = 0.25
+# ``requested_signed_coordinate`` is a float32 dot-product reduction over the
+# complete relay tensor.  Its rounding error is therefore larger than one
+# scalar float32 operation even though the requested delta is constructed at
+# exactly +/-h.  Keep this tight enough to reject a materially different
+# perturbation while allowing the observed reduction error at production
+# tensor sizes.
+ENGINEERING_REQUESTED_COORDINATE_RELATIVE_TOLERANCE = 2e-5
 ENGINEERING_PROBE_THRESHOLDS = {
     "minimum_requested_realized_cosine": -1.0,
     "maximum_off_direction_relative": 1e300,
@@ -537,8 +544,16 @@ def _validate_terminal_finite_difference(
         minus.get("realized_signed_coordinate"),
         field="finite_difference.minus.realized_signed_coordinate",
     )
-    if not math.isclose(plus_requested, h, rel_tol=1e-6, abs_tol=1e-9) or not math.isclose(
-        minus_requested, -h, rel_tol=1e-6, abs_tol=1e-9
+    if not math.isclose(
+        plus_requested,
+        h,
+        rel_tol=ENGINEERING_REQUESTED_COORDINATE_RELATIVE_TOLERANCE,
+        abs_tol=1e-9,
+    ) or not math.isclose(
+        minus_requested,
+        -h,
+        rel_tol=ENGINEERING_REQUESTED_COORDINATE_RELATIVE_TOLERANCE,
+        abs_tol=1e-9,
     ):
         raise ContractError("finite-difference requested signed coordinates differ from +/-h")
     if plus_realized <= 0 or minus_realized >= 0:

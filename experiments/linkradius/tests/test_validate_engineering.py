@@ -421,6 +421,7 @@ class EngineeringArtifactAuthenticationTests(unittest.TestCase):
         task_execution_hash: str,
         tamper_separation: bool = False,
         include_row_provenance: bool = True,
+        requested_coordinate_scale: float = 1.0,
     ) -> None:
         directory = self.root / "gradient"
         directory.mkdir(parents=True)
@@ -454,7 +455,9 @@ class EngineeringArtifactAuthenticationTests(unittest.TestCase):
                         "relative_error": 0.1,
                         "agrees": True,
                         "plus_diagnostics": {
-                            "requested_signed_coordinate": 0.01,
+                            "requested_signed_coordinate": (
+                                0.01 * requested_coordinate_scale
+                            ),
                             "realized_signed_coordinate": 0.009,
                             "realized_delta_norm": 1.0,
                             "requested_realized_cosine": 1.0,
@@ -462,7 +465,9 @@ class EngineeringArtifactAuthenticationTests(unittest.TestCase):
                             "consumer_dtype": "float32",
                         },
                         "minus_diagnostics": {
-                            "requested_signed_coordinate": -0.01,
+                            "requested_signed_coordinate": (
+                                -0.01 * requested_coordinate_scale
+                            ),
                             "realized_signed_coordinate": -0.009,
                             "realized_delta_norm": 1.0,
                             "requested_realized_cosine": 1.0,
@@ -589,6 +594,25 @@ class EngineeringArtifactAuthenticationTests(unittest.TestCase):
         check = evidence["checks"]["terminal_autograd_finite_difference_agreement"]
         self.assertTrue(check["passed"], check)
         self.assertTrue(check["detail"]["cast_survived"])
+
+    def test_gradient_float32_projection_roundoff_is_accepted(self) -> None:
+        self._publish_clean()
+        self._publish_gradient(
+            task_execution_hash=self.shared["execution_manifest_hash"],
+            requested_coordinate_scale=1.0000059349474493,
+        )
+        evidence = assemble_engineering_evidence(self.root)
+        check = evidence["checks"]["terminal_autograd_finite_difference_agreement"]
+        self.assertTrue(check["passed"], check)
+
+    def test_materially_wrong_requested_coordinate_is_rejected(self) -> None:
+        self._publish_clean()
+        self._publish_gradient(
+            task_execution_hash=self.shared["execution_manifest_hash"],
+            requested_coordinate_scale=1.0001,
+        )
+        with self.assertRaisesRegex(ContractError, "requested signed coordinates"):
+            assemble_engineering_evidence(self.root)
 
     def test_tampered_gradient_realized_separation_is_rejected(self) -> None:
         self._publish_clean()
