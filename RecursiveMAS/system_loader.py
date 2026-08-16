@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Mapping
 
 import torch
 
@@ -60,6 +60,7 @@ class LoadedMASSystem:
     dataset: str
     agents: Dict[str, LoadedAgent]
     outer_adapters: Dict[str, Any]
+    role_devices: Dict[str, torch.device]
     paths: ResolvedMASPaths
 
 
@@ -123,6 +124,33 @@ def _normalize_dtype(value: str | torch.dtype):
     return value
 
 
+def _validate_role_devices(role_devices: Mapping[str, torch.device]) -> None:
+    """Fail before model allocation when a requested logical CUDA device is hidden."""
+
+    cuda_roles = {
+        role: device for role, device in role_devices.items() if device.type == "cuda"
+    }
+    if not cuda_roles:
+        return
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA role placement was requested, but CUDA is unavailable in this process"
+        )
+    visible_count = int(torch.cuda.device_count())
+    current_index = int(torch.cuda.current_device())
+    unavailable = {
+        role: str(device)
+        for role, device in cuda_roles.items()
+        if int(device.index if device.index is not None else current_index) >= visible_count
+    }
+    if unavailable:
+        raise RuntimeError(
+            "requested role CUDA devices are outside the scheduler-visible logical "
+            f"range 0..{visible_count - 1}: {unavailable}; request enough GPUs in one "
+            "Slurm task and do not use GPU_LIST to mask model-parallel jobs"
+        )
+
+
 def resolve_mas_paths(style: str, dataset: str = "math500") -> ResolvedMASPaths:
     if style not in STYLE_SPECS:
         raise ValueError(f"Unsupported style: {style}")
@@ -173,25 +201,45 @@ def load_mas_system(
     dataset: str = "math500",
     *,
     device: str | torch.device = "cuda",
+    role_devices: Mapping[str, str | torch.device] | None = None,
     dtype: str | torch.dtype = "auto",
     outer_dtype: str | torch.dtype = "auto",
     trust_remote_code: bool = True,
 ) -> LoadedMASSystem:
-    paths = resolve_mas_paths(style=style, dataset=dataset)
-    family = paths.family
+    if style not in STYLE_SPECS:
+        raise ValueError(f"Unsupported style: {style}")
+    family = str(STYLE_SPECS[style]["family"])
     device_obj = torch.device(device)
     model_dtype = _normalize_dtype(dtype)
     outer_module_dtype = _normalize_dtype(outer_dtype)
 
-    agents: Dict[str, LoadedAgent] = {}
     role_to_repo_key = _AGENT_LAYOUTS[family]
+    supplied_role_devices = dict(role_devices or {})
+    unknown_roles = set(supplied_role_devices) - set(role_to_repo_key)
+    if unknown_roles:
+        raise ValueError(
+            "role_devices contains roles that are not part of "
+            f"{family!r}: {sorted(unknown_roles)}"
+        )
+    resolved_role_devices = {
+        role: torch.device(supplied_role_devices.get(role, device_obj))
+        for role in role_to_repo_key
+    }
+    _validate_role_devices(resolved_role_devices)
+
+    # Resolve/download checkpoint paths only after the complete topology has
+    # passed validation, so a bad scheduler allocation cannot cause avoidable
+    # network/cache work or a partial model load.
+    paths = resolve_mas_paths(style=style, dataset=dataset)
+    agents: Dict[str, LoadedAgent] = {}
     for role, repo_key in role_to_repo_key.items():
+        role_device = resolved_role_devices[role]
         repo_id = paths.repo_ids[repo_key]
         repo_path = paths.repo_paths[repo_key]
         inner_adapter_path = paths.inner_adapter_paths[repo_key]
         model, tokenizer = base.load_agent_model_and_tokenizer(
             model_name_or_path=str(repo_path),
-            device=device_obj,
+            device=role_device,
             dtype=model_dtype,
             trust_remote_code=trust_remote_code,
             agent_name=role,
@@ -200,7 +248,7 @@ def load_mas_system(
         inner_adapter = base.load_inner_adapter_module(
             adapter_path=str(inner_adapter_path),
             hidden_size=hidden_size,
-            device=device_obj,
+            device=role_device,
             dtype=model_dtype,
             fallback_adapter_type=INNER_ADAPTER_TYPE_FALLBACK,
         )
@@ -230,7 +278,10 @@ def load_mas_system(
             in_dim=agents[src_role].hidden_size,
             out_dim=out_dim,
             adapter_type=OUTER_ADAPTER_TYPE_FALLBACK,
-            device=device_obj,
+            # An outer adapter consumes the source agent's hidden state.  Keep
+            # it beside that source model; the adapted relay is transferred to
+            # the destination device by the runtime after the adapter call.
+            device=resolved_role_devices[src_role],
             dtype=outer_module_dtype,
         )
 
@@ -240,6 +291,7 @@ def load_mas_system(
         dataset=dataset,
         agents=agents,
         outer_adapters=outer_adapters,
+        role_devices=resolved_role_devices,
         paths=paths,
     )
 

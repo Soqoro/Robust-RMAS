@@ -37,7 +37,7 @@ from . import linkradius as lr
 
 SCORER_VERSION = "linkradius_forced_choice_v1"
 TRAJECTORY_VERSION = "linkradius_clean_trajectory_v1"
-RUNTIME_VERSION = "linkradius_persistent_sequential_v1"
+RUNTIME_VERSION = "linkradius_persistent_sequential_v2"
 SYSTEM_IDENTITY_VERSION = "linkradius_portable_system_identity_v1"
 DEFAULT_SCORER_PREFIX = "Final Choice: \\boxed{"
 DEFAULT_VERBALIZERS: Mapping[str, str] = {
@@ -47,6 +47,12 @@ DEFAULT_VERBALIZERS: Mapping[str, str] = {
     "D": "D}",
 }
 CHOICE_LABELS: Tuple[str, ...] = tuple(DEFAULT_VERBALIZERS)
+SEQUENTIAL_ROLES: Tuple[str, ...] = ("planner", "critic", "solver")
+EDGE_CONSUMER_ROLES: Mapping[str, str] = {
+    "p2c": "critic",
+    "c2s": "solver",
+    "s2p": "planner",
+}
 
 
 def _require_torch() -> Any:
@@ -527,6 +533,9 @@ class RuntimeConfig:
     seed: int = 42
     deterministic: bool = True
     device: str = "cuda"
+    planner_device: str = ""
+    critic_device: str = ""
+    solver_device: str = ""
     dtype: str = "auto"
     outer_dtype: str = "auto"
     enable_thinking: bool = False
@@ -550,6 +559,15 @@ class RuntimeConfig:
     scorer_version: str = SCORER_VERSION
 
     def __post_init__(self) -> None:
+        self.device = str(self.device).strip()
+        if not self.device:
+            raise ValueError("device must not be empty")
+        for role in SEQUENTIAL_ROLES:
+            field_name = f"{role}_device"
+            explicit = str(getattr(self, field_name) or "").strip()
+            # Canonicalize fallback placement immediately so semantically
+            # identical configurations hash identically in saved trajectories.
+            setattr(self, field_name, explicit or self.device)
         if int(self.rounds) < 1:
             raise ValueError("rounds must be at least 1")
         if int(self.latent_steps) < 1:
@@ -564,6 +582,15 @@ class RuntimeConfig:
             raise ValueError("score tie tolerances must be non-negative")
         if not self.scorer_prefix:
             raise ValueError("scorer_prefix must not be empty")
+
+    def device_for_role(self, role: str) -> str:
+        normalized = str(role).strip().lower()
+        if normalized not in SEQUENTIAL_ROLES:
+            raise ValueError(f"unknown sequential role: {role!r}")
+        return str(getattr(self, f"{normalized}_device"))
+
+    def resolved_role_devices(self) -> Dict[str, str]:
+        return {role: self.device_for_role(role) for role in SEQUENTIAL_ROLES}
 
 
 @dataclass
@@ -1072,6 +1099,7 @@ class LinkRadiusRuntime:
             style=self.config.style,
             dataset=self.config.dataset,
             device=self.config.device,
+            role_devices=self.config.resolved_role_devices(),
             dtype=self.config.dtype,
             outer_dtype=self.config.outer_dtype,
             trust_remote_code=trust_remote_code,
@@ -1301,11 +1329,37 @@ class LinkRadiusRuntime:
 
     @property
     def device(self) -> Any:
+        """Backward-compatible alias for the planner's execution device."""
+
+        return self.role_device("planner")
+
+    def role_device(self, role: str) -> Any:
+        """Return the actual device assigned to one sequential agent role."""
+
         t = _require_torch()
-        system = self._ensure_system()
-        for parameter in system.agents["planner"].model.parameters():
+        normalized = str(role).strip().lower()
+        configured = self.config.device_for_role(normalized)
+        system = self.system
+        if system is None:
+            return t.device(configured)
+        declared = dict(getattr(system, "role_devices", {}) or {}).get(normalized)
+        if declared is not None:
+            return t.device(declared)
+        agent = system.agents[normalized]
+        for parameter in agent.model.parameters():
             return parameter.device
-        return t.device(self.config.device)
+        return t.device(configured)
+
+    @staticmethod
+    def edge_consumer_role(edge: Any) -> str:
+        parsed = lr.parse_edge(edge) if not isinstance(edge, lr.Edge) else edge
+        try:
+            return EDGE_CONSUMER_ROLES[parsed.site]
+        except KeyError as exc:  # Defensive for duck-typed/legacy Edge values.
+            raise ValueError(f"unknown relay edge site: {parsed.site!r}") from exc
+
+    def edge_consumer_device(self, edge: Any) -> Any:
+        return self.role_device(self.edge_consumer_role(edge))
 
     def set_stage_audit_hook(
         self,
@@ -1449,6 +1503,8 @@ class LinkRadiusRuntime:
         system = self._ensure_system()
         agent = system.agents["planner"]
         consumer = system.agents["critic"]
+        planner_device = self.role_device("planner")
+        consumer_device = self.role_device("critic")
         embed_layer = agent.model.get_input_embeddings()
         embed_dtype = embed_layer.weight.dtype
         prompt_ids = self._planner_initial_prompts(questions)
@@ -1459,7 +1515,7 @@ class LinkRadiusRuntime:
                 ids, mask = _pad_left_ids(
                     prompt_ids[start:end],
                     agent.tokenizer.pad_token_id,
-                    self.device,
+                    planner_device,
                 )
                 hidden = self._latent_rollout(
                     agent.model,
@@ -1473,7 +1529,7 @@ class LinkRadiusRuntime:
                 )
         transport = t.cat(batches, dim=0)
         consumer_dtype = consumer.model.get_input_embeddings().weight.dtype
-        receiver = transport.to(dtype=consumer_dtype)
+        receiver = transport.to(device=consumer_device, dtype=consumer_dtype)
         self._audit("planner_initial", 0, "end")
         return RelayEmission(
             transport=transport,
@@ -1500,6 +1556,8 @@ class LinkRadiusRuntime:
         system = self._ensure_system()
         agent = system.agents[role]
         consumer = system.agents[consumer_role]
+        role_device = self.role_device(role)
+        consumer_device = self.role_device(consumer_role)
         embed_layer = agent.model.get_input_embeddings()
         embed_dtype = embed_layer.weight.dtype
         if int(incoming.size(-1)) != int(embed_layer.weight.size(-1)):
@@ -1515,11 +1573,11 @@ class LinkRadiusRuntime:
                 sequences: List[Any] = []
                 for index in range(start, end):
                     prefix_ids, suffix_ids = segments[index]
-                    prefix = _token_ids_to_embeds(embed_layer, prefix_ids, self.device, embed_dtype)
-                    suffix = _token_ids_to_embeds(embed_layer, suffix_ids, self.device, embed_dtype)
-                    relay = incoming[index].to(device=self.device, dtype=embed_dtype)
+                    prefix = _token_ids_to_embeds(embed_layer, prefix_ids, role_device, embed_dtype)
+                    suffix = _token_ids_to_embeds(embed_layer, suffix_ids, role_device, embed_dtype)
+                    relay = incoming[index].to(device=role_device, dtype=embed_dtype)
                     sequences.append(t.cat((prefix, relay, suffix), dim=0))
-                embedded, mask, _ = _pad_left_embeds(sequences, self.device)
+                embedded, mask, _ = _pad_left_embeds(sequences, role_device)
                 hidden = self._latent_rollout(
                     agent.model,
                     agent.inner_adapter,
@@ -1536,7 +1594,7 @@ class LinkRadiusRuntime:
                 )
         transport = t.cat(outputs, dim=0)
         consumer_dtype = consumer.model.get_input_embeddings().weight.dtype
-        receiver = transport.to(dtype=consumer_dtype)
+        receiver = transport.to(device=consumer_device, dtype=consumer_dtype)
         self._audit(action, round_idx, "end")
         return RelayEmission(
             transport=transport,
@@ -1653,6 +1711,7 @@ class LinkRadiusRuntime:
         t = _require_torch()
         system = self._ensure_system()
         agent = system.agents["solver"]
+        solver_device = self.role_device("solver")
         embed_layer = agent.model.get_input_embeddings()
         embed_dtype = embed_layer.weight.dtype
         if len(questions) != int(critic_message.size(0)):
@@ -1662,9 +1721,9 @@ class LinkRadiusRuntime:
         segments = self._slot_prompts("solver", questions, self.config.rounds - 1)
         sequences: List[Any] = []
         for index, (prefix_ids, suffix_ids) in enumerate(segments):
-            prefix = _token_ids_to_embeds(embed_layer, prefix_ids, self.device, embed_dtype)
-            suffix = _token_ids_to_embeds(embed_layer, suffix_ids, self.device, embed_dtype)
-            relay = critic_message[index].to(device=self.device, dtype=embed_dtype)
+            prefix = _token_ids_to_embeds(embed_layer, prefix_ids, solver_device, embed_dtype)
+            suffix = _token_ids_to_embeds(embed_layer, suffix_ids, solver_device, embed_dtype)
+            relay = critic_message[index].to(device=solver_device, dtype=embed_dtype)
             sequences.append(t.cat((prefix, relay, suffix), dim=0))
         return sequences
 
@@ -1734,6 +1793,7 @@ class LinkRadiusRuntime:
         agent = system.agents["solver"]
         model = agent.model
         tokenizer = agent.tokenizer
+        solver_device = self.role_device("solver")
         embed_layer = model.get_input_embeddings()
         embed_dtype = embed_layer.weight.dtype
         boundaries = validate_batch_boundaries(
@@ -1761,7 +1821,7 @@ class LinkRadiusRuntime:
                 continuation = _token_ids_to_embeds(
                     embed_layer,
                     encoding.token_ids,
-                    self.device,
+                    solver_device,
                     embed_dtype,
                 )
                 batch_sums: List[Any] = []
@@ -1772,7 +1832,7 @@ class LinkRadiusRuntime:
                         t.cat((base_sequences[index], continuation), dim=0)
                         for index in range(start, end)
                     ]
-                    padded, mask, lengths = _pad_left_embeds(sequences, self.device)
+                    padded, mask, lengths = _pad_left_embeds(sequences, solver_device)
                     keep = max(len(encoding.token_ids) + 1, encoding.token_count + 1)
                     kwargs = {
                         "inputs_embeds": padded,
@@ -1804,8 +1864,8 @@ class LinkRadiusRuntime:
                         target_ids.append(list(encoding.candidate_token_ids))
                     token_log_probs = causal_token_log_probs(
                         logits,
-                        t.as_tensor(target_ids, dtype=t.long, device=self.device),
-                        t.as_tensor(target_positions, dtype=t.long, device=self.device),
+                        t.as_tensor(target_ids, dtype=t.long, device=solver_device),
+                        t.as_tensor(target_positions, dtype=t.long, device=solver_device),
                     )
                     batch_sums.append(token_log_probs.sum(dim=-1))
                     batch_means.append(token_log_probs.mean(dim=-1))
@@ -1814,7 +1874,7 @@ class LinkRadiusRuntime:
                             (end - start,),
                             encoding.token_count,
                             dtype=t.long,
-                            device=self.device,
+                            device=solver_device,
                         )
                     )
                 sum_columns.append(t.cat(batch_sums, dim=0))
@@ -1875,6 +1935,7 @@ class LinkRadiusRuntime:
         t = _require_torch()
         system = self._ensure_system()
         agent = system.agents["solver"]
+        solver_device = self.role_device("solver")
         boundaries = validate_batch_boundaries(
             batch_boundaries or _default_boundaries(len(questions), self.config.batch_size),
             len(questions),
@@ -1889,7 +1950,7 @@ class LinkRadiusRuntime:
         self._audit("generate_final", self.config.rounds - 1, "start")
         with t.no_grad():
             for start, end in boundaries:
-                padded, mask, _ = _pad_left_embeds(sequences[start:end], self.device)
+                padded, mask, _ = _pad_left_embeds(sequences[start:end], solver_device)
                 generated = agent.model.generate(
                     inputs_embeds=padded,
                     attention_mask=mask,
@@ -1918,6 +1979,7 @@ class LinkRadiusRuntime:
         if not pending:
             return list(outputs), attempted
         agent = self._ensure_system().agents["solver"]
+        solver_device = self.role_device("solver")
         prompts = [
             f"{str(outputs[index]).rstrip()}\n{self.config.scorer_prefix}" for index in pending
         ]
@@ -1937,9 +1999,9 @@ class LinkRadiusRuntime:
                     truncation=False,
                 )
                 if hasattr(encoded, "to"):
-                    encoded = encoded.to(self.device)
-                input_ids = encoded["input_ids"].to(self.device)
-                mask = encoded["attention_mask"].to(self.device)
+                    encoded = encoded.to(solver_device)
+                input_ids = encoded["input_ids"].to(solver_device)
+                mask = encoded["attention_mask"].to(solver_device)
                 generated = agent.model.generate(
                     input_ids=input_ids,
                     attention_mask=mask,
@@ -2125,6 +2187,7 @@ class LinkRadiusRuntime:
         runtime_provenance = {
             "runtime_config": asdict(self.config),
             "runtime_config_sha256": _stable_json_hash(asdict(self.config)),
+            "role_devices": self.config.resolved_role_devices(),
             "scorer": dict(scoring.metadata),
             "scorer_hash": _stable_json_hash(dict(scoring.metadata)),
             "transport_storage_dtype": "float32",
@@ -2194,7 +2257,7 @@ class LinkRadiusRuntime:
         intervention = self._intervention_from_value(intervention_value)
         clean_stored = trajectory.message(edge, receiver=True)
         execution_device = (
-            self.device
+            self.edge_consumer_device(edge)
             if self.system is not None
             else getattr(clean_stored, "device", t.device("cpu"))
         )
@@ -2828,7 +2891,7 @@ class LinkRadiusRuntime:
             trajectory.dtype_metadata(edge).consumer_dtype
         )
         leaf = trajectory.message(edge, receiver=True).to(
-            device=self.device,
+            device=self.role_device("solver"),
             dtype=consumer_dtype,
         ).detach()
         leaf.requires_grad_(True)
@@ -2888,7 +2951,7 @@ class LinkRadiusRuntime:
             trajectory.dtype_metadata(parsed).consumer_dtype
         )
         leaf = trajectory.message(parsed, receiver=True).to(
-            device=self.device,
+            device=self.edge_consumer_device(parsed),
             dtype=consumer_dtype,
         ).detach()
         leaf.requires_grad_(True)
@@ -3012,7 +3075,8 @@ class LinkRadiusRuntime:
         consumer_dtype = _torch_dtype_from_name(
             trajectory.dtype_metadata(parsed).consumer_dtype
         )
-        clean_batch = clean_batch_cpu.to(device=self.device, dtype=t.float32)
+        execution_device = self.edge_consumer_device(parsed)
+        clean_batch = clean_batch_cpu.to(device=execution_device, dtype=t.float32)
         clean = clean_batch[selected : selected + 1]
         terminal = parsed == lr.Edge("c2s", self.config.rounds - 1)
         target_results: List[PGDTargetResult] = []
@@ -3052,7 +3116,7 @@ class LinkRadiusRuntime:
             clean_row = list(clean_scores[selected])
         for target in target_values:
             initial_margin = choice_margins(clean_row, gold, CHOICE_LABELS)[target]
-            coefficients = t.zeros(subspace.q, dtype=t.float32, device=self.device)
+            coefficients = t.zeros(subspace.q, dtype=t.float32, device=execution_device)
             for _ in range(int(steps)):
                 coefficients = coefficients.detach().requires_grad_(True)
                 delta = subspace.lift(coefficients).reshape_as(clean)

@@ -392,11 +392,32 @@ def _task_manifest(args: argparse.Namespace, task: Mapping[str, Any], repo_root:
         "method": args.method,
         "batch_size": args.batch_size,
         "latent_length": args.latent_length,
+        "role_devices": _resolved_role_devices(args),
+        # Scheduler placement is diagnostic rather than scientific identity:
+        # logical role devices are hashed above, while physical allocation may
+        # change safely between otherwise identical jobs.
+        "scheduler_environment": {
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+            "slurm_array_task_id": os.environ.get("SLURM_ARRAY_TASK_ID"),
+            "slurm_job_nodelist": os.environ.get("SLURM_JOB_NODELIST"),
+        },
         "source_hash": _cached_source_hash(args, repo_root),
         "argv": list(sys.argv),
         "cwd": str(Path.cwd()),
         "python": sys.executable,
     }
+
+
+def _resolved_role_devices(args: argparse.Namespace) -> dict[str, str]:
+    fallback = str(args.device).strip()
+    if not fallback:
+        raise ContractError("--device must not be empty")
+    result: dict[str, str] = {}
+    for role in ("planner", "critic", "solver"):
+        explicit = str(getattr(args, f"{role}_device", "") or "").strip()
+        result[role] = explicit or fallback
+    return result
 
 
 def _gate_default(args: argparse.Namespace, name: str) -> Path:
@@ -554,6 +575,7 @@ def _runner_config_digest(
             "trust_remote_code": int(args.trust_remote_code),
             "round_label_mode": args.round_label_mode,
             "device": args.device,
+            "role_devices": _resolved_role_devices(args),
             "explicit_trajectory": _configured_artifact_identity(args.trajectory),
         }
     if stage in {"replay", "causal"}:
@@ -1223,6 +1245,7 @@ def _runtime(args: argparse.Namespace, *, requested_edge: str | None = None):
 
     inference_mas.configure_runtime_reproducibility(int(args.seed), deterministic=True)
 
+    role_devices = _resolved_role_devices(args)
     config = RuntimeConfig(
         rounds=args.rounds_runtime,
         latent_steps=args.latent_length,
@@ -1232,6 +1255,9 @@ def _runtime(args: argparse.Namespace, *, requested_edge: str | None = None):
         seed=int(args.seed),
         deterministic=True,
         device=args.device,
+        planner_device=role_devices["planner"],
+        critic_device=role_devices["critic"],
+        solver_device=role_devices["solver"],
         dtype="auto",
         outer_dtype="auto",
         enable_thinking=False,
@@ -4849,6 +4875,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--latent-length", type=int, default=32)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--planner-device", default="")
+    parser.add_argument("--critic-device", default="")
+    parser.add_argument("--solver-device", default="")
     parser.add_argument("--trust-remote-code", type=int, choices=(0, 1), default=1)
     parser.add_argument("--round-label-mode", choices=("legacy", "actual"), default="legacy")
     parser.add_argument("--out-root", default="outputs/linkradius")

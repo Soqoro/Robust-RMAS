@@ -34,10 +34,42 @@ mkdir -p logs
 
 Important environment variables are `PYTHON_BIN`, `LINKRADIUS_REPO_ROOT`, `STYLE`, `METHOD`,
 `DATASETS`, `ROUNDS`, `SEEDS`, `BATCH_SIZE`, `LATENT_LENGTH`, `OUT_ROOT`,
-`GPU_LIST`, `PROBE_RADII`, `PROBE_SEEDS`, `K`, and `SUBSPACE`. `GPU_LIST` is a
-whitespace-separated physical-device list. If it is empty, scheduler-provided
-`CUDA_VISIBLE_DEVICES` is preserved; inside a masked job the runtime uses
-logical `cuda:0`.
+`GPU_LIST`, `PLANNER_DEVICE`, `CRITIC_DEVICE`, `SOLVER_DEVICE`, `PROBE_RADII`,
+`PROBE_SEEDS`, `K`, and `SUBSPACE`. `GPU_LIST` is a whitespace-separated
+physical-device list for round-robin, one-GPU-per-array-task execution. If it
+is empty, scheduler-provided `CUDA_VISIBLE_DEVICES` is preserved; inside a
+masked job the runtime uses logical CUDA indices.
+
+### Multi-GPU sequential model placement
+
+The persistent sequential runtime can place its three agents on different
+logical devices. For example:
+
+```bash
+export PLANNER_DEVICE=cuda:0
+export CRITIC_DEVICE=cuda:1
+export SOLVER_DEVICE=cuda:2
+unset GPU_LIST
+```
+
+This places the planner, critic, and solver (plus each role's inner adapter) on
+three devices. Each outer adapter stays on its source role's device, and its
+relay is copied directly to the consumer device without detaching the autograd
+graph. The CUDA indices are logical indices within the scheduler's
+`CUDA_VISIBLE_DEVICES`, not necessarily physical GPU ordinals.
+
+Run one process in one Slurm task and request three GPUs, for example with
+`--ntasks=1 --gres=gpu:3` when those are the site's allocation flags. Keep
+`GPU_LIST` empty: `GPU_LIST="0 1 2"` still means round-robin single-GPU array
+routing and does not pool memory. On a four-GPU node, throttle a two-element
+gradient array with `--array=0-1%1` so only one three-GPU element runs at once.
+
+The resolved role topology is authenticated experiment configuration. Export
+the same `STYLE`, `LATENT_LENGTH`, `PLANNER_DEVICE`, `CRITIC_DEVICE`, and
+`SOLVER_DEVICE` values for every command in a fresh workflow, including CPU
+freeze/validation/aggregation commands that reconstruct upstream task keys.
+Changing only the physical node is safe when the same three logical devices
+remain available. Changing the logical role map requires a new output root.
 
 Every array task is a whole frozen execution batch plus one intervention
 configuration. A probe task contains both signs for all nested directions, so

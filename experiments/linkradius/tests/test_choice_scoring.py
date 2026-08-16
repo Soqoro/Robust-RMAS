@@ -135,6 +135,18 @@ class _ToyLM(torch.nn.Module if torch is not None else object):
         return SimpleNamespace(logits=logits, hidden_states=(inputs_embeds,))
 
 
+class _CumulativeToyLM(_ToyLM):
+    """Toy hidden states where every relay token influences the final state."""
+
+    def forward(self, inputs_embeds, attention_mask=None, logits_to_keep=None, **kwargs):
+        hidden = inputs_embeds.cumsum(dim=1)
+        length = hidden.size(1)
+        keep = min(length, int(logits_to_keep)) if logits_to_keep is not None else length
+        dependency = hidden[:, -keep:, :].sum(dim=-1, keepdim=True) * 0.0
+        logits = self.bias.view(1, 1, -1) + dependency
+        return SimpleNamespace(logits=logits, hidden_states=(hidden,))
+
+
 class _Identity(torch.nn.Module if torch is not None else object):
     def forward(self, value):
         return value
@@ -199,6 +211,71 @@ class EndToEndToyScorerTests(unittest.TestCase):
             {"p2c@0", "c2s@0", "s2p@0", "p2c@1", "c2s@1"},
         )
         self.assertEqual(trajectory.clean_scoring.predictions, ("D",))
+
+    def test_role_routing_and_differentiable_consumer_cast(self):
+        tokenizer = _CharTokenizer()
+
+        def agent(dtype):
+            model = _CumulativeToyLM().to(dtype=dtype)
+            return SimpleNamespace(
+                model=model,
+                tokenizer=tokenizer,
+                inner_adapter=_Identity(),
+            )
+
+        system = SimpleNamespace(
+            family="sequential",
+            agents={
+                "planner": agent(torch.float32),
+                "critic": agent(torch.float64),
+                "solver": agent(torch.float32),
+            },
+            outer_adapters={
+                "outer_12": _Identity(),
+                "outer_23": _Identity(),
+                "outer_31": _Identity(),
+            },
+        )
+
+        class RecordingRuntime(LinkRadiusRuntime):
+            def __init__(self):
+                self.role_requests = []
+                super().__init__(
+                    RuntimeConfig(rounds=2, latent_steps=1, batch_size=1, device="cpu"),
+                    system=system,
+                )
+
+            @property
+            def device(self):  # Any remaining global-device use must fail.
+                raise AssertionError("concrete stages must use a role-specific device")
+
+            def role_device(self, role):
+                self.role_requests.append(role)
+                return torch.device("cpu")
+
+        runtime = RecordingRuntime()
+        question = ["Question\nA. x\nB. y\nC. z\nD. w"]
+        incoming = torch.ones((1, 2, 8), dtype=torch.float32, requires_grad=True)
+
+        runtime.role_requests.clear()
+        emission = runtime.run_critic(question, incoming, 0, differentiable=True)
+        self.assertEqual(runtime.role_requests, ["critic", "solver"])
+        self.assertEqual(emission.transport.dtype, torch.float64)
+        self.assertEqual(emission.receiver.dtype, torch.float32)
+        emission.receiver.sum().backward()
+        self.assertIsNotNone(incoming.grad)
+        self.assertGreater(float(incoming.grad.abs().sum()), 0.0)
+
+        expected = (
+            (lambda: runtime.run_initial_planner(question), {"planner", "critic"}),
+            (lambda: runtime.run_solver_feedback(question, incoming.detach(), 0), {"solver", "planner"}),
+            (lambda: runtime.run_planner_feedback(question, incoming.detach(), 1), {"planner", "critic"}),
+            (lambda: runtime.score_terminal(question, incoming.detach()), {"solver"}),
+        )
+        for operation, roles in expected:
+            runtime.role_requests.clear()
+            operation()
+            self.assertEqual(set(runtime.role_requests), roles)
 
 
 if __name__ == "__main__":

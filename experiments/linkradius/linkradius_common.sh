@@ -24,6 +24,10 @@ BATCH_SIZE="${BATCH_SIZE:-16}"
 LATENT_LENGTH="${LATENT_LENGTH:-32}"
 OUT_ROOT="${OUT_ROOT:-outputs/linkradius}"
 GPU_LIST="${GPU_LIST:-}"
+DEVICE="${DEVICE:-cuda:0}"
+PLANNER_DEVICE="${PLANNER_DEVICE:-}"
+CRITIC_DEVICE="${CRITIC_DEVICE:-}"
+SOLVER_DEVICE="${SOLVER_DEVICE:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 PROBE_RADII="${PROBE_RADII:-1e-3 3e-3}"
 PROBE_SEEDS="${PROBE_SEEDS:-101 202}"
@@ -122,8 +126,18 @@ lr_is_gpu_stage() {
   esac
 }
 
+lr_validate_gpu_configuration() {
+  if [[ -n "$GPU_LIST" ]] && {
+    [[ -n "$PLANNER_DEVICE" ]] || [[ -n "$CRITIC_DEVICE" ]] || [[ -n "$SOLVER_DEVICE" ]]
+  }; then
+    lr_die "GPU_LIST masks each array task to one GPU and cannot be combined with per-role devices; leave GPU_LIST empty and request all role GPUs in one scheduler allocation"
+    return
+  fi
+}
+
 lr_configure_gpu() {
   local task_id="$1"
+  lr_validate_gpu_configuration || return
   if [[ -n "$GPU_LIST" ]]; then
     local -a gpu_values
     read -r -a gpu_values <<< "$GPU_LIST"
@@ -174,7 +188,10 @@ lr_build_command() {
     --reuse-complete "$REUSE_COMPLETE"
     --overwrite "$OVERWRITE"
     --max-eligible "$MAX_ELIGIBLE"
-    --device cuda:0
+    --device "$DEVICE"
+    --planner-device "$PLANNER_DEVICE"
+    --critic-device "$CRITIC_DEVICE"
+    --solver-device "$SOLVER_DEVICE"
     --engineering-gate "$ENGINEERING_GATE"
     --smoke-gate "$SMOKE_GATE"
     --probe-gate "$PROBE_GATE"
@@ -225,6 +242,7 @@ lr_run_entrypoint() {
   lr_validate_positive "K" "$K" || return
   lr_validate_bool "REUSE_COMPLETE" "$REUSE_COMPLETE" || return
   lr_validate_bool "OVERWRITE" "$OVERWRITE" || return
+  lr_validate_gpu_configuration || return
 
   lr_build_command "$workflow" "$stage" "$task_id"
   if [[ "$stage" == "grid" || "$stage" == *_grid ]]; then
