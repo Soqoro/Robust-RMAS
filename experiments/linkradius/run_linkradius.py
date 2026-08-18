@@ -1273,6 +1273,345 @@ def _runtime(args: argparse.Namespace, *, requested_edge: str | None = None):
     return runtime
 
 
+def _finite_or_none(value: Any) -> float | None:
+    """Return a JSON-safe finite float for diagnostic-only statistics."""
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _finite_value_summary(values: Sequence[float]) -> dict[str, float | None]:
+    """Summarize already-filtered finite values without publishing NaN/Inf."""
+
+    if not values:
+        return {
+            "finite_min": None,
+            "finite_max": None,
+            "finite_mean": None,
+            "finite_abs_max": None,
+            "finite_l2_norm": None,
+        }
+    norm = 0.0
+    for value in values:
+        norm = math.hypot(norm, value)
+    try:
+        mean = math.fsum(value / len(values) for value in values)
+    except OverflowError:
+        mean = math.nan
+    return {
+        "finite_min": _finite_or_none(min(values)),
+        "finite_max": _finite_or_none(max(values)),
+        "finite_mean": _finite_or_none(mean),
+        "finite_abs_max": _finite_or_none(max(abs(value) for value in values)),
+        "finite_l2_norm": _finite_or_none(norm),
+    }
+
+
+def _plain_tensor_row_finiteness(value: Any, sample_index: int) -> dict[str, Any]:
+    """Pure-Python fallback used by CPU tests and tensor-like diagnostics."""
+
+    try:
+        row = value[sample_index]
+    except (IndexError, KeyError, TypeError) as exc:
+        raise ContractError(
+            f"relay tensor does not contain sample index {sample_index}"
+        ) from exc
+
+    shape: list[int] = []
+    cursor = row
+    while isinstance(cursor, (list, tuple)):
+        shape.append(len(cursor))
+        if not cursor:
+            break
+        cursor = cursor[0]
+
+    entries: list[tuple[list[int], float]] = []
+
+    def visit(item: Any, path: list[int]) -> None:
+        if isinstance(item, (list, tuple)):
+            for offset, child in enumerate(item):
+                visit(child, [*path, offset])
+            return
+        try:
+            entries.append((path, float(item)))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ContractError(
+                f"relay tensor diagnostic encountered a non-numeric value at {path}"
+            ) from exc
+
+    visit(row, [])
+    finite_entries = [(path, number) for path, number in entries if math.isfinite(number)]
+    nonfinite_entries = [
+        (path, number) for path, number in entries if not math.isfinite(number)
+    ]
+    nan_count = sum(math.isnan(number) for _, number in nonfinite_entries)
+    posinf_count = sum(number == math.inf for _, number in nonfinite_entries)
+    neginf_count = sum(number == -math.inf for _, number in nonfinite_entries)
+
+    latent_steps: list[dict[str, Any]] = []
+    if shape:
+        for latent_step in range(shape[0]):
+            step_values = [
+                number
+                for path, number in entries
+                if path and path[0] == latent_step
+            ]
+            step_finite = [number for number in step_values if math.isfinite(number)]
+            step_nonfinite = len(step_values) - len(step_finite)
+            latent_steps.append(
+                {
+                    "latent_step": latent_step,
+                    "all_finite": step_nonfinite == 0,
+                    "finite_count": len(step_finite),
+                    "nonfinite_count": step_nonfinite,
+                    **_finite_value_summary(step_finite),
+                }
+            )
+
+    return {
+        "shape": shape,
+        "stored_dtype": "python_float",
+        "numel": len(entries),
+        "all_finite": not nonfinite_entries,
+        "finite_count": len(finite_entries),
+        "nonfinite_count": len(nonfinite_entries),
+        "nan_count": nan_count,
+        "posinf_count": posinf_count,
+        "neginf_count": neginf_count,
+        "first_nonfinite_index": (
+            nonfinite_entries[0][0] if nonfinite_entries else None
+        ),
+        "first_nonfinite_latent_step": (
+            nonfinite_entries[0][0][0]
+            if nonfinite_entries and nonfinite_entries[0][0]
+            else None
+        ),
+        "latent_step_stats": latent_steps,
+        **_finite_value_summary([number for _, number in finite_entries]),
+    }
+
+
+def _tensor_row_finiteness(value: Any, sample_index: int) -> dict[str, Any]:
+    """Compute compact, JSON-safe finiteness statistics for one relay row."""
+
+    try:
+        import torch
+    except ModuleNotFoundError:  # Pure scheduling/test environments omit PyTorch.
+        torch = None  # type: ignore[assignment]
+
+    if torch is None or not torch.is_tensor(value):
+        return _plain_tensor_row_finiteness(value, sample_index)
+    if sample_index < 0 or sample_index >= int(value.size(0)):
+        raise ContractError(
+            f"relay tensor does not contain sample index {sample_index}"
+        )
+
+    row = value[sample_index].detach().to(device="cpu").double()
+    finite_mask = torch.isfinite(row)
+    nonfinite_mask = ~finite_mask
+    finite_values = row[finite_mask]
+    nonfinite_locations = torch.nonzero(nonfinite_mask, as_tuple=False)
+
+    def tensor_summary(values: Any) -> dict[str, float | None]:
+        if int(values.numel()) == 0:
+            return _finite_value_summary([])
+        return {
+            "finite_min": _finite_or_none(values.min().item()),
+            "finite_max": _finite_or_none(values.max().item()),
+            "finite_mean": _finite_or_none(values.mean().item()),
+            "finite_abs_max": _finite_or_none(values.abs().max().item()),
+            "finite_l2_norm": _finite_or_none(
+                torch.linalg.vector_norm(values).item()
+            ),
+        }
+
+    latent_steps: list[dict[str, Any]] = []
+    if row.ndim:
+        flattened = row.reshape(int(row.size(0)), -1)
+        for latent_step in range(int(flattened.size(0))):
+            step = flattened[latent_step]
+            step_mask = torch.isfinite(step)
+            step_finite = step[step_mask]
+            step_nonfinite = int((~step_mask).sum().item())
+            latent_steps.append(
+                {
+                    "latent_step": latent_step,
+                    "all_finite": step_nonfinite == 0,
+                    "finite_count": int(step_finite.numel()),
+                    "nonfinite_count": step_nonfinite,
+                    **tensor_summary(step_finite),
+                }
+            )
+
+    first_index = (
+        [int(item) for item in nonfinite_locations[0].tolist()]
+        if int(nonfinite_locations.size(0))
+        else None
+    )
+    return {
+        "shape": [int(item) for item in row.shape],
+        "stored_dtype": str(value.dtype).replace("torch.", ""),
+        "numel": int(row.numel()),
+        "all_finite": not bool(nonfinite_mask.any().item()),
+        "finite_count": int(finite_mask.sum().item()),
+        "nonfinite_count": int(nonfinite_mask.sum().item()),
+        "nan_count": int(torch.isnan(row).sum().item()),
+        "posinf_count": int((torch.isinf(row) & (row > 0)).sum().item()),
+        "neginf_count": int((torch.isinf(row) & (row < 0)).sum().item()),
+        "first_nonfinite_index": first_index,
+        "first_nonfinite_latent_step": (
+            first_index[0] if first_index else None
+        ),
+        "latent_step_stats": latent_steps,
+        **tensor_summary(finite_values),
+    }
+
+
+def _forward_finiteness_diagnostics(
+    trajectory: Any,
+    sample_index: int,
+    *,
+    scorer_numerically_valid: bool,
+) -> dict[str, Any]:
+    """Locate the first observed non-finite sequential forward boundary."""
+
+    transports = getattr(trajectory, "transport_messages", None)
+    receivers = getattr(trajectory, "receiver_reference_messages", None)
+    dtype_metadata = getattr(trajectory, "edge_dtypes", None)
+    if not isinstance(transports, Mapping) or not isinstance(receivers, Mapping):
+        raise ContractError("trajectory relay mappings are missing")
+    if not isinstance(dtype_metadata, Mapping):
+        raise ContractError("trajectory relay dtype metadata is missing")
+
+    def edge_id(value: Any) -> str:
+        return str(getattr(value, "edge_id", value))
+
+    def by_edge_id(mapping: Mapping[Any, Any], *, field: str) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in mapping.items():
+            identifier = edge_id(key)
+            if identifier in result:
+                raise ContractError(f"duplicate {field} relay edge: {identifier}")
+            result[identifier] = value
+        return result
+
+    transport_by_id = by_edge_id(transports, field="transport")
+    receiver_by_id = by_edge_id(receivers, field="receiver")
+    dtype_by_id = by_edge_id(dtype_metadata, field="dtype")
+    if set(transport_by_id) != set(receiver_by_id) or set(transport_by_id) != set(
+        dtype_by_id
+    ):
+        raise ContractError("trajectory relay diagnostics found inconsistent edge sets")
+
+    site_order = {"p2c": 0, "c2s": 1, "s2p": 2}
+
+    def chronological(identifier: str) -> tuple[int, int]:
+        try:
+            site, raw_round = identifier.split("@", 1)
+            return int(raw_round), site_order[site]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ContractError(f"invalid trajectory relay edge ID: {identifier}") from exc
+
+    ordered_edges = sorted(transport_by_id, key=chronological)
+    edge_diagnostics: dict[str, Any] = {}
+    first_nonfinite: dict[str, Any] | None = None
+    all_relays_finite = True
+    role_by_site = {
+        "p2c": ("planner", "critic"),
+        "c2s": ("critic", "solver"),
+        "s2p": ("solver", "planner"),
+    }
+    action_by_site = {
+        "c2s": "critic",
+        "s2p": "solver_feedback",
+    }
+
+    for identifier in ordered_edges:
+        round_idx, _ = chronological(identifier)
+        site = identifier.split("@", 1)[0]
+        source_role, consumer_role = role_by_site[site]
+        action = (
+            "planner_initial"
+            if site == "p2c" and round_idx == 0
+            else "planner_feedback"
+            if site == "p2c"
+            else action_by_site[site]
+        )
+        transport_stats = _tensor_row_finiteness(
+            transport_by_id[identifier], sample_index
+        )
+        receiver_stats = _tensor_row_finiteness(
+            receiver_by_id[identifier], sample_index
+        )
+        metadata = dtype_by_id[identifier]
+        transport_dtype = (
+            metadata.get("transport_dtype")
+            if isinstance(metadata, Mapping)
+            else getattr(metadata, "transport_dtype", None)
+        )
+        consumer_dtype = (
+            metadata.get("consumer_dtype")
+            if isinstance(metadata, Mapping)
+            else getattr(metadata, "consumer_dtype", None)
+        )
+        edge_diagnostics[identifier] = {
+            "action": action,
+            "source_role": source_role,
+            "consumer_role": consumer_role,
+            "declared_transport_dtype": str(transport_dtype),
+            "declared_consumer_dtype": str(consumer_dtype),
+            "transport": transport_stats,
+            "receiver": receiver_stats,
+        }
+        for interface, stats in (
+            ("transport", transport_stats),
+            ("receiver", receiver_stats),
+        ):
+            if not stats["all_finite"]:
+                all_relays_finite = False
+                if first_nonfinite is None:
+                    first_nonfinite = {
+                        "stage": action,
+                        "edge_id": identifier,
+                        "source_role": source_role,
+                        "consumer_role": consumer_role,
+                        "interface": interface,
+                        "first_nonfinite_index": stats[
+                            "first_nonfinite_index"
+                        ],
+                        "first_nonfinite_latent_step": stats[
+                            "first_nonfinite_latent_step"
+                        ],
+                    }
+
+    terminal_edge = f"c2s@{int(trajectory.rounds) - 1}"
+    if first_nonfinite is None and not scorer_numerically_valid:
+        first_nonfinite = {
+            "stage": "terminal_solver_scoring",
+            "edge_id": terminal_edge,
+            "source_role": "solver",
+            "consumer_role": None,
+            "interface": "forced_choice_scores",
+            "first_nonfinite_index": None,
+            "first_nonfinite_latent_step": None,
+        }
+
+    return {
+        "schema_version": "linkradius.forward_finiteness.v1",
+        "all_relay_interfaces_finite": all_relays_finite,
+        "scorer_numerically_valid": bool(scorer_numerically_valid),
+        "all_observed_numeric_outputs_finite": bool(
+            all_relays_finite and scorer_numerically_valid
+        ),
+        "terminal_input_edge": terminal_edge,
+        "first_nonfinite": first_nonfinite,
+        "edges": edge_diagnostics,
+    }
+
+
 def _trajectory_rows(
     trajectory: Any,
     *,
@@ -1331,13 +1670,29 @@ def _trajectory_rows(
             label: public_number(value, field=f"margins.{label}")
             for label, value in trajectory.clean_margins[index].items()
         }
-        if nonfinite_fields and not screening_stage:
+        scorer_numerically_valid = not nonfinite_fields
+        forward_finiteness = _forward_finiteness_diagnostics(
+            trajectory,
+            index,
+            scorer_numerically_valid=scorer_numerically_valid,
+        )
+        if (
+            nonfinite_fields
+            or not forward_finiteness["all_relay_interfaces_finite"]
+        ) and not screening_stage:
+            first = forward_finiteness.get("first_nonfinite")
+            first_text = (
+                f"; first observed at {first.get('stage')} "
+                f"{first.get('edge_id')} {first.get('interface')}"
+                if isinstance(first, Mapping)
+                else ""
+            )
             raise ContractError(
                 f"{task.get('stage')} trajectory row {trajectory.raw_sample_ids[index]} "
-                "contains non-finite scorer values: "
-                + ", ".join(nonfinite_fields)
+                "contains non-finite forward values: "
+                + (", ".join(nonfinite_fields) or "relay tensor")
+                + first_text
             )
-        scorer_numerically_valid = not nonfinite_fields
         gold = trajectory.gold_labels[index]
         prediction = (
             trajectory.clean_scoring.predictions[index]
@@ -1373,6 +1728,7 @@ def _trajectory_rows(
                 "scorer_correct": bool(scorer_numerically_valid and prediction == gold),
                 "scorer_numerically_valid": scorer_numerically_valid,
                 "scorer_nonfinite_fields": sorted(nonfinite_fields),
+                "forward_finiteness": forward_finiteness,
                 "option_scores": option_scores,
                 "summed_option_logprobs": summed_scores,
                 "mean_option_logprobs": mean_scores,

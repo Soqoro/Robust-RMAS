@@ -114,7 +114,17 @@ Discovery/screening treats a non-finite scorer output as an auditable invalid
 row rather than a serialization failure: the affected public numeric fields
 are `null`, `scorer_nonfinite_fields` names the exact failures, and the row is
 excluded as `scorer_nonfinite`. This tolerance is screening-only. A non-finite
-score in an authenticated clean/frozen capture remains a hard error.
+score or relay in an authenticated clean/frozen capture remains a hard error.
+
+Every fresh screening row also publishes `forward_finiteness`. Its `edges`
+mapping follows execution chronology (`p2c@0,c2s@0,s2p@0,...`) and separately
+summarizes the source-side `transport` and destination-side `receiver` tensor.
+Diagnostics include finite/NaN/+Inf/-Inf counts, the first bad coordinate and
+latent step, and JSON-safe magnitude statistics for every latent step. The
+top-level `first_nonfinite` therefore distinguishes a source-agent failure, a
+consumer cast/transfer failure, and a terminal-only forced-choice failure.
+These statistics detach and inspect stored clean relays; they do not alter the
+forward computation or make a non-finite row eligible.
 
 Validation writes:
 

@@ -39,6 +39,12 @@ def classify_screening_row(row: Mapping[str, Any]) -> tuple[bool, str]:
     generated = None if generated is None else str(generated).strip().upper()
     if gold not in {"A", "B", "C", "D"}:
         return False, "invalid_gold"
+    forward_finiteness = row.get("forward_finiteness")
+    if (
+        isinstance(forward_finiteness, Mapping)
+        and forward_finiteness.get("all_relay_interfaces_finite") is False
+    ):
+        return False, "relay_nonfinite"
     if bool(row.get("answer_conflict", False)):
         return False, "generated_answer_conflict"
     if generated not in {"A", "B", "C", "D"} or bool(row.get("answer_invalid", False)):

@@ -1,6 +1,6 @@
 # LinkRadius experiment handoff
 
-Last updated: 2026-08-18 (Asia/Singapore)
+Last updated: 2026-08-19 (Asia/Singapore)
 
 ## How to use this file
 
@@ -36,7 +36,7 @@ relabelled as a pass. Do not resume its causal, probe, attack, or pilot stages.
 The next run is a separate exploratory stronger-model condition:
 
 ```text
-OUT_ROOT=outputs/linkradius-scaled-mp-membounded-v2
+OUT_ROOT=outputs/linkradius-scaled-mp-membounded-v3
 STYLE=sequential_scaled
 METHOD=ours_recursive
 DATASETS=gpqa
@@ -85,7 +85,7 @@ releases that solver branch, then backpropagates the target component through
 the retained downstream replay graph. Engineering PGD uses the same bounded
 path. Ordinary clean/replay/finite-difference/final-PGD scoring remains the
 unchanged four-way A/B/C/D scorer. This source revision requires a completely
-fresh root: `outputs/linkradius-scaled-mp-membounded-v2`.
+fresh root.
 
 The first fallback-kernel discovery retry under `membounded-v1` exposed a
 separate screening-publication bug: non-finite scorer values were recognized
@@ -96,10 +96,28 @@ Authenticated clean/frozen captures continue to reject any non-finite scorer
 value rather than accepting or imputing it. Do not resume `membounded-v1`;
 the screening fix changes the source hash.
 
-Local verification after the latest change: 155 LinkRadius tests passed with 56
-PyTorch-dependent skips, Python compilation passed, and `git diff --check`
-passed. The real PyTorch tests and GPU workflow still require cluster
-verification before the memory fix can be considered validated.
+The complete `outputs/linkradius-scaled-mp-membounded-v2` discovery grid then
+produced non-finite forced-choice scores and invalid generation on all 20 rows
+under fallback kernels on `node04`. A forced task-0 rerun with
+`REUSE_COMPLETE=0 OVERWRITE=1` reproduced the failure on `PA100q/node02`
+(`CUDA_VISIBLE_DEVICES=1,2,3`). The known-good `scaled-mp-v1` trajectory and
+the current resolver have identical model and adapter hashes, including every
+snapshot revision and adapter blob. This rules out FLA, one bad node, model
+parallelism by itself, and checkpoint drift; do not freeze or resume v2.
+
+Fresh screening rows now contain `forward_finiteness`, which inspects each
+chronological relay's source-side transport and destination-side receiver
+without changing the forward pass. It records NaN/Inf counts, the first bad
+coordinate/latent step, and per-latent-step magnitude statistics. This source
+change requires `outputs/linkradius-scaled-mp-membounded-v3`. Initially run
+only split plus discovery task 0 on `PA100q/node02`; inspect the first observed
+non-finite boundary before submitting tasks 1--19.
+
+Local verification after the latest change: 158 LinkRadius tests passed with 57
+PyTorch-dependent skips, Python compilation and all seven launcher syntax
+checks passed, the canonical discovery grid remained 20 tasks, and
+`git diff --check` passed. The real PyTorch diagnostic test and GPU workflow
+still require cluster verification.
 
 The previous gradient submission was:
 
@@ -121,11 +139,11 @@ The code supports source-hashed three-GPU role placement. The planner,
 critic, and solver can use logical `cuda:0`, `cuda:1`, and `cuda:2`; learned
 outer adapters remain on their source role and relays cross devices without
 detaching autograd. Start the complete engineering workflow again under
-`outputs/linkradius-scaled-mp-membounded-v2`. Export these values for every command,
+`outputs/linkradius-scaled-mp-membounded-v3`. Export these values for every command,
 including CPU freeze and validation commands:
 
 ```bash
-export OUT_ROOT="$PWD/outputs/linkradius-scaled-mp-membounded-v2"
+export OUT_ROOT="$PWD/outputs/linkradius-scaled-mp-membounded-v3"
 export STYLE=sequential_scaled
 export LATENT_LENGTH=48
 export DEVICE=cuda:0
@@ -154,7 +172,7 @@ import torch
 from experiments.linkradius.io_utils import source_hash, verify_completion
 
 repo = Path.cwd().resolve()
-root = repo / "outputs/linkradius-scaled-mp-membounded-v2/engineering/gpqa/R2/validation/clean"
+root = repo / "outputs/linkradius-scaled-mp-membounded-v3/engineering/gpqa/R2/validation/clean"
 current_source = source_hash(repo)
 candidates = []
 
@@ -188,7 +206,7 @@ Copy the two printed `export` lines into the shell, then run the release path on
 a GPU. The scaled style and latent length are mandatory:
 
 ```bash
-export OUT_ROOT="$PWD/outputs/linkradius-scaled-mp-membounded-v2"
+export OUT_ROOT="$PWD/outputs/linkradius-scaled-mp-membounded-v3"
 export LEGACY_RESULTS="$OUT_ROOT/legacy_release.jsonl"
 export LEGACY_TRACE="$OUT_ROOT/legacy_release_trace.pt"
 
@@ -214,20 +232,20 @@ python -m experiments.linkradius.compare_legacy_equivalence \
 If the comparator reports `"passed": true`, validate Phase 1:
 
 ```bash
-OUT_ROOT="$PWD/outputs/linkradius-scaled-mp-membounded-v2" \
+OUT_ROOT="$PWD/outputs/linkradius-scaled-mp-membounded-v3" \
 STYLE=sequential_scaled \
 LATENT_LENGTH=48 \
 PLANNER_DEVICE=cuda:0 \
 CRITIC_DEVICE=cuda:1 \
 SOLVER_DEVICE=cuda:2 \
-LEGACY_EQUIVALENCE="$PWD/outputs/linkradius-scaled-mp-membounded-v2/legacy_equivalence.json" \
+LEGACY_EQUIVALENCE="$PWD/outputs/linkradius-scaled-mp-membounded-v3/legacy_equivalence.json" \
 OVERWRITE=1 \
 LR_STAGE=validate \
 bash experiments/linkradius/run_linkradius_engineering.sh
 ```
 
 Do not start scaled Phase 2 unless this produces a passed
-`outputs/linkradius-scaled-mp-membounded-v2/engineering_gate.json`.
+`outputs/linkradius-scaled-mp-membounded-v3/engineering_gate.json`.
 
 ## Source and artifact rules
 
@@ -239,7 +257,7 @@ Do not start scaled Phase 2 unless this produces a passed
   makes earlier gates stale. Scheduler choices belong on the `sbatch` command
   line, not inside `.sh` files.
 - Do not mix artifacts from `linkradius-v3`, `linkradius-scaled-v1`, and
-  `linkradius-scaled-mp-membounded-v2`.
+  `linkradius-scaled-mp-membounded-v3`.
 - Do not reuse discovery output as the clean reference trajectory.
 - Do not continue after a failed engineering or smoke gate.
 - The strict parser should report `STRICT_CHOICE_VERSION=linkradius_choice_v2`.

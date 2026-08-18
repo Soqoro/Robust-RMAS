@@ -6,12 +6,26 @@ from experiments.linkradius.run_linkradius import _trajectory_rows
 from experiments.linkradius.schemas import ContractError
 from experiments.linkradius.select_clean_correct import annotate_screening_rows
 
+try:
+    import torch
+except ModuleNotFoundError:
+    torch = None
+
 
 class ScreeningNonfiniteTests(unittest.TestCase):
     @staticmethod
+    def relay_tensor(offset=0.0):
+        return [[
+            [1.0 + offset, 2.0 + offset],
+            [3.0 + offset, 4.0 + offset],
+        ]]
+
+    @staticmethod
     def trajectory():
         labels = ("A", "B", "C", "D")
+        edges = ("p2c@0", "c2s@0", "s2p@0", "p2c@1", "c2s@1")
         return SimpleNamespace(
+            rounds=2,
             sample_ids=["sample-0"],
             raw_sample_ids=["raw-0"],
             raw_indices=[0],
@@ -39,6 +53,21 @@ class ScreeningNonfiniteTests(unittest.TestCase):
             execution_manifest_hash="execution-hash",
             ordered_cohort_hash="cohort-hash",
             batch_boundary_hash="boundary-hash",
+            transport_messages={
+                edge: ScreeningNonfiniteTests.relay_tensor(index * 10.0)
+                for index, edge in enumerate(edges)
+            },
+            receiver_reference_messages={
+                edge: ScreeningNonfiniteTests.relay_tensor(index * 10.0)
+                for index, edge in enumerate(edges)
+            },
+            edge_dtypes={
+                edge: SimpleNamespace(
+                    transport_dtype="float32",
+                    consumer_dtype="bfloat16",
+                )
+                for edge in edges
+            },
         )
 
     @staticmethod
@@ -66,6 +95,17 @@ class ScreeningNonfiniteTests(unittest.TestCase):
         self.assertIsNone(row["minimum_margin"])
         self.assertIsNone(row["binding_competitor"])
         self.assertIn("option_scores.A", row["scorer_nonfinite_fields"])
+        diagnostics = row["forward_finiteness"]
+        self.assertTrue(diagnostics["all_relay_interfaces_finite"])
+        self.assertFalse(diagnostics["all_observed_numeric_outputs_finite"])
+        self.assertEqual(
+            diagnostics["first_nonfinite"]["stage"],
+            "terminal_solver_scoring",
+        )
+        self.assertEqual(
+            list(diagnostics["edges"]),
+            ["p2c@0", "c2s@0", "s2p@0", "p2c@1", "c2s@1"],
+        )
         canonical_json_bytes(rows)
 
         annotated, summary = annotate_screening_rows(rows)
@@ -77,12 +117,81 @@ class ScreeningNonfiniteTests(unittest.TestCase):
     def test_authenticated_clean_capture_still_rejects_nonfinite_scores(self):
         with self.assertRaisesRegex(
             ContractError,
-            "clean trajectory row raw-0 contains non-finite scorer values",
+            "clean trajectory row raw-0 contains non-finite forward values",
         ):
             _trajectory_rows(
                 self.trajectory(),
                 task=self.task("clean"),
             )
+
+    def test_first_nonfinite_relay_stage_and_latent_step_are_explicit(self):
+        trajectory = self.trajectory()
+        trajectory.transport_messages["s2p@0"][0][1][1] = float("inf")
+        trajectory.receiver_reference_messages["s2p@0"][0][1][1] = float(
+            "inf"
+        )
+
+        row = _trajectory_rows(
+            trajectory,
+            task=self.task("discover"),
+        )[0]
+        diagnostics = row["forward_finiteness"]
+        first = diagnostics["first_nonfinite"]
+        self.assertFalse(diagnostics["all_relay_interfaces_finite"])
+        self.assertEqual(first["stage"], "solver_feedback")
+        self.assertEqual(first["edge_id"], "s2p@0")
+        self.assertEqual(first["interface"], "transport")
+        self.assertEqual(first["first_nonfinite_index"], [1, 1])
+        self.assertEqual(first["first_nonfinite_latent_step"], 1)
+
+        transport = diagnostics["edges"]["s2p@0"]["transport"]
+        self.assertEqual(transport["nonfinite_count"], 1)
+        self.assertEqual(transport["posinf_count"], 1)
+        self.assertEqual(transport["nan_count"], 0)
+        self.assertTrue(transport["latent_step_stats"][0]["all_finite"])
+        self.assertFalse(transport["latent_step_stats"][1]["all_finite"])
+        canonical_json_bytes(row)
+
+        annotated, summary = annotate_screening_rows([row])
+        self.assertEqual(annotated[0]["exclusion_reason"], "relay_nonfinite")
+        self.assertEqual(summary["exclusion_counts"], {"relay_nonfinite": 1})
+
+    def test_receiver_cast_boundary_is_distinguished_from_transport(self):
+        trajectory = self.trajectory()
+        trajectory.receiver_reference_messages["c2s@0"][0][0][0] = float("nan")
+
+        row = _trajectory_rows(
+            trajectory,
+            task=self.task("discover"),
+        )[0]
+        first = row["forward_finiteness"]["first_nonfinite"]
+        self.assertEqual(first["stage"], "critic")
+        self.assertEqual(first["edge_id"], "c2s@0")
+        self.assertEqual(first["interface"], "receiver")
+        receiver = row["forward_finiteness"]["edges"]["c2s@0"]["receiver"]
+        self.assertEqual(receiver["nan_count"], 1)
+        self.assertEqual(receiver["first_nonfinite_index"], [0, 0])
+
+    @unittest.skipIf(torch is None, "PyTorch is not installed")
+    def test_real_tensor_diagnostics_are_json_safe(self):
+        trajectory = self.trajectory()
+        for edge, values in tuple(trajectory.transport_messages.items()):
+            trajectory.transport_messages[edge] = torch.tensor(values)
+        for edge, values in tuple(
+            trajectory.receiver_reference_messages.items()
+        ):
+            trajectory.receiver_reference_messages[edge] = torch.tensor(values)
+        trajectory.transport_messages["p2c@1"][0, 0, 1] = float("-inf")
+
+        row = _trajectory_rows(
+            trajectory,
+            task=self.task("discover"),
+        )[0]
+        stats = row["forward_finiteness"]["edges"]["p2c@1"]["transport"]
+        self.assertEqual(stats["stored_dtype"], "float32")
+        self.assertEqual(stats["neginf_count"], 1)
+        self.assertEqual(stats["first_nonfinite_index"], [0, 1])
+        canonical_json_bytes(row)
 
 
 if __name__ == "__main__":
