@@ -110,6 +110,12 @@ canonical Python grid used for task selection. `LR_STAGE=all` is a local,
 sequential convenience for this small workflow; it never submits jobs and is
 not a substitute for inspecting the real GPU checks.
 
+Discovery/screening treats a non-finite scorer output as an auditable invalid
+row rather than a serialization failure: the affected public numeric fields
+are `null`, `scorer_nonfinite_fields` names the exact failures, and the row is
+excluded as `scorer_nonfinite`. This tolerance is screening-only. A non-finite
+score in an authenticated clean/frozen capture remains a hard error.
+
 Validation writes:
 
 ```text

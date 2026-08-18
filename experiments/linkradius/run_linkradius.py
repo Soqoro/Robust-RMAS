@@ -1296,16 +1296,61 @@ def _trajectory_rows(
         else None
     )
     rows = []
+    screening_stage = str(task.get("stage")) in {"discover", "screen", "screen_clean"}
     for index, sample_id in enumerate(trajectory.sample_ids):
         generation = trajectory.clean_generation_audit[index] if trajectory.clean_generation_audit else {}
-        option_scores = {label: float(scores[index][pos]) for pos, label in enumerate(labels)}
-        margins = {label: float(value) for label, value in trajectory.clean_margins[index].items()}
+
+        nonfinite_fields: list[str] = []
+
+        def public_number(value: Any, *, field: str) -> float | None:
+            number = float(value)
+            if math.isfinite(number):
+                return number
+            nonfinite_fields.append(field)
+            return None
+
+        option_scores = {
+            label: public_number(scores[index][pos], field=f"option_scores.{label}")
+            for pos, label in enumerate(labels)
+        }
+        summed_scores = {
+            label: public_number(
+                summed_logprobs[index][pos],
+                field=f"summed_option_logprobs.{label}",
+            )
+            for pos, label in enumerate(labels)
+        }
+        mean_scores = {
+            label: public_number(
+                mean_logprobs[index][pos],
+                field=f"mean_option_logprobs.{label}",
+            )
+            for pos, label in enumerate(labels)
+        }
+        margins = {
+            label: public_number(value, field=f"margins.{label}")
+            for label, value in trajectory.clean_margins[index].items()
+        }
+        if nonfinite_fields and not screening_stage:
+            raise ContractError(
+                f"{task.get('stage')} trajectory row {trajectory.raw_sample_ids[index]} "
+                "contains non-finite scorer values: "
+                + ", ".join(nonfinite_fields)
+            )
+        scorer_numerically_valid = not nonfinite_fields
         gold = trajectory.gold_labels[index]
-        prediction = trajectory.clean_scoring.predictions[index]
+        prediction = (
+            trajectory.clean_scoring.predictions[index]
+            if scorer_numerically_valid
+            else None
+        )
         strict_choice = generation.get("strict_choice")
         strict_valid = bool(strict_choice in {"A", "B", "C", "D"}) and not bool(
             generation.get("answer_invalid", False)
         )
+        finite_margins = {
+            label: value for label, value in margins.items() if value is not None
+        }
         rows.append(
             {
                 "schema_version": "linkradius.v1",
@@ -1320,25 +1365,33 @@ def _trajectory_rows(
                 "answer_invalid": generation.get("answer_invalid", not bool(generation)),
                 "answer_conflict": generation.get("answer_conflict", False),
                 "scorer_prediction": prediction,
-                "score_tie": bool(trajectory.clean_scoring.score_ties[index]),
-                "scorer_correct": prediction == gold,
+                "score_tie": (
+                    bool(trajectory.clean_scoring.score_ties[index])
+                    if scorer_numerically_valid
+                    else False
+                ),
+                "scorer_correct": bool(scorer_numerically_valid and prediction == gold),
+                "scorer_numerically_valid": scorer_numerically_valid,
+                "scorer_nonfinite_fields": sorted(nonfinite_fields),
                 "option_scores": option_scores,
-                "summed_option_logprobs": {
-                    label: float(summed_logprobs[index][pos])
-                    for pos, label in enumerate(labels)
-                },
-                "mean_option_logprobs": {
-                    label: float(mean_logprobs[index][pos])
-                    for pos, label in enumerate(labels)
-                },
+                "summed_option_logprobs": summed_scores,
+                "mean_option_logprobs": mean_scores,
                 "option_token_counts": {
                     label: int(token_counts[index][pos])
                     for pos, label in enumerate(labels)
                 },
                 "scorer_metadata": scorer_metadata,
                 "margins": margins,
-                "minimum_margin": min(margins.values()),
-                "binding_competitor": min(margins, key=margins.get),
+                "minimum_margin": (
+                    min(finite_margins.values())
+                    if scorer_numerically_valid
+                    else None
+                ),
+                "binding_competitor": (
+                    min(finite_margins, key=finite_margins.get)
+                    if scorer_numerically_valid
+                    else None
+                ),
                 "analysis_eligible": bool(trajectory.analysis_eligibility_mask[index]),
                 "exclusion_reason": (
                     str(exclusion_reasons[index])

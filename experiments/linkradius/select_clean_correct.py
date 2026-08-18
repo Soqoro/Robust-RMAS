@@ -20,7 +20,12 @@ def _prediction(row: Mapping[str, Any]) -> str | None:
         scores = row.get("option_scores")
         if not isinstance(scores, Mapping) or set(scores) != {"A", "B", "C", "D"}:
             return None
-        numeric = {label: float(score) for label, score in scores.items()}
+        try:
+            numeric = {label: float(score) for label, score in scores.items()}
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(score) for score in numeric.values()):
+            return None
         maximum = max(numeric.values())
         winners = [label for label, score in numeric.items() if score == maximum]
         return winners[0] if len(winners) == 1 else None
@@ -42,6 +47,10 @@ def classify_screening_row(row: Mapping[str, Any]) -> tuple[bool, str]:
         return False, "generated_incorrect"
     if bool(row.get("score_tie", False)):
         return False, "score_tie"
+    if row.get("scorer_numerically_valid") is False or row.get(
+        "scorer_nonfinite_fields"
+    ):
+        return False, "scorer_nonfinite"
     scored = _prediction(row)
     if scored is None:
         return False, "scorer_prediction_invalid"
