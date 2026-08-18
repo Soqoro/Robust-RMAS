@@ -393,6 +393,9 @@ def _task_manifest(args: argparse.Namespace, task: Mapping[str, Any], repo_root:
         "batch_size": args.batch_size,
         "latent_length": args.latent_length,
         "role_devices": _resolved_role_devices(args),
+        "relay_transfer_mode": str(
+            getattr(args, "relay_transfer_mode", "cpu_staged")
+        ),
         # Scheduler placement is diagnostic rather than scientific identity:
         # logical role devices are hashed above, while physical allocation may
         # change safely between otherwise identical jobs.
@@ -576,6 +579,9 @@ def _runner_config_digest(
             "round_label_mode": args.round_label_mode,
             "device": args.device,
             "role_devices": _resolved_role_devices(args),
+            "relay_transfer_mode": str(
+                getattr(args, "relay_transfer_mode", "cpu_staged")
+            ),
             "explicit_trajectory": _configured_artifact_identity(args.trajectory),
         }
     if stage in {"replay", "causal"}:
@@ -1258,6 +1264,7 @@ def _runtime(args: argparse.Namespace, *, requested_edge: str | None = None):
         planner_device=role_devices["planner"],
         critic_device=role_devices["critic"],
         solver_device=role_devices["solver"],
+        relay_transfer_mode=args.relay_transfer_mode,
         dtype="auto",
         outer_dtype="auto",
         enable_thinking=False,
@@ -1547,15 +1554,18 @@ def _forward_finiteness_diagnostics(
             receiver_by_id[identifier], sample_index
         )
         metadata = dtype_by_id[identifier]
-        transport_dtype = (
-            metadata.get("transport_dtype")
-            if isinstance(metadata, Mapping)
-            else getattr(metadata, "transport_dtype", None)
+        def metadata_value(field: str, default: Any = None) -> Any:
+            if isinstance(metadata, Mapping):
+                return metadata.get(field, default)
+            return getattr(metadata, field, default)
+
+        transport_dtype = metadata_value("transport_dtype")
+        consumer_dtype = metadata_value("consumer_dtype")
+        requested_transfer_mode = metadata_value(
+            "requested_transfer_mode", "direct"
         )
-        consumer_dtype = (
-            metadata.get("consumer_dtype")
-            if isinstance(metadata, Mapping)
-            else getattr(metadata, "consumer_dtype", None)
+        realized_transfer_mode = metadata_value(
+            "realized_transfer_mode", "direct"
         )
         edge_diagnostics[identifier] = {
             "action": action,
@@ -1563,6 +1573,8 @@ def _forward_finiteness_diagnostics(
             "consumer_role": consumer_role,
             "declared_transport_dtype": str(transport_dtype),
             "declared_consumer_dtype": str(consumer_dtype),
+            "requested_transfer_mode": str(requested_transfer_mode),
+            "realized_transfer_mode": str(realized_transfer_mode),
             "transport": transport_stats,
             "receiver": receiver_stats,
         }
@@ -1600,7 +1612,7 @@ def _forward_finiteness_diagnostics(
         }
 
     return {
-        "schema_version": "linkradius.forward_finiteness.v1",
+        "schema_version": "linkradius.forward_finiteness.v2",
         "all_relay_interfaces_finite": all_relays_finite,
         "scorer_numerically_valid": bool(scorer_numerically_valid),
         "all_observed_numeric_outputs_finite": bool(
@@ -5287,6 +5299,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--planner-device", default="")
     parser.add_argument("--critic-device", default="")
     parser.add_argument("--solver-device", default="")
+    parser.add_argument(
+        "--relay-transfer-mode",
+        choices=("direct", "cpu_staged"),
+        default="cpu_staged",
+        help=(
+            "relay copy path: cpu_staged uses differentiable GPU->CPU float32->GPU "
+            "copies for distinct CUDA role devices"
+        ),
+    )
     parser.add_argument("--trust-remote-code", type=int, choices=(0, 1), default=1)
     parser.add_argument("--round-label-mode", choices=("legacy", "actual"), default="legacy")
     parser.add_argument("--out-root", default="outputs/linkradius")

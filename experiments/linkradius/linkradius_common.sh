@@ -28,6 +28,7 @@ DEVICE="${DEVICE:-cuda:0}"
 PLANNER_DEVICE="${PLANNER_DEVICE:-}"
 CRITIC_DEVICE="${CRITIC_DEVICE:-}"
 SOLVER_DEVICE="${SOLVER_DEVICE:-}"
+RELAY_TRANSFER_MODE="${RELAY_TRANSFER_MODE:-cpu_staged}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 PROBE_RADII="${PROBE_RADII:-1e-3 3e-3}"
 PROBE_SEEDS="${PROBE_SEEDS:-101 202}"
@@ -97,6 +98,13 @@ lr_validate_bool() {
   case "$2" in
     0|1) ;;
     *) lr_die "$1 must be 0 or 1, got: $2" ;;
+  esac
+}
+
+lr_validate_relay_transfer_mode() {
+  case "$RELAY_TRANSFER_MODE" in
+    direct|cpu_staged) ;;
+    *) lr_die "RELAY_TRANSFER_MODE must be direct or cpu_staged, got: $RELAY_TRANSFER_MODE" ;;
   esac
 }
 
@@ -192,6 +200,7 @@ lr_build_command() {
     --planner-device "$PLANNER_DEVICE"
     --critic-device "$CRITIC_DEVICE"
     --solver-device "$SOLVER_DEVICE"
+    --relay-transfer-mode "$RELAY_TRANSFER_MODE"
     --engineering-gate "$ENGINEERING_GATE"
     --smoke-gate "$SMOKE_GATE"
     --probe-gate "$PROBE_GATE"
@@ -242,6 +251,7 @@ lr_run_entrypoint() {
   lr_validate_positive "K" "$K" || return
   lr_validate_bool "REUSE_COMPLETE" "$REUSE_COMPLETE" || return
   lr_validate_bool "OVERWRITE" "$OVERWRITE" || return
+  lr_validate_relay_transfer_mode || return
   lr_validate_gpu_configuration || return
 
   lr_build_command "$workflow" "$stage" "$task_id"

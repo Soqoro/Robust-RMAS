@@ -65,6 +65,8 @@ class ScreeningNonfiniteTests(unittest.TestCase):
                 edge: SimpleNamespace(
                     transport_dtype="float32",
                     consumer_dtype="bfloat16",
+                    requested_transfer_mode="cpu_staged",
+                    realized_transfer_mode="cpu_float32_staged_cross_device",
                 )
                 for edge in edges
             },
@@ -105,6 +107,14 @@ class ScreeningNonfiniteTests(unittest.TestCase):
         self.assertEqual(
             list(diagnostics["edges"]),
             ["p2c@0", "c2s@0", "s2p@0", "p2c@1", "c2s@1"],
+        )
+        self.assertEqual(
+            diagnostics["edges"]["p2c@0"]["requested_transfer_mode"],
+            "cpu_staged",
+        )
+        self.assertEqual(
+            diagnostics["edges"]["p2c@0"]["realized_transfer_mode"],
+            "cpu_float32_staged_cross_device",
         )
         canonical_json_bytes(rows)
 

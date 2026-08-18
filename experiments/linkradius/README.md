@@ -34,8 +34,9 @@ mkdir -p logs
 
 Important environment variables are `PYTHON_BIN`, `LINKRADIUS_REPO_ROOT`, `STYLE`, `METHOD`,
 `DATASETS`, `ROUNDS`, `SEEDS`, `BATCH_SIZE`, `LATENT_LENGTH`, `OUT_ROOT`,
-`GPU_LIST`, `PLANNER_DEVICE`, `CRITIC_DEVICE`, `SOLVER_DEVICE`, `PROBE_RADII`,
-`PROBE_SEEDS`, `K`, and `SUBSPACE`. `GPU_LIST` is a whitespace-separated
+`GPU_LIST`, `PLANNER_DEVICE`, `CRITIC_DEVICE`, `SOLVER_DEVICE`,
+`RELAY_TRANSFER_MODE`, `PROBE_RADII`, `PROBE_SEEDS`, `K`, and `SUBSPACE`.
+`GPU_LIST` is a whitespace-separated
 physical-device list for round-robin, one-GPU-per-array-task execution. If it
 is empty, scheduler-provided `CUDA_VISIBLE_DEVICES` is preserved; inside a
 masked job the runtime uses logical CUDA indices.
@@ -49,13 +50,16 @@ logical devices. For example:
 export PLANNER_DEVICE=cuda:0
 export CRITIC_DEVICE=cuda:1
 export SOLVER_DEVICE=cuda:2
+export RELAY_TRANSFER_MODE=cpu_staged
 unset GPU_LIST
 ```
 
 This places the planner, critic, and solver (plus each role's inner adapter) on
-three devices. Each outer adapter stays on its source role's device, and its
-relay is copied directly to the consumer device without detaching the autograd
-graph. The CUDA indices are logical indices within the scheduler's
+three devices. Each outer adapter stays on its source role's device. By default,
+a relay crossing two CUDA devices is copied source GPU -> CPU float32 ->
+destination GPU consumer dtype, using differentiable tensor copies without a
+detach. A same-device relay remains a direct cast/copy. The CUDA indices are
+logical indices within the scheduler's
 `CUDA_VISIBLE_DEVICES`, not necessarily physical GPU ordinals.
 
 Run one process in one Slurm task and request three GPUs, for example with
@@ -66,10 +70,13 @@ gradient array with `--array=0-1%1` so only one three-GPU element runs at once.
 
 The resolved role topology is authenticated experiment configuration. Export
 the same `STYLE`, `LATENT_LENGTH`, `PLANNER_DEVICE`, `CRITIC_DEVICE`, and
-`SOLVER_DEVICE` values for every command in a fresh workflow, including CPU
-freeze/validation/aggregation commands that reconstruct upstream task keys.
+`SOLVER_DEVICE` values, plus the same `RELAY_TRANSFER_MODE`, for every command
+in a fresh workflow, including CPU freeze/validation/aggregation commands that
+reconstruct upstream task keys. `cpu_staged` is the supported default;
+`direct` is retained for controlled diagnostics and has a distinct task hash.
 Changing only the physical node is safe when the same three logical devices
-remain available. Changing the logical role map requires a new output root.
+remain available. Changing the logical role map or transfer mode requires a
+new output root.
 
 Differentiable gradient and PGD objectives use the exact frozen
 `gold_score - target_score` margin but evaluate and backpropagate the gold and
@@ -120,7 +127,8 @@ Every fresh screening row also publishes `forward_finiteness`. Its `edges`
 mapping follows execution chronology (`p2c@0,c2s@0,s2p@0,...`) and separately
 summarizes the source-side `transport` and destination-side `receiver` tensor.
 Diagnostics include finite/NaN/+Inf/-Inf counts, the first bad coordinate and
-latent step, and JSON-safe magnitude statistics for every latent step. The
+latent step, the requested and realized relay-transfer modes, and JSON-safe
+magnitude statistics for every latent step. The
 top-level `first_nonfinite` therefore distinguishes a source-agent failure, a
 consumer cast/transfer failure, and a terminal-only forced-choice failure.
 These statistics detach and inspect stored clean relays; they do not alter the

@@ -50,6 +50,20 @@ class RoleDeviceConfigTests(unittest.TestCase):
             "solver": "cuda:9",
         })
 
+    def test_relay_transfer_mode_is_canonical_and_validated(self) -> None:
+        self.assertEqual(
+            RuntimeConfig(device="cpu").relay_transfer_mode,
+            "cpu_staged",
+        )
+        self.assertEqual(
+            RuntimeConfig(
+                device="cpu", relay_transfer_mode=" DIRECT "
+            ).relay_transfer_mode,
+            "direct",
+        )
+        with self.assertRaisesRegex(ValueError, "relay_transfer_mode"):
+            RuntimeConfig(device="cpu", relay_transfer_mode="peer_magic")
+
     def test_edge_consumer_roles_are_explicit(self) -> None:
         self.assertEqual(LinkRadiusRuntime.edge_consumer_role("p2c@0"), "critic")
         self.assertEqual(LinkRadiusRuntime.edge_consumer_role("c2s@0"), "solver")
@@ -77,6 +91,11 @@ class RoleDeviceConfigTests(unittest.TestCase):
         self.assertEqual(default, explicit_same)
         self.assertNotEqual(default, parallel)
 
+    def test_relay_transfer_mode_is_part_of_gpu_task_identity(self) -> None:
+        staged = self._task_key("--relay-transfer-mode", "cpu_staged")
+        direct = self._task_key("--relay-transfer-mode", "direct")
+        self.assertNotEqual(staged, direct)
+
     def test_shell_rejects_array_gpu_mask_with_role_placement(self) -> None:
         common = REPO_ROOT / "experiments" / "linkradius" / "linkradius_common.sh"
         env = dict(os.environ)
@@ -96,6 +115,32 @@ class RoleDeviceConfigTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 2)
         self.assertIn("cannot be combined with per-role devices", completed.stderr)
+
+    def test_shell_passes_authoritative_relay_transfer_mode(self) -> None:
+        common = REPO_ROOT / "experiments" / "linkradius" / "linkradius_common.sh"
+        env = dict(os.environ)
+        env["RELAY_TRANSFER_MODE"] = "direct"
+        completed = subprocess.run(
+            [
+                "bash",
+                "-c",
+                (
+                    f'source "{common}"; '
+                    "lr_validate_relay_transfer_mode; "
+                    "lr_build_command engineering discover 0; "
+                    "printf '%s\\n' \"${LR_COMMAND[@]}\""
+                ),
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        arguments = completed.stdout.splitlines()
+        flag_index = arguments.index("--relay-transfer-mode")
+        self.assertEqual(arguments[flag_index + 1], "direct")
 
 
 @unittest.skipIf(torch is None, "PyTorch is not installed")
@@ -203,6 +248,60 @@ class SystemLoaderPlacementTests(unittest.TestCase):
                     },
                 )
         resolve.assert_not_called()
+
+    def test_same_device_relay_stays_direct_and_differentiable(self) -> None:
+        runtime = LinkRadiusRuntime(RuntimeConfig(device="cpu"))
+        source = torch.tensor([[-2.0, 0.5, 3.0]], requires_grad=True)
+
+        receiver, realized = runtime._transfer_relay(
+            source,
+            torch.device("cpu"),
+            torch.float32,
+        )
+
+        self.assertEqual(realized, "same_device_direct")
+        self.assertTrue(torch.equal(receiver, source))
+        receiver.square().sum().backward()
+        self.assertTrue(torch.equal(source.grad, 2.0 * source.detach()))
+
+    def test_cpu_staged_cross_gpu_relay_preserves_values_and_gradients(self) -> None:
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+            self.skipTest("requires at least two scheduler-visible CUDA devices")
+
+        runtime = LinkRadiusRuntime(
+            RuntimeConfig(
+                device="cuda:0",
+                planner_device="cuda:0",
+                critic_device="cuda:1",
+                solver_device="cuda:1",
+                relay_transfer_mode="cpu_staged",
+            )
+        )
+        source = torch.linspace(
+            -4.0,
+            4.0,
+            257,
+            device="cuda:0",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+
+        receiver, realized = runtime._transfer_relay(
+            source,
+            torch.device("cuda:1"),
+            torch.bfloat16,
+        )
+
+        self.assertEqual(realized, "cpu_float32_staged_cross_device")
+        self.assertEqual(receiver.device, torch.device("cuda:1"))
+        self.assertEqual(receiver.dtype, torch.bfloat16)
+        self.assertTrue(torch.isfinite(receiver).all().item())
+        self.assertTrue(torch.equal(receiver.cpu(), source.detach().cpu()))
+
+        receiver.float().square().sum().backward()
+        self.assertIsNotNone(source.grad)
+        self.assertTrue(torch.isfinite(source.grad).all().item())
+        self.assertGreater(torch.count_nonzero(source.grad).item(), 0)
 
 
 if __name__ == "__main__":

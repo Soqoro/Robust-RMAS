@@ -37,7 +37,7 @@ from . import linkradius as lr
 
 SCORER_VERSION = "linkradius_forced_choice_v1"
 TRAJECTORY_VERSION = "linkradius_clean_trajectory_v1"
-RUNTIME_VERSION = "linkradius_persistent_sequential_v2"
+RUNTIME_VERSION = "linkradius_persistent_sequential_v3"
 SYSTEM_IDENTITY_VERSION = "linkradius_portable_system_identity_v1"
 DEFAULT_SCORER_PREFIX = "Final Choice: \\boxed{"
 DEFAULT_VERBALIZERS: Mapping[str, str] = {
@@ -48,6 +48,7 @@ DEFAULT_VERBALIZERS: Mapping[str, str] = {
 }
 CHOICE_LABELS: Tuple[str, ...] = tuple(DEFAULT_VERBALIZERS)
 SEQUENTIAL_ROLES: Tuple[str, ...] = ("planner", "critic", "solver")
+RELAY_TRANSFER_MODES: Tuple[str, ...] = ("direct", "cpu_staged")
 EDGE_CONSUMER_ROLES: Mapping[str, str] = {
     "p2c": "critic",
     "c2s": "solver",
@@ -536,6 +537,7 @@ class RuntimeConfig:
     planner_device: str = ""
     critic_device: str = ""
     solver_device: str = ""
+    relay_transfer_mode: str = "cpu_staged"
     dtype: str = "auto"
     outer_dtype: str = "auto"
     enable_thinking: bool = False
@@ -568,6 +570,14 @@ class RuntimeConfig:
             # Canonicalize fallback placement immediately so semantically
             # identical configurations hash identically in saved trajectories.
             setattr(self, field_name, explicit or self.device)
+        self.relay_transfer_mode = (
+            str(self.relay_transfer_mode or "").strip().lower()
+        )
+        if self.relay_transfer_mode not in RELAY_TRANSFER_MODES:
+            raise ValueError(
+                "relay_transfer_mode must be one of "
+                f"{RELAY_TRANSFER_MODES}, got {self.relay_transfer_mode!r}"
+            )
         if int(self.rounds) < 1:
             raise ValueError("rounds must be at least 1")
         if int(self.latent_steps) < 1:
@@ -597,6 +607,8 @@ class RuntimeConfig:
 class EdgeDtypeMetadata:
     transport_dtype: str
     consumer_dtype: str
+    requested_transfer_mode: str = "direct"
+    realized_transfer_mode: str = "direct"
 
 
 @dataclass
@@ -607,6 +619,8 @@ class RelayEmission:
     receiver: Any
     transport_dtype: str
     consumer_dtype: str
+    requested_transfer_mode: str = "direct"
+    realized_transfer_mode: str = "direct"
 
 
 @dataclass
@@ -1375,6 +1389,70 @@ class LinkRadiusRuntime:
     def edge_consumer_device(self, edge: Any) -> Any:
         return self.role_device(self.edge_consumer_role(edge))
 
+    def _transfer_relay(
+        self,
+        transport: Any,
+        consumer_device: Any,
+        consumer_dtype: Any,
+    ) -> Tuple[Any, str]:
+        """Move one relay to its consumer using the authenticated transfer mode.
+
+        Some CUDA stacks have produced finite source relays but all-NaN tensors
+        after a direct peer-to-peer GPU copy.  ``cpu_staged`` avoids that path by
+        materializing an ordinary CPU float32 tensor before the destination copy.
+        Both ``Tensor.to`` operations remain in the autograd graph; no detach or
+        NumPy conversion is used.
+        """
+
+        t = _require_torch()
+        destination = t.device(consumer_device)
+        source = t.device(transport.device)
+
+        def device_identity(device: Any) -> Tuple[str, Optional[int]]:
+            parsed = t.device(device)
+            index = parsed.index
+            if parsed.type == "cuda" and index is None:
+                index = int(t.cuda.current_device())
+            return parsed.type, index
+
+        if device_identity(source) == device_identity(destination):
+            return (
+                transport.to(
+                    device=destination,
+                    dtype=consumer_dtype,
+                    non_blocking=False,
+                ),
+                "same_device_direct",
+            )
+
+        if (
+            self.config.relay_transfer_mode == "cpu_staged"
+            and source.type == "cuda"
+            and destination.type == "cuda"
+        ):
+            staged = transport.to(
+                device="cpu",
+                dtype=t.float32,
+                non_blocking=False,
+            ).contiguous()
+            return (
+                staged.to(
+                    device=destination,
+                    dtype=consumer_dtype,
+                    non_blocking=False,
+                ),
+                "cpu_float32_staged_cross_device",
+            )
+
+        return (
+            transport.to(
+                device=destination,
+                dtype=consumer_dtype,
+                non_blocking=False,
+            ),
+            "direct_cross_device",
+        )
+
     def set_stage_audit_hook(
         self,
         hook: Optional[Callable[[Mapping[str, Any]], None]],
@@ -1543,13 +1621,19 @@ class LinkRadiusRuntime:
                 )
         transport = t.cat(batches, dim=0)
         consumer_dtype = consumer.model.get_input_embeddings().weight.dtype
-        receiver = transport.to(device=consumer_device, dtype=consumer_dtype)
+        receiver, realized_transfer_mode = self._transfer_relay(
+            transport,
+            consumer_device,
+            consumer_dtype,
+        )
         self._audit("planner_initial", 0, "end")
         return RelayEmission(
             transport=transport,
             receiver=receiver,
             transport_dtype=_dtype_name(transport.dtype),
             consumer_dtype=_dtype_name(consumer_dtype),
+            requested_transfer_mode=self.config.relay_transfer_mode,
+            realized_transfer_mode=realized_transfer_mode,
         )
 
     def _emit_from_slot(
@@ -1608,13 +1692,19 @@ class LinkRadiusRuntime:
                 )
         transport = t.cat(outputs, dim=0)
         consumer_dtype = consumer.model.get_input_embeddings().weight.dtype
-        receiver = transport.to(device=consumer_device, dtype=consumer_dtype)
+        receiver, realized_transfer_mode = self._transfer_relay(
+            transport,
+            consumer_device,
+            consumer_dtype,
+        )
         self._audit(action, round_idx, "end")
         return RelayEmission(
             transport=transport,
             receiver=receiver,
             transport_dtype=_dtype_name(transport.dtype),
             consumer_dtype=_dtype_name(consumer_dtype),
+            requested_transfer_mode=self.config.relay_transfer_mode,
+            realized_transfer_mode=realized_transfer_mode,
         )
 
     # Public stage methods are intentionally concrete and individually
@@ -2103,6 +2193,8 @@ class LinkRadiusRuntime:
         dtypes[edge] = EdgeDtypeMetadata(
             transport_dtype=emission.transport_dtype,
             consumer_dtype=emission.consumer_dtype,
+            requested_transfer_mode=emission.requested_transfer_mode,
+            realized_transfer_mode=emission.realized_transfer_mode,
         )
 
     def capture_clean(
@@ -3451,6 +3543,7 @@ __all__ = [
     "PGDResult",
     "PGDTargetResult",
     "PersistentSequentialRuntime",
+    "RELAY_TRANSFER_MODES",
     "RUNTIME_VERSION",
     "RelayEmission",
     "ReplayIntervention",
