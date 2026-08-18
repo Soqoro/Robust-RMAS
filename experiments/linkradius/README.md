@@ -71,6 +71,14 @@ freeze/validation/aggregation commands that reconstruct upstream task keys.
 Changing only the physical node is safe when the same three logical devices
 remain available. Changing the logical role map requires a new output root.
 
+Differentiable gradient and PGD objectives use the exact frozen
+`gold_score - target_score` margin but evaluate and backpropagate the gold and
+target solver candidates sequentially. This keeps at most one differentiable
+terminal scorer graph resident at a time. Ordinary clean, replay,
+finite-difference, and final PGD scoring remains the complete four-way A/B/C/D
+scorer; the memory optimization does not change reported choice scores or
+candidate selection.
+
 Every array task is a whole frozen execution batch plus one intervention
 configuration. A probe task contains both signs for all nested directions, so
 the scheduler never splits an antithetic pair. Outputs are written beside a

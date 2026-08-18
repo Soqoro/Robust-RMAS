@@ -195,6 +195,41 @@ class EndToEndToyScorerTests(unittest.TestCase):
             all(result.metadata["candidate_token_ids"][label] for label in "ABCD")
         )
 
+    def test_candidate_subset_matches_full_scorer_columns(self):
+        runtime = self.runtime()
+        questions = ["Question\nA. x\nB. y\nC. z\nD. w"]
+        relay = torch.zeros((1, 2, 8), requires_grad=True)
+        full = runtime.score_terminal(questions, relay, differentiable=True)
+        subset = runtime.score_terminal(
+            questions,
+            relay,
+            differentiable=True,
+            candidate_labels=("D", "B"),
+        )
+        self.assertEqual(subset.labels, ("D", "B"))
+        self.assertTrue(
+            torch.equal(
+                subset.scores,
+                full.scores[:, [full.labels.index("D"), full.labels.index("B")]],
+            )
+        )
+        # Candidate span discovery remains bound to the complete frozen
+        # comparison set even though only two model forwards are requested.
+        self.assertEqual(set(subset.metadata["joint_token_ids"]), set("ABCD"))
+
+    def test_candidate_subset_validation(self):
+        runtime = self.runtime()
+        questions = ["Question\nA. x\nB. y\nC. z\nD. w"]
+        relay = torch.zeros((1, 2, 8))
+        for invalid in ((), ("A", "A"), ("E",)):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "candidate_labels"):
+                    runtime.score_terminal(
+                        questions,
+                        relay,
+                        candidate_labels=invalid,
+                    )
+
     def test_concrete_persistent_stages_capture_all_r2_edges(self):
         runtime = self.runtime(rounds=2)
         trajectory = runtime.capture_clean(

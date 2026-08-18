@@ -745,6 +745,20 @@ class ReplayResult:
 
 
 @dataclass
+class _ReplayTerminalState:
+    """Live downstream replay state before terminal candidate scoring."""
+
+    edge: Any
+    schedule: Tuple[ReplayStep, ...]
+    boundaries: List[Tuple[int, int]]
+    intervention_metadata: List[Mapping[str, Any]]
+    intervened_receiver: Any
+    terminal_receiver: Any
+    recomputed_transport_messages: Dict[Any, Any]
+    recomputed_receiver_messages: Dict[Any, Any]
+
+
+@dataclass
 class GradientResult:
     edge: Any
     gold_label: str
@@ -1779,13 +1793,18 @@ class LinkRadiusRuntime:
         batch_boundaries: Optional[Sequence[Sequence[int]]] = None,
         differentiable: bool = False,
         verbalizers: Mapping[str, str] = DEFAULT_VERBALIZERS,
+        candidate_labels: Optional[Sequence[str]] = None,
     ) -> ForcedChoiceBatch:
         """Teacher-force and score every frozen A/B/C/D continuation.
 
         The prefix and candidate are tokenized jointly. Candidate token log
         probabilities are gathered with causal next-token alignment after an
         explicit float32 ``log_softmax``.  The returned score tensor retains its
-        graph only when ``differentiable=True``.
+        graph only when ``differentiable=True``. ``candidate_labels`` is an
+        internal memory-bounded gradient facility: tokenization still uses the
+        complete frozen A/B/C/D comparison set, but only the requested columns
+        are forwarded through the solver. Ordinary scoring always leaves it
+        unset and therefore retains the exact four-way scorer.
         """
 
         t = _require_torch()
@@ -1805,6 +1824,18 @@ class LinkRadiusRuntime:
         }
         if tuple(normalized_verbalizers) != CHOICE_LABELS:
             raise ValueError("The GPQA scorer requires ordered verbalizers A, B, C, D")
+        selected_labels = tuple(
+            str(label).upper()
+            for label in (CHOICE_LABELS if candidate_labels is None else candidate_labels)
+        )
+        if (
+            not selected_labels
+            or len(set(selected_labels)) != len(selected_labels)
+            or set(selected_labels) - set(CHOICE_LABELS)
+        ):
+            raise ValueError(
+                "candidate_labels must be a non-empty unique subset of A/B/C/D"
+            )
         encodings = tokenize_joint_candidates(
             tokenizer,
             self.config.scorer_prefix,
@@ -1816,7 +1847,7 @@ class LinkRadiusRuntime:
         count_columns: List[Any] = []
         self._audit("score_final", self.config.rounds - 1, "start")
         with t.set_grad_enabled(differentiable):
-            for label in CHOICE_LABELS:
+            for label in selected_labels:
                 encoding = encodings[label]
                 continuation = _token_ids_to_embeds(
                     embed_layer,
@@ -1888,7 +1919,7 @@ class LinkRadiusRuntime:
         selections = [
             prediction_from_scores(
                 row,
-                CHOICE_LABELS,
+                selected_labels,
                 atol=self.config.score_tie_atol,
                 rtol=self.config.score_tie_rtol,
             )
@@ -1896,7 +1927,7 @@ class LinkRadiusRuntime:
         ]
         self._audit("score_final", self.config.rounds - 1, "end")
         return ForcedChoiceBatch(
-            labels=CHOICE_LABELS,
+            labels=selected_labels,
             scores=scores,
             summed_logprobs=summed,
             mean_logprobs=means,
@@ -2507,16 +2538,15 @@ class LinkRadiusRuntime:
         transport[edge] = cls._store_tensor(emission.transport)
         receiver[edge] = cls._store_tensor(emission.receiver)
 
-    def replay(
+    def _replay_to_terminal(
         self,
         trajectory: CleanTrajectory,
         edge: Any,
         intervention: Any = "identity",
         *,
         differentiable: bool = False,
-        include_generation: bool = False,
-    ) -> ReplayResult:
-        """Inject one receiver-interface relay and recompute only descendants."""
+    ) -> _ReplayTerminalState:
+        """Inject one relay and recompute descendants without terminal scoring."""
 
         parsed = lr.parse_edge(edge) if not isinstance(edge, lr.Edge) else edge
         # This happens before _apply_intervention or any default stage can load.
@@ -2620,31 +2650,59 @@ class LinkRadiusRuntime:
                     current_s = s.receiver
         if final_c is None:
             raise RuntimeError("Replay schedule did not produce terminal c2s")
+        return _ReplayTerminalState(
+            edge=parsed,
+            schedule=schedule,
+            boundaries=boundaries,
+            intervention_metadata=intervention_metadata,
+            intervened_receiver=injected,
+            terminal_receiver=final_c,
+            recomputed_transport_messages=recomputed_transport,
+            recomputed_receiver_messages=recomputed_receiver,
+        )
+
+    def replay(
+        self,
+        trajectory: CleanTrajectory,
+        edge: Any,
+        intervention: Any = "identity",
+        *,
+        differentiable: bool = False,
+        include_generation: bool = False,
+    ) -> ReplayResult:
+        """Inject one receiver-interface relay and recompute only descendants."""
+
+        state = self._replay_to_terminal(
+            trajectory,
+            edge,
+            intervention,
+            differentiable=differentiable,
+        )
         scoring = self.score_terminal(
             trajectory.questions,
-            final_c,
-            batch_boundaries=boundaries,
+            state.terminal_receiver,
+            batch_boundaries=state.boundaries,
             differentiable=differentiable,
         )
         margins = scoring.margins(trajectory.gold_labels)
         generation = (
             self.audit_ordinary_generation(
                 trajectory.questions,
-                final_c,
-                batch_boundaries=boundaries,
+                state.terminal_receiver,
+                batch_boundaries=state.boundaries,
             )
             if include_generation
             else []
         )
         return ReplayResult(
-            edge=parsed,
-            schedule=schedule,
+            edge=state.edge,
+            schedule=state.schedule,
             scoring=scoring if differentiable else scoring.detached(),
             margins=margins,
-            intervention_metadata=intervention_metadata,
-            intervened_receiver=self._store_tensor(injected),
-            recomputed_transport_messages=recomputed_transport,
-            recomputed_receiver_messages=recomputed_receiver,
+            intervention_metadata=state.intervention_metadata,
+            intervened_receiver=self._store_tensor(state.intervened_receiver),
+            recomputed_transport_messages=state.recomputed_transport_messages,
+            recomputed_receiver_messages=state.recomputed_receiver_messages,
             generation_audit=generation,
         )
 
@@ -2844,6 +2902,74 @@ class LinkRadiusRuntime:
             - scoring.scores[sample_index, scoring.labels.index(target)]
         )
 
+    def _sequential_terminal_margin_gradient(
+        self,
+        *,
+        questions: Sequence[str],
+        terminal_receiver: Any,
+        gradient_input: Any,
+        gold_label: str,
+        target_label: str,
+        sample_index: int,
+        batch_boundaries: Sequence[Sequence[int]],
+    ) -> Tuple[float, Any]:
+        """Differentiate a margin while retaining only one scorer graph.
+
+        The downstream replay graph is shared by both passes. The gold pass
+        retains that shared graph, then releases its solver-scoring branch
+        before the target pass is constructed. This computes the same
+        ``gold_score - target_score`` derivative without simultaneously
+        retaining four candidate forward graphs on the solver device.
+        """
+
+        t = _require_torch()
+        gold = str(gold_label).upper()
+        target = str(target_label).upper()
+        if gold not in CHOICE_LABELS or target not in CHOICE_LABELS or gold == target:
+            raise ValueError("gold and target must be distinct A/B/C/D labels")
+
+        component_values: List[Any] = []
+        margin_gradient = None
+        for component_index, (label, sign) in enumerate(((gold, 1.0), (target, -1.0))):
+            scoring = self.score_terminal(
+                questions,
+                terminal_receiver,
+                batch_boundaries=batch_boundaries,
+                differentiable=True,
+                candidate_labels=(label,),
+            )
+            if label not in scoring.labels:
+                raise RuntimeError(
+                    f"memory-bounded scorer omitted requested candidate {label}"
+                )
+            component = scoring.scores[
+                sample_index,
+                scoring.labels.index(label),
+            ]
+            component_gradient = t.autograd.grad(
+                component,
+                gradient_input,
+                # The target pass must traverse the same downstream replay
+                # graph, but the gold scorer branch itself can be dropped as
+                # soon as this iteration's local references are released.
+                retain_graph=component_index == 0,
+                create_graph=False,
+                allow_unused=False,
+            )[0]
+            component_values.append(component.detach().float().cpu())
+            signed_gradient = component_gradient if sign > 0 else -component_gradient
+            margin_gradient = (
+                signed_gradient
+                if margin_gradient is None
+                else margin_gradient + signed_gradient
+            )
+            del component, component_gradient, scoring, signed_gradient
+
+        if margin_gradient is None:  # Defensive; the fixed loop always runs twice.
+            raise RuntimeError("memory-bounded margin gradient produced no components")
+        objective_value = float(component_values[0] - component_values[1])
+        return objective_value, margin_gradient
+
     @staticmethod
     def _validate_autograd_sample(trajectory: CleanTrajectory, sample_index: int) -> int:
         if isinstance(sample_index, bool):
@@ -2895,28 +3021,22 @@ class LinkRadiusRuntime:
             dtype=consumer_dtype,
         ).detach()
         leaf.requires_grad_(True)
-        scoring = self.score_terminal(
-            trajectory.questions,
-            leaf,
-            batch_boundaries=trajectory.batch_boundaries,
-            differentiable=True,
-        )
-        objective = self._score_margin_tensor(
-            scoring,
-            gold,
-            target,
+        objective_value, full_gradient = self._sequential_terminal_margin_gradient(
+            questions=trajectory.questions,
+            terminal_receiver=leaf,
+            gradient_input=leaf,
+            gold_label=gold,
+            target_label=target,
             sample_index=selected,
+            batch_boundaries=trajectory.batch_boundaries,
         )
-        full_gradient = t.autograd.grad(
-            objective, leaf, retain_graph=False, create_graph=False
-        )[0]
         gradient = full_gradient[selected : selected + 1]
         return GradientResult(
             edge=edge,
             gold_label=gold,
             target_label=target,
             objective_name="gold_minus_target_margin",
-            objective_value=float(objective.detach().float().cpu()),
+            objective_value=objective_value,
             gradient=gradient.detach().float().cpu(),
             gradient_norm=float(t.linalg.vector_norm(gradient.float()).detach().cpu()),
             autograd_semantics="continuous_consumer_input",
@@ -2955,28 +3075,28 @@ class LinkRadiusRuntime:
             dtype=consumer_dtype,
         ).detach()
         leaf.requires_grad_(True)
-        result = self.replay(
+        state = self._replay_to_terminal(
             trajectory,
             parsed,
             ReplayIntervention(mode="replacement", replacement=leaf),
             differentiable=True,
         )
-        objective = self._score_margin_tensor(
-            result.scoring,
-            gold,
-            target,
+        objective_value, full_gradient = self._sequential_terminal_margin_gradient(
+            questions=trajectory.questions,
+            terminal_receiver=state.terminal_receiver,
+            gradient_input=leaf,
+            gold_label=gold,
+            target_label=target,
             sample_index=selected,
+            batch_boundaries=state.boundaries,
         )
-        full_gradient = t.autograd.grad(
-            objective, leaf, retain_graph=False, create_graph=False
-        )[0]
         gradient = full_gradient[selected : selected + 1]
         return GradientResult(
             edge=parsed,
             gold_label=gold,
             target_label=target,
             objective_name="gold_minus_target_margin",
-            objective_value=float(objective.detach().float().cpu()),
+            objective_value=objective_value,
             gradient=gradient.detach().float().cpu(),
             gradient_norm=float(t.linalg.vector_norm(gradient.float()).detach().cpu()),
             autograd_semantics="relaxed_autograd",
@@ -3091,23 +3211,18 @@ class LinkRadiusRuntime:
                 dim=0,
             )
 
-        def score_requested(requested_row: Any) -> ForcedChoiceBatch:
+        def terminal_receiver_for(requested_row: Any) -> Any:
             requested_receiver = inject_selected(requested_row)
             live = requested_receiver.to(dtype=consumer_dtype)
             if terminal:
-                return self.score_terminal(
-                    trajectory.questions,
-                    live,
-                    batch_boundaries=trajectory.batch_boundaries,
-                    differentiable=True,
-                )
-            replayed = self.replay(
+                return live
+            state = self._replay_to_terminal(
                 trajectory,
                 parsed,
                 ReplayIntervention(mode="replacement", replacement=requested_receiver),
                 differentiable=True,
             )
-            return replayed.scoring
+            return state.terminal_receiver
 
         clean_scores = trajectory.clean_scoring.scores
         if t.is_tensor(clean_scores):
@@ -3120,20 +3235,17 @@ class LinkRadiusRuntime:
             for _ in range(int(steps)):
                 coefficients = coefficients.detach().requires_grad_(True)
                 delta = subspace.lift(coefficients).reshape_as(clean)
-                scoring = score_requested(clean + delta)
-                objective = self._score_margin_tensor(
-                    scoring,
-                    gold,
-                    target,
+                terminal_receiver = terminal_receiver_for(clean + delta)
+                _, gradient = self._sequential_terminal_margin_gradient(
+                    questions=trajectory.questions,
+                    terminal_receiver=terminal_receiver,
+                    gradient_input=coefficients,
+                    gold_label=gold,
+                    target_label=target,
                     sample_index=selected,
+                    batch_boundaries=trajectory.batch_boundaries,
                 )
-                gradient = t.autograd.grad(
-                    objective,
-                    coefficients,
-                    retain_graph=False,
-                    create_graph=False,
-                    allow_unused=False,
-                )[0]
+                del terminal_receiver
                 gradient_norm = t.linalg.vector_norm(gradient)
                 if not bool(t.isfinite(gradient_norm)) or float(gradient_norm.detach().cpu()) == 0.0:
                     coefficients = coefficients.detach()

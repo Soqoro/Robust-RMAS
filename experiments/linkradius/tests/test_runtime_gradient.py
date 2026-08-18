@@ -19,6 +19,7 @@ class RuntimeGradientTests(unittest.TestCase):
         def __init__(self):
             super().__init__(RuntimeConfig(rounds=1, latent_steps=1, batch_size=1, device="cpu"))
             self.scored_batch_sizes = []
+            self.scored_candidate_labels = []
 
         @property
         def device(self):
@@ -36,12 +37,19 @@ class RuntimeGradientTests(unittest.TestCase):
 
         def score_terminal(self, questions, critic_message, **kwargs):
             self.scored_batch_sizes.append(len(questions))
+            selected = tuple(kwargs.get("candidate_labels") or ("A", "B", "C", "D"))
+            self.scored_candidate_labels.append(selected)
             x = critic_message.float().mean(dim=(1, 2))
-            scores = torch.stack((x, -x, -x - 1.0, -x - 2.0), dim=-1)
+            all_scores = torch.stack((x, -x, -x - 1.0, -x - 2.0), dim=-1)
+            columns = [("A", "B", "C", "D").index(label) for label in selected]
+            scores = all_scores[:, columns]
             row = scores.detach().cpu().tolist()
-            predictions = tuple("A" if values[0] > values[1] else "B" for values in row)
+            predictions = tuple(
+                selected[max(range(len(values)), key=values.__getitem__)]
+                for values in row
+            )
             return ForcedChoiceBatch(
-                labels=("A", "B", "C", "D"),
+                labels=selected,
                 scores=scores,
                 summed_logprobs=scores,
                 mean_logprobs=scores,
@@ -71,12 +79,37 @@ class RuntimeGradientTests(unittest.TestCase):
         )
 
     def test_terminal_consumer_leaf_gradient(self):
+        clean = self.trajectory.message("c2s@0").clone().requires_grad_(True)
+        full = self.runtime.score_terminal(
+            self.trajectory.questions,
+            clean,
+            differentiable=True,
+        )
+        full_objective = self.runtime._score_margin_tensor(full, "A", "B")
+        full_gradient = torch.autograd.grad(full_objective, clean)[0]
+        self.runtime.scored_candidate_labels.clear()
+
         result = self.runtime.terminal_gradient(self.trajectory, target_label="B")
         self.assertEqual(result.autograd_semantics, "continuous_consumer_input")
         self.assertGreater(result.gradient_norm, 0.0)
         self.assertTrue(torch.isfinite(result.gradient).all())
+        self.assertAlmostEqual(result.objective_value, float(full_objective.detach()))
+        self.assertTrue(torch.allclose(result.gradient, full_gradient))
+        self.assertEqual(self.runtime.scored_candidate_labels, [("A",), ("B",)])
+
+    def test_early_edge_gradient_scores_one_candidate_graph_at_a_time(self):
+        self.runtime.scored_candidate_labels.clear()
+        result = self.runtime.autograd_gradient(
+            self.trajectory,
+            "p2c@0",
+            target_label="B",
+        )
+        self.assertGreater(result.gradient_norm, 0.0)
+        self.assertTrue(torch.isfinite(result.gradient).all())
+        self.assertEqual(self.runtime.scored_candidate_labels, [("A",), ("B",)])
 
     def test_terminal_pgd_improves_target_margin_and_respects_realized_budget(self):
+        self.runtime.scored_candidate_labels.clear()
         result = self.runtime.autograd_pgd(
             self.trajectory,
             "c2s@0",
@@ -90,6 +123,13 @@ class RuntimeGradientTests(unittest.TestCase):
         self.assertLess(target.final_margin, target.initial_margin)
         self.assertTrue(target.budget_respected)
         self.assertLessEqual(target.realized_delta_norm, target.budget + 1e-6)
+        self.assertEqual(self.runtime.scored_candidate_labels[-1], ("A", "B", "C", "D"))
+        self.assertTrue(
+            all(
+                len(labels) == 1
+                for labels in self.runtime.scored_candidate_labels[:-1]
+            )
+        )
 
     def test_gradient_selects_one_row_without_rebatching_frozen_context(self):
         trajectory = self.runtime.capture_clean(
@@ -103,6 +143,7 @@ class RuntimeGradientTests(unittest.TestCase):
             include_generation=False,
         )
         self.runtime.scored_batch_sizes.clear()
+        self.runtime.scored_candidate_labels.clear()
         result = self.runtime.terminal_gradient(
             trajectory,
             target_label="B",
@@ -112,7 +153,8 @@ class RuntimeGradientTests(unittest.TestCase):
         self.assertEqual(result.sample_id, "eligible")
         self.assertEqual(tuple(result.gradient.shape), (1, 1, 2))
         self.assertGreater(result.gradient_norm, 0.0)
-        self.assertEqual(self.runtime.scored_batch_sizes, [3])
+        self.assertEqual(self.runtime.scored_batch_sizes, [3, 3])
+        self.assertEqual(self.runtime.scored_candidate_labels, [("A",), ("B",)])
         with self.assertRaisesRegex(ValueError, "analysis-eligible"):
             self.runtime.terminal_gradient(trajectory, sample_index=0)
 
