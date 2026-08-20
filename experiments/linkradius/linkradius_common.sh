@@ -28,7 +28,9 @@ DEVICE="${DEVICE:-cuda:0}"
 PLANNER_DEVICE="${PLANNER_DEVICE:-}"
 CRITIC_DEVICE="${CRITIC_DEVICE:-}"
 SOLVER_DEVICE="${SOLVER_DEVICE:-}"
+TERMINAL_SOLVER_DEVICE="${TERMINAL_SOLVER_DEVICE:-}"
 RELAY_TRANSFER_MODE="${RELAY_TRANSFER_MODE:-cpu_staged}"
+AUTOGRAD_MEMORY_MODE="${AUTOGRAD_MEMORY_MODE:-none}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 PROBE_RADII="${PROBE_RADII:-1e-3 3e-3}"
 PROBE_SEEDS="${PROBE_SEEDS:-101 202}"
@@ -108,6 +110,13 @@ lr_validate_relay_transfer_mode() {
   esac
 }
 
+lr_validate_autograd_memory_mode() {
+  case "$AUTOGRAD_MEMORY_MODE" in
+    none|checkpoint) ;;
+    *) lr_die "AUTOGRAD_MEMORY_MODE must be none or checkpoint, got: $AUTOGRAD_MEMORY_MODE" ;;
+  esac
+}
+
 lr_validate_stage() {
   local selected="$1"
   shift
@@ -136,7 +145,7 @@ lr_is_gpu_stage() {
 
 lr_validate_gpu_configuration() {
   if [[ -n "$GPU_LIST" ]] && {
-    [[ -n "$PLANNER_DEVICE" ]] || [[ -n "$CRITIC_DEVICE" ]] || [[ -n "$SOLVER_DEVICE" ]]
+    [[ -n "$PLANNER_DEVICE" ]] || [[ -n "$CRITIC_DEVICE" ]] || [[ -n "$SOLVER_DEVICE" ]] || [[ -n "$TERMINAL_SOLVER_DEVICE" ]]
   }; then
     lr_die "GPU_LIST masks each array task to one GPU and cannot be combined with per-role devices; leave GPU_LIST empty and request all role GPUs in one scheduler allocation"
     return
@@ -200,7 +209,9 @@ lr_build_command() {
     --planner-device "$PLANNER_DEVICE"
     --critic-device "$CRITIC_DEVICE"
     --solver-device "$SOLVER_DEVICE"
+    --terminal-solver-device "$TERMINAL_SOLVER_DEVICE"
     --relay-transfer-mode "$RELAY_TRANSFER_MODE"
+    --autograd-memory-mode "$AUTOGRAD_MEMORY_MODE"
     --engineering-gate "$ENGINEERING_GATE"
     --smoke-gate "$SMOKE_GATE"
     --probe-gate "$PROBE_GATE"
@@ -252,6 +263,7 @@ lr_run_entrypoint() {
   lr_validate_bool "REUSE_COMPLETE" "$REUSE_COMPLETE" || return
   lr_validate_bool "OVERWRITE" "$OVERWRITE" || return
   lr_validate_relay_transfer_mode || return
+  lr_validate_autograd_memory_mode || return
   lr_validate_gpu_configuration || return
 
   lr_build_command "$workflow" "$stage" "$task_id"

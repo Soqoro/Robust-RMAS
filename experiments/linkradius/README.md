@@ -35,7 +35,8 @@ mkdir -p logs
 Important environment variables are `PYTHON_BIN`, `LINKRADIUS_REPO_ROOT`, `STYLE`, `METHOD`,
 `DATASETS`, `ROUNDS`, `SEEDS`, `BATCH_SIZE`, `LATENT_LENGTH`, `OUT_ROOT`,
 `GPU_LIST`, `PLANNER_DEVICE`, `CRITIC_DEVICE`, `SOLVER_DEVICE`,
-`RELAY_TRANSFER_MODE`, `PROBE_RADII`, `PROBE_SEEDS`, `K`, and `SUBSPACE`.
+`TERMINAL_SOLVER_DEVICE`, `RELAY_TRANSFER_MODE`, `AUTOGRAD_MEMORY_MODE`,
+`PROBE_RADII`, `PROBE_SEEDS`, `K`, and `SUBSPACE`.
 `GPU_LIST` is a whitespace-separated
 physical-device list for round-robin, one-GPU-per-array-task execution. If it
 is empty, scheduler-provided `CUDA_VISIBLE_DEVICES` is preserved; inside a
@@ -50,41 +51,57 @@ logical devices. For example:
 export PLANNER_DEVICE=cuda:0
 export CRITIC_DEVICE=cuda:1
 export SOLVER_DEVICE=cuda:2
+export TERMINAL_SOLVER_DEVICE=cuda:3
 export RELAY_TRANSFER_MODE=cpu_staged
+export AUTOGRAD_MEMORY_MODE=checkpoint
 unset GPU_LIST
 ```
 
-This places the planner, critic, and solver (plus each role's inner adapter) on
-three devices. Each outer adapter stays on its source role's device. By default,
-a relay crossing two CUDA devices is copied source GPU -> CPU float32 ->
+This four-device configuration places the planner, critic, and recurrent
+solver-feedback model on the first three devices. It loads a frozen replica of
+the identical solver checkpoint on the fourth device for terminal scoring and
+generation. This separates the solver-feedback and terminal-scoring activation
+graphs. Each outer adapter stays on its source role's device. By default, a
+relay crossing two CUDA devices is copied source GPU -> CPU float32 ->
 destination GPU consumer dtype, using differentiable tensor copies without a
 detach. A same-device relay remains a direct cast/copy. The CUDA indices are
 logical indices within the scheduler's
 `CUDA_VISIBLE_DEVICES`, not necessarily physical GPU ordinals.
 
-Run one process in one Slurm task and request three GPUs, for example with
-`--ntasks=1 --gres=gpu:3` when those are the site's allocation flags. Keep
-`GPU_LIST` empty: `GPU_LIST="0 1 2"` still means round-robin single-GPU array
+Run one process in one Slurm task and request four GPUs, for example with
+`--ntasks=1 --gres=gpu:4` when those are the site's allocation flags. Keep
+`GPU_LIST` empty: `GPU_LIST="0 1 2 3"` still means round-robin single-GPU array
 routing and does not pool memory. On a four-GPU node, throttle a two-element
-gradient array with `--array=0-1%1` so only one three-GPU element runs at once.
+gradient array with `--array=0-1%1` so only one four-GPU element runs at once.
+
+`AUTOGRAD_MEMORY_MODE=checkpoint` applies PyTorch non-reentrant activation
+checkpointing only to differentiable latent and terminal-scorer forwards. It
+recomputes model activations during backward rather than retaining every
+intermediate activation from all latent steps. Non-differentiable discovery,
+clean capture, replay, probes, and final scoring retain their ordinary forward
+path. Leaving `TERMINAL_SOLVER_DEVICE` empty reuses `SOLVER_DEVICE`; leaving
+`AUTOGRAD_MEMORY_MODE=none` preserves the legacy memory behavior.
 
 The resolved role topology is authenticated experiment configuration. Export
 the same `STYLE`, `LATENT_LENGTH`, `PLANNER_DEVICE`, `CRITIC_DEVICE`, and
 `SOLVER_DEVICE` values, plus the same `RELAY_TRANSFER_MODE`, for every command
-in a fresh workflow, including CPU freeze/validation/aggregation commands that
-reconstruct upstream task keys. `cpu_staged` is the supported default;
+in a fresh workflow. The same `TERMINAL_SOLVER_DEVICE` and
+`AUTOGRAD_MEMORY_MODE` values are also required, including for CPU
+freeze/validation/aggregation commands that reconstruct upstream task keys.
+`cpu_staged` is the supported default;
 `direct` is retained for controlled diagnostics and has a distinct task hash.
-Changing only the physical node is safe when the same three logical devices
-remain available. Changing the logical role map or transfer mode requires a
-new output root.
+Changing only the physical node is safe when the same four logical devices
+remain available. Changing the logical role map, terminal replica placement,
+checkpoint mode, or transfer mode requires a new output root.
 
 Differentiable gradient and PGD objectives use the exact frozen
 `gold_score - target_score` margin but evaluate and backpropagate the gold and
 target solver candidates sequentially. This keeps at most one differentiable
 terminal scorer graph resident at a time. Ordinary clean, replay,
 finite-difference, and final PGD scoring remains the complete four-way A/B/C/D
-scorer; the memory optimization does not change reported choice scores or
-candidate selection.
+scorer. With checkpoint mode enabled, each differentiable model forward is
+recomputed during backward; neither memory optimization changes reported choice
+scores or candidate selection.
 
 Every array task is a whole frozen execution batch plus one intervention
 configuration. A probe task contains both signs for all nested directions, so

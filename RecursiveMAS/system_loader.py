@@ -62,6 +62,12 @@ class LoadedMASSystem:
     outer_adapters: Dict[str, Any]
     role_devices: Dict[str, torch.device]
     paths: ResolvedMASPaths
+    # A distinct terminal solver is an optional frozen replica of the ordinary
+    # solver base model.  It has no inner adapter because terminal
+    # scoring/generation consumes the final critic relay directly.  Keeping the
+    # replica separate lets differentiable solver-feedback activations and
+    # terminal-scoring activations reside on different GPUs.
+    terminal_solver: LoadedAgent | None = None
 
 
 _AGENT_LAYOUTS: Dict[str, Dict[str, str]] = {
@@ -215,6 +221,11 @@ def load_mas_system(
 
     role_to_repo_key = _AGENT_LAYOUTS[family]
     supplied_role_devices = dict(role_devices or {})
+    requested_terminal_device = supplied_role_devices.pop("terminal_solver", None)
+    if requested_terminal_device is not None and family != "sequential":
+        raise ValueError(
+            "terminal_solver placement is available only for sequential systems"
+        )
     unknown_roles = set(supplied_role_devices) - set(role_to_repo_key)
     if unknown_roles:
         raise ValueError(
@@ -225,7 +236,15 @@ def load_mas_system(
         role: torch.device(supplied_role_devices.get(role, device_obj))
         for role in role_to_repo_key
     }
-    _validate_role_devices(resolved_role_devices)
+    terminal_solver_device = (
+        torch.device(requested_terminal_device)
+        if requested_terminal_device is not None
+        else resolved_role_devices.get("solver")
+    )
+    complete_device_topology = dict(resolved_role_devices)
+    if terminal_solver_device is not None:
+        complete_device_topology["terminal_solver"] = terminal_solver_device
+    _validate_role_devices(complete_device_topology)
 
     # Resolve/download checkpoint paths only after the complete topology has
     # passed validation, so a bad scheduler allocation cannot cause avoidable
@@ -285,14 +304,46 @@ def load_mas_system(
             dtype=outer_module_dtype,
         )
 
+    terminal_solver = None
+    if (
+        family == "sequential"
+        and terminal_solver_device is not None
+        and terminal_solver_device != resolved_role_devices["solver"]
+    ):
+        repo_id = paths.repo_ids["solver"]
+        repo_path = paths.repo_paths["solver"]
+        model, tokenizer = base.load_agent_model_and_tokenizer(
+            model_name_or_path=str(repo_path),
+            device=terminal_solver_device,
+            dtype=model_dtype,
+            trust_remote_code=trust_remote_code,
+            agent_name="terminal_solver",
+        )
+        hidden_size = int(model.get_input_embeddings().weight.size(-1))
+        if hidden_size != agents["solver"].hidden_size:
+            raise RuntimeError(
+                "terminal solver replica hidden size differs from the feedback solver"
+            )
+        terminal_solver = LoadedAgent(
+            role="terminal_solver",
+            repo_id=repo_id,
+            repo_path=repo_path,
+            model=model,
+            tokenizer=tokenizer,
+            inner_adapter_path=paths.inner_adapter_paths["solver"],
+            inner_adapter=None,
+            hidden_size=hidden_size,
+        )
+
     return LoadedMASSystem(
         style=style,
         family=family,
         dataset=dataset,
         agents=agents,
         outer_adapters=outer_adapters,
-        role_devices=resolved_role_devices,
+        role_devices=complete_device_topology,
         paths=paths,
+        terminal_solver=terminal_solver,
     )
 
 
@@ -309,6 +360,13 @@ def unload_mas_system(system: LoadedMASSystem) -> None:
         agent.model = None
         agent.tokenizer = None
         agent.inner_adapter = None
+    terminal_solver = system.terminal_solver
+    if terminal_solver is not None:
+        modules.extend([terminal_solver.model, terminal_solver.tokenizer])
+        terminal_solver.model = None
+        terminal_solver.tokenizer = None
+        terminal_solver.inner_adapter = None
+        system.terminal_solver = None
     modules.extend(system.outer_adapters.values())
     system.agents.clear()
     system.outer_adapters.clear()

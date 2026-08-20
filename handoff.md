@@ -1,6 +1,6 @@
-# LinkRadius H200 experiment handoff
+# LinkRadius four-GPU memory-bounded experiment handoff
 
-Last updated: 2026-08-19 (Asia/Singapore)
+Last updated: 2026-08-20 (Asia/Singapore)
 
 ## Instruction for the next Codex session
 
@@ -8,7 +8,7 @@ This chat is not available on the new cloud platform. After cloning the source,
 start a new Codex session there with this instruction:
 
 > Read `handoff.md` completely, inspect the checkout and hardware, and continue
-> the LinkRadius H200 run from the exact checkpoint described here. Do not reuse
+> the LinkRadius four-80GB-GPU run from the exact checkpoint described here. Do not reuse
 > artifacts from an older output root, change experiment source after starting,
 > install FLA, or skip an authenticated stage.
 
@@ -47,22 +47,29 @@ failed light baseline.
 
 ## Exact source state to transfer
 
-The minimum implementation revision containing the current fixes is:
+The four-GPU patch is based on this implementation revision. The authoritative
+identity for result-affecting code is the source hash below; commit and push the
+complete working tree before moving platforms.
 
 ```text
-implementation commit: 174d773e6bb8a50dd0f18bf8951acb4d4ae92d3a
-expected LinkRadius source_hash: f313855756bbc3febedec70ec472fc618cae8addf1b0a73dc4a8b59cc2315229
+four-GPU patch base commit: 174d773e6bb8a50dd0f18bf8951acb4d4ae92d3a
+expected LinkRadius source_hash: e009d574d9ac3124d4db15b934521f41cbc102941dc388e6fed9f71f87542c35
 strict parser: linkradius_choice_v2
 ```
 
-Commit this updated `handoff.md` and push the private working branch. The
-resulting Git commit will be newer than the implementation commit above, but
-the expected `source_hash` must remain exactly the same because `handoff.md` is
-outside the result-affecting source tree.
+The resulting Git commit must be newer than the base commit above. Updating
+only `handoff.md` after verification does not change `source_hash` because this
+file is outside the result-affecting source tree.
 
 The relevant implementation already includes:
 
-- three-role model placement on logical `cuda:0`, `cuda:1`, and `cuda:2`;
+- planner, critic, and recurrent solver placement on logical `cuda:0`,
+  `cuda:1`, and `cuda:2`;
+- an authenticated frozen terminal-solver replica on logical `cuda:3`;
+- terminal scoring/generation isolated from recurrent solver-feedback
+  activations;
+- authenticated non-reentrant activation checkpointing for differentiable
+  latent and terminal-scorer forwards;
 - source-role placement for learned outer adapters;
 - authenticated `RELAY_TRANSFER_MODE=cpu_staged` transfers;
 - source CUDA -> CPU float32 -> destination CUDA consumer-dtype relays without
@@ -73,8 +80,8 @@ The relevant implementation already includes:
   memory;
 - strict artifact/completion/source authentication throughout the workflow.
 
-At this source revision, the complete local LinkRadius suite ran 163 tests with
-no failures (59 PyTorch-dependent skips in the local lightweight environment),
+At this source revision, the complete local LinkRadius suite ran 171 tests with
+no failures (64 PyTorch-dependent skips in the local lightweight environment),
 all Python files compiled, all seven launchers passed `bash -n`, the canonical
 discovery grid contained 20 tasks, and `git diff --check` passed.
 
@@ -88,7 +95,7 @@ from pathlib import Path
 from RecursiveMAS.inference_utils.linkradius import STRICT_CHOICE_VERSION
 from experiments.linkradius.io_utils import source_hash
 
-expected = "f313855756bbc3febedec70ec472fc618cae8addf1b0a73dc4a8b59cc2315229"
+expected = "e009d574d9ac3124d4db15b934521f41cbc102941dc388e6fed9f71f87542c35"
 actual = source_hash(Path.cwd())
 print({
     "strict_parser": STRICT_CHOICE_VERSION,
@@ -111,7 +118,7 @@ The old-platform root is:
 outputs/linkradius-scaled-mp-membounded-v4
 ```
 
-It is halted and must not be resumed or copied into the H200 root. Reported
+It is halted and must not be resumed or copied into the new four-GPU root. Reported
 progress on that root was:
 
 - split completed;
@@ -139,11 +146,13 @@ while requesting another 20 MiB. This rules out another user's process,
 allocator fragmentation, and incorrect GPU selection. Pinning or requesting an
 exclusive A100 would not solve it.
 
-No activation-checkpointing or saved-tensor CPU-offload change has been made.
-The next run deliberately tests the unchanged, authenticated implementation on
-larger-memory H200 devices. If early-edge gradient task 1 still OOMs on H200,
-stop. The next code change should then be an authenticated autograd
-checkpoint/offload mode and another fresh root.
+The replacement implementation addresses this peak in two ways: it moves
+terminal scoring to an identical frozen solver replica on a fourth GPU, and it
+checkpoints differentiable model forwards so their intermediate activations are
+recomputed during backward. Generic saved-tensor CPU offload is not enabled.
+If the patched early-edge gradient still OOMs on four otherwise-empty 80 GB
+GPUs, stop; the next fallback is selective saved-tensor CPU offload under a new
+source hash and output root.
 
 Earlier roots (`linkradius-scaled-v1`, FLA roots, `membounded-v1`, v2, and v3)
 are also historical failures or diagnostics. Never mix their artifacts.
@@ -203,36 +212,44 @@ result = {
 }
 print(json.dumps(result, indent=2))
 
-if len(gpus) < 3:
-    raise SystemExit("the prescribed model-parallel topology requires 3 visible GPUs")
-if any("H200" not in gpu["name"].upper() for gpu in gpus[:3]):
-    raise SystemExit("the first three logical devices are not all H200 GPUs")
+if len(gpus) < 4:
+    raise SystemExit("the prescribed model-parallel topology requires 4 visible GPUs")
+if len({gpu["name"] for gpu in gpus[:4]}) != 1:
+    raise SystemExit("the first four logical devices are not the same GPU model")
+if any(gpu["total_gib"] < 75.0 for gpu in gpus[:4]):
+    raise SystemExit("one of the first four logical GPUs has less than 75 GiB")
+if any(gpu["free_gib"] / gpu["total_gib"] < 0.95 for gpu in gpus[:4]):
+    raise SystemExit("one of the four allocated GPUs is unexpectedly occupied")
 if packages["flash-linear-attention"] or packages["fla-core"]:
     raise SystemExit("FLA packages are installed; use a clean fallback environment")
 PY
 ```
 
-The prescribed run requires three simultaneously visible H200 GPUs. If the new
-platform exposes only one H200, stop and ask the next Codex session to evaluate
-a separate single-device condition; do not silently change all role devices to
-`cuda:0` under the root defined below.
+The prescribed run requires four simultaneously visible GPUs with at least
+75 GiB each. They are four independent CUDA memory spaces; the patch uses the
+fourth device for the terminal solver rather than pretending to pool memory.
 
-Run the real two-GPU differentiable relay regression inside the allocation:
+Run the placement, checkpoint-equivalence, and real differentiable-relay
+regressions inside the allocation:
 
 ```bash
 python -m unittest \
+  experiments.linkradius.tests.test_model_parallelism.SystemLoaderPlacementTests.test_loader_places_agents_terminal_replica_and_outer_adapters \
+  experiments.linkradius.tests.test_choice_scoring.EndToEndToyScorerTests.test_checkpointed_latent_rollout_matches_output_and_gradient \
+  experiments.linkradius.tests.test_choice_scoring.EndToEndToyScorerTests.test_checkpointed_terminal_scorer_matches_scores_and_gradients \
+  experiments.linkradius.tests.test_choice_scoring.EndToEndToyScorerTests.test_checkpointed_early_edge_margin_matches_full_graph \
   experiments.linkradius.tests.test_model_parallelism.SystemLoaderPlacementTests.test_cpu_staged_cross_gpu_relay_preserves_values_and_gradients
 ```
 
 It must pass rather than skip.
 
-## Fresh H200 experiment identity
+## Fresh four-GPU experiment identity
 
 Use a completely new root on the new platform:
 
 ```bash
 export PYTHON_BIN="$CONDA_PREFIX/bin/python"
-export OUT_ROOT="$PWD/outputs/linkradius-scaled-mp-membounded-h200-v1"
+export OUT_ROOT="$PWD/outputs/linkradius-scaled-mp-checkpoint-4x80-v1"
 export STYLE=sequential_scaled
 export METHOD=ours_recursive
 export DATASETS=gpqa
@@ -244,7 +261,9 @@ export DEVICE=cuda:0
 export PLANNER_DEVICE=cuda:0
 export CRITIC_DEVICE=cuda:1
 export SOLVER_DEVICE=cuda:2
+export TERMINAL_SOLVER_DEVICE=cuda:3
 export RELAY_TRANSFER_MODE=cpu_staged
+export AUTOGRAD_MEMORY_MODE=checkpoint
 export DISCOVERY_BATCHES=20
 export PROBE_RADII="1e-3 3e-3"
 export PROBE_SEEDS=101
@@ -255,12 +274,13 @@ mkdir -p logs
 ```
 
 Export exactly these values for every command, including CPU stages. CPU stages
-reconstruct upstream task identities, so omitting the role map or transfer mode
-makes valid GPU outputs appear missing.
+reconstruct upstream task identities, so omitting the role map, terminal
+placement, checkpoint mode, or transfer mode makes valid GPU outputs appear
+missing.
 
 The role device numbers are logical indices inside the platform-provided
 `CUDA_VISIBLE_DEVICES`. Never use `GPU_LIST` with model parallelism. On Slurm,
-do not manually replace `CUDA_VISIBLE_DEVICES`; request three GPUs and let the
+do not manually replace `CUDA_VISIBLE_DEVICES`; request four GPUs and let the
 scheduler provide the mask.
 
 ## Launching on the new platform
@@ -271,25 +291,25 @@ Set the site-specific partition and optional node. Do not edit `#SBATCH` lines
 inside the tracked launcher:
 
 ```bash
-export H200_PARTITION='<replace-with-H200-partition>'
-export H200_NODE=''
+export GPU_PARTITION='<replace-with-80GB-GPU-partition>'
+export GPU_NODE=''
 
-SBATCH_H200=(-p "$H200_PARTITION" --ntasks=1 --gres=gpu:3)
-if [[ -n "$H200_NODE" ]]; then
-  SBATCH_H200+=(-w "$H200_NODE")
+SBATCH_GPU=(-p "$GPU_PARTITION" --nodes=1 --ntasks=1 --gres=gpu:4)
+if [[ -n "$GPU_NODE" ]]; then
+  SBATCH_GPU+=(-w "$GPU_NODE")
 fi
 ```
 
-If the site requires a typed GRES such as `--gres=gpu:h200:3`, replace only
-that array element. Each experiment array element is one process using three
-GPUs. With only three GPUs available, use `%1` array throttling.
+If the site requires a typed GRES such as `--gres=gpu:a100:4`, replace only
+that array element. Each experiment array element is one process using four
+GPUs. With only four GPUs available, use `%1` array throttling.
 
 ### Dedicated non-Slurm instance
 
-Only on a dedicated instance where GPUs 0, 1, and 2 are assigned to this user:
+Only on a dedicated instance where GPUs 0, 1, 2, and 3 are assigned to this user:
 
 ```bash
-export CUDA_VISIBLE_DEVICES=0,1,2
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 
 run_gpu_task() {
   local stage="$1"
@@ -300,7 +320,7 @@ run_gpu_task() {
 ```
 
 Do not set `SLURM_JOB_ID` manually. For multiple tasks, call `run_gpu_task`
-sequentially unless the instance has another independent set of three GPUs.
+sequentially unless the instance has another independent set of four GPUs.
 
 ## Exact Phase 1 run order
 
@@ -318,7 +338,7 @@ bash experiments/linkradius/run_linkradius_engineering.sh
 
 ```bash
 OVERWRITE=1 LR_STAGE=discover \
-sbatch "${SBATCH_H200[@]}" --array=0 \
+sbatch "${SBATCH_GPU[@]}" --array=0 \
   experiments/linkradius/run_linkradius_engineering.sh
 ```
 
@@ -332,7 +352,7 @@ from pathlib import Path
 from experiments.linkradius.io_utils import load_json, load_jsonl, source_hash, verify_completion
 
 repo = Path.cwd().resolve()
-root = Path("outputs/linkradius-scaled-mp-membounded-h200-v1/engineering")
+root = Path("outputs/linkradius-scaled-mp-checkpoint-4x80-v1/engineering")
 current = source_hash(repo)
 matches = []
 
@@ -350,6 +370,16 @@ if len(matches) != 1:
     raise SystemExit(f"expected one current discovery task 0, found {len(matches)}")
 
 task_dir, manifest = matches[0]
+expected_topology = {
+    "planner": "cuda:0",
+    "critic": "cuda:1",
+    "solver": "cuda:2",
+    "terminal_solver": "cuda:3",
+}
+if manifest.get("role_devices") != expected_topology:
+    raise SystemExit(f"wrong logical topology: {manifest.get('role_devices')}")
+if manifest.get("autograd_memory_mode") != "checkpoint":
+    raise SystemExit("task was not keyed to checkpoint memory mode")
 rows = [
     row for row in load_jsonl(task_dir / "screening_rows.jsonl")
     if row.get("record_type") == "sample"
@@ -385,7 +415,7 @@ PY
 
 ```bash
 OVERWRITE=1 LR_STAGE=discover \
-sbatch "${SBATCH_H200[@]}" --array=1-19%1 \
+sbatch "${SBATCH_GPU[@]}" --array=1-19%1 \
   experiments/linkradius/run_linkradius_engineering.sh
 ```
 
@@ -400,7 +430,7 @@ from experiments.linkradius.io_utils import load_json, load_jsonl, source_hash, 
 from experiments.linkradius.select_clean_correct import classify_screening_row
 
 repo = Path.cwd().resolve()
-root = Path("outputs/linkradius-scaled-mp-membounded-h200-v1/engineering")
+root = Path("outputs/linkradius-scaled-mp-checkpoint-4x80-v1/engineering")
 current = source_hash(repo)
 seen = {}
 reasons = Counter()
@@ -418,6 +448,15 @@ for marker in root.rglob(".complete.json"):
     completion = verify_completion(task_dir)
     if completion.get("source_hash") != current:
         continue
+    if manifest.get("role_devices") != {
+        "planner": "cuda:0",
+        "critic": "cuda:1",
+        "solver": "cuda:2",
+        "terminal_solver": "cuda:3",
+    }:
+        raise SystemExit(f"task {task.get('array_index')}: wrong logical topology")
+    if manifest.get("autograd_memory_mode") != "checkpoint":
+        raise SystemExit(f"task {task.get('array_index')}: wrong memory mode")
     index = int(task["array_index"])
     if index in seen:
         raise SystemExit(f"duplicate current discovery index {index}")
@@ -461,17 +500,17 @@ OVERWRITE=1 LR_STAGE=freeze_execution \
 bash experiments/linkradius/run_linkradius_engineering.sh
 
 OVERWRITE=1 LR_STAGE=clean \
-sbatch "${SBATCH_H200[@]}" --array=0 \
+sbatch "${SBATCH_GPU[@]}" --array=0 \
   experiments/linkradius/run_linkradius_engineering.sh
 ```
 
-The freeze is CPU-only. Clean is a one-element three-GPU stage.
+The freeze is CPU-only. Clean is a one-element four-GPU stage.
 
 ### 5. Replay
 
 ```bash
 OVERWRITE=1 LR_STAGE=replay \
-sbatch "${SBATCH_H200[@]}" --array=0-9%1 \
+sbatch "${SBATCH_GPU[@]}" --array=0-9%1 \
   experiments/linkradius/run_linkradius_engineering.sh
 ```
 
@@ -488,7 +527,7 @@ The grid must report `total_tasks=2` and `max_array_index=1`. Then submit:
 
 ```bash
 OVERWRITE=1 LR_STAGE=probe \
-sbatch "${SBATCH_H200[@]}" --array=0-1%1 \
+sbatch "${SBATCH_GPU[@]}" --array=0-1%1 \
   experiments/linkradius/run_linkradius_engineering.sh
 ```
 
@@ -498,7 +537,7 @@ Run the terminal check first:
 
 ```bash
 OVERWRITE=1 LR_STAGE=gradient \
-sbatch "${SBATCH_H200[@]}" --array=0 \
+sbatch "${SBATCH_GPU[@]}" --array=0 \
   experiments/linkradius/run_linkradius_engineering.sh
 ```
 
@@ -507,14 +546,14 @@ check:
 
 ```bash
 OVERWRITE=1 LR_STAGE=gradient \
-sbatch "${SBATCH_H200[@]}" --array=1 \
+sbatch "${SBATCH_GPU[@]}" --array=1 \
   experiments/linkradius/run_linkradius_engineering.sh
 ```
 
-Capture the array-1 peak-memory log. If it OOMs on an otherwise empty H200, do
-not retry on another H200 and do not alter the environment within this root.
-Stop and implement a source-hashed activation-checkpoint/saved-tensor-offload
-mode under a new output root.
+Capture the array-1 peak-memory log. If it OOMs on four otherwise-empty 80 GB
+GPUs, do not retry on another node and do not alter the environment within this
+root. Stop and implement selective saved-tensor CPU offload under a new source
+hash and output root.
 
 ### 8. Legacy equivalence and engineering validation
 
@@ -528,7 +567,7 @@ import torch
 from experiments.linkradius.io_utils import source_hash, verify_completion
 
 repo = Path.cwd().resolve()
-root = repo / "outputs/linkradius-scaled-mp-membounded-h200-v1/engineering/gpqa/R2/validation/clean"
+root = repo / "outputs/linkradius-scaled-mp-checkpoint-4x80-v1/engineering/gpqa/R2/validation/clean"
 current = source_hash(repo)
 candidates = []
 
@@ -550,7 +589,7 @@ print(f"export RAW_INDEX={int(trajectory.raw_indices[0])}")
 PY
 ```
 
-Copy the two printed exports. Run the release path inside a one-GPU H200
+Copy the two printed exports. Run the release path inside a one-GPU 80 GB
 allocation in the same environment:
 
 ```bash
@@ -597,36 +636,41 @@ Do not start Phase 2 unless this produces a passed, authenticated
 - Never mix Python environments within one output root.
 - Do not modify `RecursiveMAS` or `experiments/linkradius` after `split`.
 - Scheduler partition, node, and physical GPU allocation may change safely;
-  logical role devices and `RELAY_TRANSFER_MODE` may not.
+  logical role devices, `TERMINAL_SOLVER_DEVICE`, `AUTOGRAD_MEMORY_MODE`, and
+  `RELAY_TRANSFER_MODE` may not.
 - `nvidia-smi` can show every physical GPU even when a job is masked. Use the
   task manifest's `scheduler_environment.cuda_visible_devices` and PyTorch's
   logical device accounting.
-- `GPU_LIST="0 1 2"` does not combine memory. It means round-robin
+- `GPU_LIST="0 1 2 3"` does not combine memory. It means round-robin
   one-GPU-per-array-task routing and is deliberately rejected with role maps.
 - Do not weaken JSON finiteness, scorer agreement, parser, provenance, or gate
   checks to make a stage pass.
 - A node change does not alter the source hash. A tracked source edit does.
 
-Expected known-good checkpoint identities from the old resolver were:
+Expected known-good primary-checkpoint identities from the old resolver were:
 
 ```text
 model_hash:   2c18218f3fcb202e23746abf17b438cfebdbc6ce735baf407c2f2d62a494191b
 adapter_hash: 245f624ddcab7747b901a42c50d8a642bebc3cac4a5907807d16e19237e24341
 ```
 
-Compare these after the new clean capture. A mismatch requires investigation;
-do not continue to replay or gradient validation.
+The adapter hash should remain unchanged. The aggregate model hash will change
+because the new provenance explicitly adds a second `terminal_solver` identity,
+even though it points to the same solver checkpoint. Compare the individual
+planner, critic, solver, and terminal-solver artifact identities; the solver and
+terminal-solver identities must be identical. Any other mismatch requires
+investigation before replay or gradient validation.
 
 ## Moving the work to the other cloud
 
 1. Commit this handoff and push the current private branch.
-2. Clone or pull that exact branch on the H200 platform.
+2. Clone or pull that exact branch on the four-GPU platform.
 3. Verify the expected LinkRadius source hash before installing/running.
 4. Keep model caches and `outputs/` on persistent cloud storage, not in Git.
-5. Do not transfer old experiment artifacts to populate the fresh H200 root.
+5. Do not transfer old experiment artifacts to populate the fresh four-GPU root.
 6. Update this file with job IDs, completed/failed indices, GPU masks, and the
    exact next command before switching platforms again.
 7. Use `tmux` or the platform's persistent job mechanism for long commands.
 
-If source must change after the H200 run begins, stop all jobs, update this
+If source must change after the four-GPU run begins, stop all jobs, update this
 handoff, choose a new output-root name, and restart from `split`.

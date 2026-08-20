@@ -37,7 +37,7 @@ from . import linkradius as lr
 
 SCORER_VERSION = "linkradius_forced_choice_v1"
 TRAJECTORY_VERSION = "linkradius_clean_trajectory_v1"
-RUNTIME_VERSION = "linkradius_persistent_sequential_v3"
+RUNTIME_VERSION = "linkradius_persistent_sequential_v4"
 SYSTEM_IDENTITY_VERSION = "linkradius_portable_system_identity_v1"
 DEFAULT_SCORER_PREFIX = "Final Choice: \\boxed{"
 DEFAULT_VERBALIZERS: Mapping[str, str] = {
@@ -47,8 +47,10 @@ DEFAULT_VERBALIZERS: Mapping[str, str] = {
     "D": "D}",
 }
 CHOICE_LABELS: Tuple[str, ...] = tuple(DEFAULT_VERBALIZERS)
-SEQUENTIAL_ROLES: Tuple[str, ...] = ("planner", "critic", "solver")
+SEQUENTIAL_AGENT_ROLES: Tuple[str, ...] = ("planner", "critic", "solver")
+SEQUENTIAL_ROLES: Tuple[str, ...] = (*SEQUENTIAL_AGENT_ROLES, "terminal_solver")
 RELAY_TRANSFER_MODES: Tuple[str, ...] = ("direct", "cpu_staged")
+AUTOGRAD_MEMORY_MODES: Tuple[str, ...] = ("none", "checkpoint")
 EDGE_CONSUMER_ROLES: Mapping[str, str] = {
     "p2c": "critic",
     "c2s": "solver",
@@ -537,7 +539,9 @@ class RuntimeConfig:
     planner_device: str = ""
     critic_device: str = ""
     solver_device: str = ""
+    terminal_solver_device: str = ""
     relay_transfer_mode: str = "cpu_staged"
+    autograd_memory_mode: str = "none"
     dtype: str = "auto"
     outer_dtype: str = "auto"
     enable_thinking: bool = False
@@ -564,12 +568,14 @@ class RuntimeConfig:
         self.device = str(self.device).strip()
         if not self.device:
             raise ValueError("device must not be empty")
-        for role in SEQUENTIAL_ROLES:
+        for role in SEQUENTIAL_AGENT_ROLES:
             field_name = f"{role}_device"
             explicit = str(getattr(self, field_name) or "").strip()
             # Canonicalize fallback placement immediately so semantically
             # identical configurations hash identically in saved trajectories.
             setattr(self, field_name, explicit or self.device)
+        terminal_explicit = str(self.terminal_solver_device or "").strip()
+        self.terminal_solver_device = terminal_explicit or self.solver_device
         self.relay_transfer_mode = (
             str(self.relay_transfer_mode or "").strip().lower()
         )
@@ -577,6 +583,14 @@ class RuntimeConfig:
             raise ValueError(
                 "relay_transfer_mode must be one of "
                 f"{RELAY_TRANSFER_MODES}, got {self.relay_transfer_mode!r}"
+            )
+        self.autograd_memory_mode = str(
+            self.autograd_memory_mode or ""
+        ).strip().lower()
+        if self.autograd_memory_mode not in AUTOGRAD_MEMORY_MODES:
+            raise ValueError(
+                "autograd_memory_mode must be one of "
+                f"{AUTOGRAD_MEMORY_MODES}, got {self.autograd_memory_mode!r}"
             )
         if int(self.rounds) < 1:
             raise ValueError("rounds must be at least 1")
@@ -1169,12 +1183,32 @@ class LinkRadiusRuntime:
             raise ValueError(
                 f"Incomplete sequential system: agents={missing_agents}, adapters={missing_adapters}"
             )
+        terminal_solver = getattr(system, "terminal_solver", None)
+        if (
+            self.config.terminal_solver_device != self.config.solver_device
+            and terminal_solver is None
+        ):
+            raise ValueError(
+                "a distinct terminal_solver_device requires a loaded terminal solver replica"
+            )
+        if terminal_solver is not None:
+            solver_hidden = int(agents["solver"].model.get_input_embeddings().weight.size(-1))
+            terminal_hidden = int(
+                terminal_solver.model.get_input_embeddings().weight.size(-1)
+            )
+            if terminal_hidden != solver_hidden:
+                raise ValueError(
+                    "terminal solver replica hidden size differs from the feedback solver"
+                )
 
     @staticmethod
     def _freeze_system_parameters(system: Any) -> None:
         modules: List[Any] = []
         for agent in system.agents.values():
             modules.extend((agent.model, agent.inner_adapter))
+        terminal_solver = getattr(system, "terminal_solver", None)
+        if terminal_solver is not None:
+            modules.append(terminal_solver.model)
         modules.extend(system.outer_adapters.values())
         for module in modules:
             if module is None:
@@ -1321,6 +1355,11 @@ class LinkRadiusRuntime:
             )
             for key in model_repo_keys
         }
+        if getattr(system, "terminal_solver", None) is not None:
+            # The loader constructs the replica from this exact resolved solver
+            # path. Reuse its already-computed portable identity instead of
+            # hashing a large local checkpoint directory twice.
+            model_artifacts["terminal_solver"] = dict(model_artifacts["solver"])
         inner_artifacts = {
             key: _portable_artifact_identity(
                 path,
@@ -1350,6 +1389,11 @@ class LinkRadiusRuntime:
             "adapter_hash": _stable_json_hash(adapter_identity),
             "system_diagnostic_paths": {
                 "repo_paths": repo_paths,
+                "terminal_solver_repo_path": (
+                    repo_paths.get("solver")
+                    if getattr(system, "terminal_solver", None) is not None
+                    else None
+                ),
                 "inner_adapter_paths": inner_paths,
                 "outer_adapter_paths": outer_paths,
             },
@@ -1373,10 +1417,17 @@ class LinkRadiusRuntime:
         declared = dict(getattr(system, "role_devices", {}) or {}).get(normalized)
         if declared is not None:
             return t.device(declared)
-        agent = system.agents[normalized]
+        if normalized == "terminal_solver":
+            agent = getattr(system, "terminal_solver", None) or system.agents["solver"]
+        else:
+            agent = system.agents[normalized]
         for parameter in agent.model.parameters():
             return parameter.device
         return t.device(configured)
+
+    def _terminal_agent(self) -> Any:
+        system = self._ensure_system()
+        return getattr(system, "terminal_solver", None) or system.agents["solver"]
 
     @staticmethod
     def edge_consumer_role(edge: Any) -> str:
@@ -1387,7 +1438,11 @@ class LinkRadiusRuntime:
             raise ValueError(f"unknown relay edge site: {parsed.site!r}") from exc
 
     def edge_consumer_device(self, edge: Any) -> Any:
-        return self.role_device(self.edge_consumer_role(edge))
+        parsed = lr.parse_edge(edge) if not isinstance(edge, lr.Edge) else edge
+        lr.validate_edge(parsed, self.config.rounds)
+        if parsed.site == "c2s" and parsed.round_idx == self.config.rounds - 1:
+            return self.role_device("terminal_solver")
+        return self.role_device(self.edge_consumer_role(parsed))
 
     def _transfer_relay(
         self,
@@ -1557,22 +1612,47 @@ class LinkRadiusRuntime:
         inner_adapter: Any,
         input_embeds: Any,
         attention_mask: Any,
+        *,
+        differentiable: bool,
     ) -> Any:
         t = _require_torch()
         hidden_states: List[Any] = []
-        for _ in range(int(self.config.latent_steps)):
+
+        def last_hidden_for(embeds: Any, mask: Any) -> Any:
             kwargs = {
-                "inputs_embeds": input_embeds,
-                "attention_mask": attention_mask,
+                "inputs_embeds": embeds,
+                "attention_mask": mask,
                 "output_hidden_states": True,
                 "use_cache": False,
                 "return_dict": True,
             }
             try:
-                outputs = model(logits_to_keep=1, **kwargs)
+                model_outputs = model(logits_to_keep=1, **kwargs)
             except TypeError:
-                outputs = model(**kwargs)
-            last_hidden = outputs.hidden_states[-1][:, -1, :]
+                model_outputs = model(**kwargs)
+            result = model_outputs.hidden_states[-1][:, -1, :]
+            # Do not keep the tuple of every layer's returned hidden state alive
+            # while the following latent step allocates its forward buffers.
+            del model_outputs
+            return result
+
+        for _ in range(int(self.config.latent_steps)):
+            if (
+                differentiable
+                and self.config.autograd_memory_mode == "checkpoint"
+                and bool(getattr(input_embeds, "requires_grad", False))
+            ):
+                from torch.utils.checkpoint import checkpoint
+
+                last_hidden = checkpoint(
+                    last_hidden_for,
+                    input_embeds,
+                    attention_mask,
+                    use_reentrant=False,
+                    preserve_rng_state=True,
+                )
+            else:
+                last_hidden = last_hidden_for(input_embeds, attention_mask)
             hidden_states.append(last_hidden.unsqueeze(1))
             next_embed = _run_adapter(inner_adapter, last_hidden, input_embeds.dtype).unsqueeze(1)
             input_embeds = t.cat((input_embeds, next_embed), dim=1)
@@ -1614,6 +1694,7 @@ class LinkRadiusRuntime:
                     agent.inner_adapter,
                     embed_layer(ids),
                     mask,
+                    differentiable=differentiable,
                 )
                 self_state = _run_adapter(agent.inner_adapter, hidden, embed_dtype)
                 batches.append(
@@ -1646,6 +1727,8 @@ class LinkRadiusRuntime:
         boundaries: Sequence[Tuple[int, int]],
         outer_key: str,
         consumer_role: str,
+        consumer_agent: Any = None,
+        consumer_device: Any = None,
         transport_dtype: Any,
         action: str,
         differentiable: bool,
@@ -1653,9 +1736,17 @@ class LinkRadiusRuntime:
         t = _require_torch()
         system = self._ensure_system()
         agent = system.agents[role]
-        consumer = system.agents[consumer_role]
+        consumer = (
+            consumer_agent
+            if consumer_agent is not None
+            else system.agents[consumer_role]
+        )
         role_device = self.role_device(role)
-        consumer_device = self.role_device(consumer_role)
+        resolved_consumer_device = (
+            self.role_device(consumer_role)
+            if consumer_device is None
+            else t.device(consumer_device)
+        )
         embed_layer = agent.model.get_input_embeddings()
         embed_dtype = embed_layer.weight.dtype
         if int(incoming.size(-1)) != int(embed_layer.weight.size(-1)):
@@ -1681,6 +1772,7 @@ class LinkRadiusRuntime:
                     agent.inner_adapter,
                     embedded,
                     mask,
+                    differentiable=differentiable,
                 )
                 self_state = _run_adapter(agent.inner_adapter, hidden, embed_dtype)
                 outputs.append(
@@ -1694,7 +1786,7 @@ class LinkRadiusRuntime:
         consumer_dtype = consumer.model.get_input_embeddings().weight.dtype
         receiver, realized_transfer_mode = self._transfer_relay(
             transport,
-            consumer_device,
+            resolved_consumer_device,
             consumer_dtype,
         )
         self._audit(action, round_idx, "end")
@@ -1737,6 +1829,13 @@ class LinkRadiusRuntime:
             len(questions),
         )
         critic_dtype = system.agents["critic"].model.get_input_embeddings().weight.dtype
+        terminal_round = int(round_idx) == int(self.config.rounds) - 1
+        consumer_agent = self._terminal_agent() if terminal_round else system.agents["solver"]
+        consumer_device = (
+            self.role_device("terminal_solver")
+            if terminal_round
+            else self.role_device("solver")
+        )
         return self._emit_from_slot(
             role="critic",
             questions=questions,
@@ -1745,6 +1844,8 @@ class LinkRadiusRuntime:
             boundaries=boundaries,
             outer_key="outer_23",
             consumer_role="solver",
+            consumer_agent=consumer_agent,
+            consumer_device=consumer_device,
             transport_dtype=critic_dtype,
             action="critic",
             differentiable=differentiable,
@@ -1813,9 +1914,8 @@ class LinkRadiusRuntime:
         """Build the exact final-solver embedding sequences before continuation."""
 
         t = _require_torch()
-        system = self._ensure_system()
-        agent = system.agents["solver"]
-        solver_device = self.role_device("solver")
+        agent = self._terminal_agent()
+        solver_device = self.role_device("terminal_solver")
         embed_layer = agent.model.get_input_embeddings()
         embed_dtype = embed_layer.weight.dtype
         if len(questions) != int(critic_message.size(0)):
@@ -1898,11 +1998,10 @@ class LinkRadiusRuntime:
         """
 
         t = _require_torch()
-        system = self._ensure_system()
-        agent = system.agents["solver"]
+        agent = self._terminal_agent()
         model = agent.model
         tokenizer = agent.tokenizer
-        solver_device = self.role_device("solver")
+        solver_device = self.role_device("terminal_solver")
         embed_layer = model.get_input_embeddings()
         embed_dtype = embed_layer.weight.dtype
         boundaries = validate_batch_boundaries(
@@ -1955,17 +2054,41 @@ class LinkRadiusRuntime:
                     ]
                     padded, mask, lengths = _pad_left_embeds(sequences, solver_device)
                     keep = max(len(encoding.token_ids) + 1, encoding.token_count + 1)
-                    kwargs = {
-                        "inputs_embeds": padded,
-                        "attention_mask": mask,
-                        "use_cache": False,
-                        "return_dict": True,
-                    }
-                    try:
-                        output = model(logits_to_keep=keep, **kwargs)
-                    except TypeError:
-                        output = model(**kwargs)
-                    logits = output.logits
+                    def logits_for(
+                        embeds: Any,
+                        attention: Any,
+                        _keep: int = int(keep),
+                    ) -> Any:
+                        kwargs = {
+                            "inputs_embeds": embeds,
+                            "attention_mask": attention,
+                            "use_cache": False,
+                            "return_dict": True,
+                        }
+                        try:
+                            model_output = model(logits_to_keep=_keep, **kwargs)
+                        except TypeError:
+                            model_output = model(**kwargs)
+                        result = model_output.logits
+                        del model_output
+                        return result
+
+                    if (
+                        differentiable
+                        and self.config.autograd_memory_mode == "checkpoint"
+                        and bool(getattr(padded, "requires_grad", False))
+                    ):
+                        from torch.utils.checkpoint import checkpoint
+
+                        logits = checkpoint(
+                            logits_for,
+                            padded,
+                            mask,
+                            use_reentrant=False,
+                            preserve_rng_state=True,
+                        )
+                    else:
+                        logits = logits_for(padded, mask)
                     # Models supporting logits_to_keep return a suffix. Models
                     # ignoring it return the full sequence; both are handled.
                     logit_origin = int(padded.size(1)) - int(logits.size(1))
@@ -2054,9 +2177,8 @@ class LinkRadiusRuntime:
         """Run the ordinary deterministic release generation at terminal c2s."""
 
         t = _require_torch()
-        system = self._ensure_system()
-        agent = system.agents["solver"]
-        solver_device = self.role_device("solver")
+        agent = self._terminal_agent()
+        solver_device = self.role_device("terminal_solver")
         boundaries = validate_batch_boundaries(
             batch_boundaries or _default_boundaries(len(questions), self.config.batch_size),
             len(questions),
@@ -2099,8 +2221,8 @@ class LinkRadiusRuntime:
         attempted = [index in set(pending) for index in range(len(outputs))]
         if not pending:
             return list(outputs), attempted
-        agent = self._ensure_system().agents["solver"]
-        solver_device = self.role_device("solver")
+        agent = self._terminal_agent()
+        solver_device = self.role_device("terminal_solver")
         prompts = [
             f"{str(outputs[index]).rstrip()}\n{self.config.scorer_prefix}" for index in pending
         ]
@@ -3109,7 +3231,7 @@ class LinkRadiusRuntime:
             trajectory.dtype_metadata(edge).consumer_dtype
         )
         leaf = trajectory.message(edge, receiver=True).to(
-            device=self.role_device("solver"),
+            device=self.edge_consumer_device(edge),
             dtype=consumer_dtype,
         ).detach()
         leaf.requires_grad_(True)

@@ -396,6 +396,9 @@ def _task_manifest(args: argparse.Namespace, task: Mapping[str, Any], repo_root:
         "relay_transfer_mode": str(
             getattr(args, "relay_transfer_mode", "cpu_staged")
         ),
+        "autograd_memory_mode": str(
+            getattr(args, "autograd_memory_mode", "none")
+        ),
         # Scheduler placement is diagnostic rather than scientific identity:
         # logical role devices are hashed above, while physical allocation may
         # change safely between otherwise identical jobs.
@@ -420,6 +423,10 @@ def _resolved_role_devices(args: argparse.Namespace) -> dict[str, str]:
     for role in ("planner", "critic", "solver"):
         explicit = str(getattr(args, f"{role}_device", "") or "").strip()
         result[role] = explicit or fallback
+    terminal_explicit = str(
+        getattr(args, "terminal_solver_device", "") or ""
+    ).strip()
+    result["terminal_solver"] = terminal_explicit or result["solver"]
     return result
 
 
@@ -581,6 +588,9 @@ def _runner_config_digest(
             "role_devices": _resolved_role_devices(args),
             "relay_transfer_mode": str(
                 getattr(args, "relay_transfer_mode", "cpu_staged")
+            ),
+            "autograd_memory_mode": str(
+                getattr(args, "autograd_memory_mode", "none")
             ),
             "explicit_trajectory": _configured_artifact_identity(args.trajectory),
         }
@@ -1264,7 +1274,9 @@ def _runtime(args: argparse.Namespace, *, requested_edge: str | None = None):
         planner_device=role_devices["planner"],
         critic_device=role_devices["critic"],
         solver_device=role_devices["solver"],
+        terminal_solver_device=role_devices["terminal_solver"],
         relay_transfer_mode=args.relay_transfer_mode,
+        autograd_memory_mode=args.autograd_memory_mode,
         dtype="auto",
         outer_dtype="auto",
         enable_thinking=False,
@@ -5299,6 +5311,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--planner-device", default="")
     parser.add_argument("--critic-device", default="")
     parser.add_argument("--solver-device", default="")
+    parser.add_argument("--terminal-solver-device", default="")
     parser.add_argument(
         "--relay-transfer-mode",
         choices=("direct", "cpu_staged"),
@@ -5306,6 +5319,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "relay copy path: cpu_staged uses differentiable GPU->CPU float32->GPU "
             "copies for distinct CUDA role devices"
+        ),
+    )
+    parser.add_argument(
+        "--autograd-memory-mode",
+        choices=("none", "checkpoint"),
+        default="none",
+        help=(
+            "memory policy for differentiable model forwards; checkpoint uses "
+            "non-reentrant activation recomputation"
         ),
     )
     parser.add_argument("--trust-remote-code", type=int, choices=(0, 1), default=1)

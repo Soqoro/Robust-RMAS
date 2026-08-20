@@ -147,6 +147,25 @@ class _CumulativeToyLM(_ToyLM):
         return SimpleNamespace(logits=logits, hidden_states=(hidden,))
 
 
+class _GradientToyLM(_ToyLM):
+    """Toy LM whose candidate scores have a nonzero input-embedding gradient."""
+
+    def forward(self, inputs_embeds, attention_mask=None, logits_to_keep=None, **kwargs):
+        hidden = inputs_embeds.cumsum(dim=1)
+        length = hidden.size(1)
+        keep = min(length, int(logits_to_keep)) if logits_to_keep is not None else length
+        signal = hidden[:, -keep:, :].sum(dim=-1, keepdim=True)
+        scale = torch.linspace(
+            -0.5,
+            0.5,
+            self.bias.numel(),
+            dtype=signal.dtype,
+            device=signal.device,
+        ).view(1, 1, -1)
+        logits = self.bias.to(dtype=signal.dtype).view(1, 1, -1) + signal * scale
+        return SimpleNamespace(logits=logits, hidden_states=(hidden,))
+
+
 class _Identity(torch.nn.Module if torch is not None else object):
     def forward(self, value):
         return value
@@ -155,7 +174,7 @@ class _Identity(torch.nn.Module if torch is not None else object):
 @unittest.skipIf(torch is None, "PyTorch is not installed")
 class EndToEndToyScorerTests(unittest.TestCase):
     @staticmethod
-    def runtime(rounds=1):
+    def runtime(rounds=1, *, autograd_memory_mode="none"):
         tokenizer = _CharTokenizer()
         model = _ToyLM()
         agent = SimpleNamespace(model=model, tokenizer=tokenizer, inner_adapter=_Identity())
@@ -169,9 +188,228 @@ class EndToEndToyScorerTests(unittest.TestCase):
             },
         )
         return LinkRadiusRuntime(
-            RuntimeConfig(rounds=rounds, latent_steps=1, batch_size=1, device="cpu"),
+            RuntimeConfig(
+                rounds=rounds,
+                latent_steps=1,
+                batch_size=1,
+                device="cpu",
+                autograd_memory_mode=autograd_memory_mode,
+            ),
             system=system,
         )
+
+    def test_terminal_scoring_uses_the_dedicated_replica(self):
+        tokenizer = _CharTokenizer()
+        primary = _ToyLM()
+        terminal = _ToyLM()
+        with torch.no_grad():
+            terminal.bias.zero_()
+            terminal.bias[2 + ord("A") % 110] = 20.0
+        primary_agent = SimpleNamespace(
+            model=primary,
+            tokenizer=tokenizer,
+            inner_adapter=_Identity(),
+        )
+        terminal_agent = SimpleNamespace(
+            model=terminal,
+            tokenizer=tokenizer,
+            inner_adapter=None,
+        )
+        system = SimpleNamespace(
+            family="sequential",
+            agents={
+                "planner": primary_agent,
+                "critic": primary_agent,
+                "solver": primary_agent,
+            },
+            terminal_solver=terminal_agent,
+            outer_adapters={
+                "outer_12": _Identity(),
+                "outer_23": _Identity(),
+                "outer_31": _Identity(),
+            },
+        )
+        runtime = LinkRadiusRuntime(
+            RuntimeConfig(rounds=1, latent_steps=1, batch_size=1, device="cpu"),
+            system=system,
+        )
+        result = runtime.score_terminal(
+            ["Question\nA. x\nB. y\nC. z\nD. w"],
+            torch.zeros((1, 2, 8)),
+        )
+        self.assertEqual(result.predictions, ("A",))
+
+    def test_checkpointed_terminal_scorer_matches_scores_and_gradients(self):
+        tokenizer = _CharTokenizer()
+
+        def evaluate(mode):
+            torch.manual_seed(1234)
+            model = _GradientToyLM()
+            agent = SimpleNamespace(
+                model=model,
+                tokenizer=tokenizer,
+                inner_adapter=_Identity(),
+            )
+            terminal_model = _GradientToyLM()
+            terminal_model.load_state_dict(model.state_dict())
+            terminal_agent = SimpleNamespace(
+                model=terminal_model,
+                tokenizer=tokenizer,
+                inner_adapter=None,
+            )
+            system = SimpleNamespace(
+                family="sequential",
+                agents={"planner": agent, "critic": agent, "solver": agent},
+                terminal_solver=terminal_agent,
+                outer_adapters={
+                    "outer_12": _Identity(),
+                    "outer_23": _Identity(),
+                    "outer_31": _Identity(),
+                },
+            )
+            runtime = LinkRadiusRuntime(
+                RuntimeConfig(
+                    rounds=1,
+                    latent_steps=1,
+                    batch_size=1,
+                    device="cpu",
+                    autograd_memory_mode=mode,
+                ),
+                system=system,
+            )
+            relay = torch.linspace(-1.0, 1.0, 16).reshape(1, 2, 8)
+            relay.requires_grad_(True)
+            scoring = runtime.score_terminal(
+                ["Question\nA. x\nB. y\nC. z\nD. w"],
+                relay,
+                differentiable=True,
+                candidate_labels=("A", "D"),
+            )
+            margin = scoring.scores[0, 0] - scoring.scores[0, 1]
+            gradient = torch.autograd.grad(margin, relay)[0]
+            return scoring.scores.detach(), gradient.detach()
+
+        ordinary_scores, ordinary_gradient = evaluate("none")
+        checkpoint_scores, checkpoint_gradient = evaluate("checkpoint")
+        self.assertTrue(torch.allclose(checkpoint_scores, ordinary_scores))
+        self.assertTrue(torch.allclose(checkpoint_gradient, ordinary_gradient))
+        self.assertGreater(float(checkpoint_gradient.abs().sum()), 0.0)
+
+    def test_checkpointed_latent_rollout_matches_output_and_gradient(self):
+        tokenizer = _CharTokenizer()
+
+        def evaluate(mode):
+            torch.manual_seed(4321)
+            model = _CumulativeToyLM()
+            agent = SimpleNamespace(
+                model=model,
+                tokenizer=tokenizer,
+                inner_adapter=_Identity(),
+            )
+            system = SimpleNamespace(
+                family="sequential",
+                agents={"planner": agent, "critic": agent, "solver": agent},
+                outer_adapters={
+                    "outer_12": _Identity(),
+                    "outer_23": _Identity(),
+                    "outer_31": _Identity(),
+                },
+            )
+            runtime = LinkRadiusRuntime(
+                RuntimeConfig(
+                    rounds=2,
+                    latent_steps=2,
+                    batch_size=1,
+                    device="cpu",
+                    autograd_memory_mode=mode,
+                ),
+                system=system,
+            )
+            relay = torch.linspace(-1.0, 1.0, 16).reshape(1, 2, 8)
+            relay.requires_grad_(True)
+            emission = runtime.run_critic(
+                ["Question\nA. x\nB. y\nC. z\nD. w"],
+                relay,
+                0,
+                differentiable=True,
+            )
+            gradient = torch.autograd.grad(emission.receiver.square().sum(), relay)[0]
+            return emission.receiver.detach(), gradient.detach()
+
+        ordinary_output, ordinary_gradient = evaluate("none")
+        checkpoint_output, checkpoint_gradient = evaluate("checkpoint")
+        self.assertTrue(torch.allclose(checkpoint_output, ordinary_output))
+        self.assertTrue(torch.allclose(checkpoint_gradient, ordinary_gradient))
+        self.assertGreater(float(checkpoint_gradient.abs().sum()), 0.0)
+
+    def test_checkpointed_early_edge_margin_matches_full_graph(self):
+        tokenizer = _CharTokenizer()
+
+        def evaluate(mode):
+            torch.manual_seed(9876)
+            model = _GradientToyLM()
+            agent = SimpleNamespace(
+                model=model,
+                tokenizer=tokenizer,
+                inner_adapter=_Identity(),
+            )
+            terminal_model = _GradientToyLM()
+            terminal_model.load_state_dict(model.state_dict())
+            terminal_agent = SimpleNamespace(
+                model=terminal_model,
+                tokenizer=tokenizer,
+                inner_adapter=None,
+            )
+            system = SimpleNamespace(
+                family="sequential",
+                agents={"planner": agent, "critic": agent, "solver": agent},
+                terminal_solver=terminal_agent,
+                outer_adapters={
+                    "outer_12": _Identity(),
+                    "outer_23": _Identity(),
+                    "outer_31": _Identity(),
+                },
+            )
+            runtime = LinkRadiusRuntime(
+                RuntimeConfig(
+                    rounds=2,
+                    latent_steps=2,
+                    batch_size=1,
+                    device="cpu",
+                    autograd_memory_mode=mode,
+                ),
+                system=system,
+            )
+            trajectory = runtime.capture_clean(
+                sample_ids=["sample"],
+                raw_sample_ids=["raw"],
+                raw_indices=[0],
+                questions=["Question\nA. x\nB. y\nC. z\nD. w"],
+                gold_labels=["D"],
+                batch_boundaries=[(0, 1)],
+                analysis_eligibility_mask=[True],
+                include_generation=False,
+            )
+            result = runtime.autograd_gradient(
+                trajectory,
+                "p2c@0",
+                target_label="A",
+                sample_index=0,
+            )
+            return result.objective_value, result.gradient
+
+        ordinary_value, ordinary_gradient = evaluate("none")
+        checkpoint_value, checkpoint_gradient = evaluate("checkpoint")
+        self.assertAlmostEqual(checkpoint_value, ordinary_value, places=6)
+        self.assertTrue(
+            torch.allclose(
+                checkpoint_gradient,
+                ordinary_gradient,
+                atol=1e-6,
+                rtol=1e-5,
+            )
+        )
+        self.assertGreater(float(checkpoint_gradient.abs().sum()), 0.0)
 
     def test_terminal_scorer_returns_four_float32_mean_scores(self):
         runtime = self.runtime()
@@ -303,9 +541,16 @@ class EndToEndToyScorerTests(unittest.TestCase):
 
         expected = (
             (lambda: runtime.run_initial_planner(question), {"planner", "critic"}),
+            (
+                lambda: runtime.run_critic(question, incoming.detach(), 1),
+                {"critic", "terminal_solver"},
+            ),
             (lambda: runtime.run_solver_feedback(question, incoming.detach(), 0), {"solver", "planner"}),
             (lambda: runtime.run_planner_feedback(question, incoming.detach(), 1), {"planner", "critic"}),
-            (lambda: runtime.score_terminal(question, incoming.detach()), {"solver"}),
+            (
+                lambda: runtime.score_terminal(question, incoming.detach()),
+                {"terminal_solver"},
+            ),
         )
         for operation, roles in expected:
             runtime.role_requests.clear()
