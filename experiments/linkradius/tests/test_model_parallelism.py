@@ -202,6 +202,137 @@ class RoleDeviceConfigTests(unittest.TestCase):
 
 
 @unittest.skipIf(torch is None, "PyTorch is not installed")
+class ReleaseRolePlacementTests(unittest.TestCase):
+    def test_release_role_device_fallback_and_terminal_override(self) -> None:
+        from RecursiveMAS.inference_utils import inference_mas
+
+        fallback = inference_mas.resolve_sequential_role_devices(device="cpu")
+        self.assertEqual(
+            {role: str(device) for role, device in fallback.items()},
+            {
+                "planner": "cpu",
+                "critic": "cpu",
+                "solver": "cpu",
+                "terminal_solver": "cpu",
+            },
+        )
+
+        with (
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+            mock.patch.object(torch.cuda, "device_count", return_value=4),
+            mock.patch.object(torch.cuda, "current_device", return_value=0),
+        ):
+            explicit = inference_mas.resolve_sequential_role_devices(
+                device="cuda:0",
+                planner_device="cuda:0",
+                critic_device="cuda:1",
+                solver_device="cuda:2",
+                terminal_solver_device="cuda:3",
+            )
+        self.assertEqual(
+            {role: str(device) for role, device in explicit.items()},
+            {
+                "planner": "cuda:0",
+                "critic": "cuda:1",
+                "solver": "cuda:2",
+                "terminal_solver": "cuda:3",
+            },
+        )
+        with (
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+            mock.patch.object(torch.cuda, "device_count", return_value=3),
+            mock.patch.object(torch.cuda, "current_device", return_value=0),
+        ):
+            terminal_fallback = inference_mas.resolve_sequential_role_devices(
+                device="cuda:0",
+                solver_device="cuda:2",
+            )
+        self.assertEqual(str(terminal_fallback["terminal_solver"]), "cuda:2")
+
+    def test_release_hidden_terminal_device_fails_before_execution(self) -> None:
+        from RecursiveMAS.inference_utils import inference_mas
+
+        with (
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+            mock.patch.object(torch.cuda, "device_count", return_value=3),
+            mock.patch.object(torch.cuda, "current_device", return_value=0),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "terminal_solver"):
+                inference_mas.resolve_sequential_role_devices(
+                    device="cuda:0",
+                    planner_device="cuda:0",
+                    critic_device="cuda:1",
+                    solver_device="cuda:2",
+                    terminal_solver_device="cuda:3",
+                )
+
+    def test_release_wrapper_validates_topology_before_resolving_paths(self) -> None:
+        from RecursiveMAS import run as release_run
+
+        argv = [
+            "RecursiveMAS/run.py",
+            "--style", "sequential_scaled",
+            "--dataset", "gpqa",
+            "--terminal-solver-device", "cuda:3",
+        ]
+        with (
+            mock.patch("sys.argv", argv),
+            mock.patch.object(release_run, "configure_reproducibility"),
+            mock.patch.object(
+                release_run.inference_mas,
+                "resolve_sequential_role_devices",
+                side_effect=RuntimeError("hidden terminal device"),
+            ),
+            mock.patch.object(release_run, "resolve_style_paths") as resolve_paths,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "hidden terminal"):
+                release_run.main()
+        resolve_paths.assert_not_called()
+
+    def test_release_wrapper_forwards_exact_topology_and_transfer_policy(self) -> None:
+        from RecursiveMAS import run as release_run
+
+        args = release_run.build_parser().parse_args([
+            "--style", "sequential_scaled",
+            "--dataset", "gpqa",
+            "--planner-device", "cuda:0",
+            "--critic-device", "cuda:1",
+            "--solver-device", "cuda:2",
+            "--terminal-solver-device", "cuda:3",
+            "--relay-transfer-mode", "cpu_staged",
+        ])
+        cli = release_run.build_common_cli(
+            args,
+            dataset_arg="gpqa",
+            dataset_split="train",
+            latent_steps=48,
+            max_new_tokens=4000,
+        )
+        expected = {
+            "--planner_device": "cuda:0",
+            "--critic_device": "cuda:1",
+            "--solver_device": "cuda:2",
+            "--terminal_solver_device": "cuda:3",
+            "--relay_transfer_mode": "cpu_staged",
+        }
+        for flag, value in expected.items():
+            self.assertEqual(cli.count(flag), 1)
+            index = cli.index(flag)
+            self.assertEqual(cli[index + 1], value)
+
+    def test_release_relay_staging_is_cpu_float32_and_contiguous(self) -> None:
+        from RecursiveMAS.inference_utils import inference_mas
+
+        source = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
+        staged = inference_mas.stage_release_relay(source.transpose(0, 1))
+        self.assertEqual(staged.device.type, "cpu")
+        self.assertEqual(staged.dtype, torch.float32)
+        self.assertTrue(staged.is_contiguous())
+        self.assertFalse(staged.requires_grad)
+        self.assertTrue(torch.equal(staged, source.transpose(0, 1).float()))
+
+
+@unittest.skipIf(torch is None, "PyTorch is not installed")
 class SystemLoaderPlacementTests(unittest.TestCase):
     @staticmethod
     def _paths():

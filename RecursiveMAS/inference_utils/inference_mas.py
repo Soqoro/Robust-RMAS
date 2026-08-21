@@ -177,6 +177,7 @@ METHOD_DEFAULT_SYSTEM_NAMES = {
 
 LATENT_METHODS = {"ours", "ours_recursive", "ours_recursive_no_feedback"}
 RECURSIVE_METHODS = {"text_recursive", "ours_recursive", "ours_recursive_no_feedback"}
+RELEASE_RELAY_TRANSFER_MODES = ("cpu_staged",)
 
 
 def get_release_recommended_settings(style: str, dataset: str) -> Optional[Dict[str, int]]:
@@ -220,7 +221,7 @@ def build_sample_id(
     return f"{dataset_name}:{dataset_split}:{sample_idx}"
 
 
-PROVENANCE_SCHEMA_VERSION = 2
+PROVENANCE_SCHEMA_VERSION = 3
 
 
 def stable_json_sha256(value: Any) -> str:
@@ -407,6 +408,88 @@ def configure_runtime_reproducibility(seed: int, deterministic: bool) -> None:
             torch.backends.cuda.matmul.allow_tf32 = False
         if hasattr(torch.backends, "cudnn") and hasattr(torch.backends.cudnn, "allow_tf32"):
             torch.backends.cudnn.allow_tf32 = False
+
+
+def resolve_sequential_role_devices(
+    *,
+    device: Optional[str] = None,
+    planner_device: str = "",
+    critic_device: str = "",
+    solver_device: str = "",
+    terminal_solver_device: str = "",
+    relay_transfer_mode: str = "cpu_staged",
+) -> Dict[str, torch.device]:
+    """Resolve and validate release-stage placement before model loading.
+
+    The released sequential implementation materializes every inter-agent
+    relay on CPU between stages.  Explicit role placement therefore preserves
+    that chronology while allowing each independently loaded agent to execute
+    on the same logical GPU used by a model-parallel LinkRadius run.
+    """
+
+    normalized_transfer = str(relay_transfer_mode or "").strip().lower()
+    if normalized_transfer not in RELEASE_RELAY_TRANSFER_MODES:
+        raise ValueError(
+            "release relay_transfer_mode must be one of "
+            f"{RELEASE_RELAY_TRANSFER_MODES}, got {relay_transfer_mode!r}"
+        )
+    fallback_text = str(
+        device or ("cuda" if torch.cuda.is_available() else "cpu")
+    ).strip()
+    if not fallback_text:
+        raise ValueError("release device must not be empty")
+    fallback = torch.device(fallback_text)
+    resolved = {
+        "planner": torch.device(str(planner_device or "").strip() or str(fallback)),
+        "critic": torch.device(str(critic_device or "").strip() or str(fallback)),
+        "solver": torch.device(str(solver_device or "").strip() or str(fallback)),
+    }
+    resolved["terminal_solver"] = torch.device(
+        str(terminal_solver_device or "").strip() or str(resolved["solver"])
+    )
+
+    cuda_roles = {
+        role: role_device
+        for role, role_device in resolved.items()
+        if role_device.type == "cuda"
+    }
+    if cuda_roles:
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA release role placement was requested, but CUDA is unavailable"
+            )
+        visible_count = int(torch.cuda.device_count())
+        current_index = (
+            int(torch.cuda.current_device())
+            if any(role_device.index is None for role_device in cuda_roles.values())
+            else 0
+        )
+        unavailable = {
+            role: str(role_device)
+            for role, role_device in cuda_roles.items()
+            if int(
+                role_device.index
+                if role_device.index is not None
+                else current_index
+            )
+            >= visible_count
+        }
+        if unavailable:
+            raise RuntimeError(
+                "requested release role CUDA devices are outside the scheduler-visible "
+                f"logical range 0..{visible_count - 1}: {unavailable}"
+            )
+    return resolved
+
+
+def stage_release_relay(latent: torch.Tensor) -> torch.Tensor:
+    """Materialize an inter-agent relay using the release transfer contract."""
+
+    return latent.detach().to(
+        device="cpu",
+        dtype=torch.float32,
+        non_blocking=False,
+    ).contiguous()
 
 
 def runtime_environment_identity(device: torch.device) -> Dict[str, Any]:
@@ -1696,8 +1779,9 @@ def run_planner_latent_stage(
         )
         lat12, _meta = maybe_perturb(lat12, perturb_cfg, "p2c", round_idx, start)
 
-        for i in range(lat12.size(0)):
-            planner_to_refiner.append(lat12[i].detach().cpu())
+        staged_lat12 = stage_release_relay(lat12)
+        for i in range(staged_lat12.size(0)):
+            planner_to_refiner.append(staged_lat12[i])
 
     release_resources(model, tokenizer, inner_1, outer_12)
     return planner_to_refiner
@@ -1850,8 +1934,9 @@ def run_refiner_latent_stage(
             recorder=role_profile_recorder,
         )
         mapped, _meta = maybe_perturb(mapped, perturb_cfg, "c2s", round_idx, start)
-        for i in range(mapped.size(0)):
-            refiner_to_solver.append(mapped[i].detach().cpu())
+        staged_mapped = stage_release_relay(mapped)
+        for i in range(staged_mapped.size(0)):
+            refiner_to_solver.append(staged_mapped[i])
 
     release_resources(model, tokenizer, inner_2, outer_23)
     return refiner_to_solver
@@ -2006,8 +2091,9 @@ def run_solver_feedback_latent_stage(
             recorder=role_profile_recorder,
         )
         mapped_feedback, _meta = maybe_perturb(mapped_feedback, perturb_cfg, "s2p", round_idx, start)
-        for i in range(mapped_feedback.size(0)):
-            feedback_latents.append(mapped_feedback[i].detach().cpu())
+        staged_feedback = stage_release_relay(mapped_feedback)
+        for i in range(staged_feedback.size(0)):
+            feedback_latents.append(staged_feedback[i])
 
     release_resources(model, tokenizer, inner_3, outer_31)
     return feedback_latents
@@ -2166,8 +2252,9 @@ def run_planner_feedback_latent_stage(
             recorder=role_profile_recorder,
         )
         lat12, _meta = maybe_perturb(lat12, perturb_cfg, "p2c", round_idx, start)
-        for i in range(lat12.size(0)):
-            planner_to_refiner.append(lat12[i].detach().cpu())
+        staged_lat12 = stage_release_relay(lat12)
+        for i in range(staged_lat12.size(0)):
+            planner_to_refiner.append(staged_lat12[i])
 
     release_resources(model, tokenizer, inner_1, outer_12)
     return planner_to_refiner
@@ -2733,6 +2820,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--trust_remote_code", type=int, default=1, choices=[0, 1])
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument(
+        "--planner_device", "--planner-device", dest="planner_device", default=""
+    )
+    parser.add_argument(
+        "--critic_device", "--critic-device", dest="critic_device", default=""
+    )
+    parser.add_argument(
+        "--solver_device", "--solver-device", dest="solver_device", default=""
+    )
+    parser.add_argument(
+        "--terminal_solver_device",
+        "--terminal-solver-device",
+        dest="terminal_solver_device",
+        default="",
+    )
+    parser.add_argument(
+        "--relay_transfer_mode",
+        "--relay-transfer-mode",
+        dest="relay_transfer_mode",
+        default="cpu_staged",
+        choices=RELEASE_RELAY_TRANSFER_MODES,
+    )
     parser.add_argument("--deterministic", type=int, default=1, choices=[0, 1])
     parser.add_argument(
         "--enable_thinking",
@@ -2791,6 +2900,30 @@ def main() -> None:
         f"regime={args.role_response_regime} "
         f"custom_path={args.role_response_regime_path or '<empty>'}"
     )
+
+    device = torch.device(
+        args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    role_devices = resolve_sequential_role_devices(
+        device=str(device),
+        planner_device=args.planner_device,
+        critic_device=args.critic_device,
+        solver_device=args.solver_device,
+        terminal_solver_device=args.terminal_solver_device,
+        relay_transfer_mode=args.relay_transfer_mode,
+    )
+    planner_device = role_devices["planner"]
+    critic_device = role_devices["critic"]
+    solver_device = role_devices["solver"]
+    terminal_solver_device = role_devices["terminal_solver"]
+    resolved_role_device_names = {
+        role: str(role_device) for role, role_device in role_devices.items()
+    }
+    scheduler_environment = {
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+        "slurm_job_nodelist": os.environ.get("SLURM_JOB_NODELIST"),
+    }
 
     planner_model = resolve_model_artifact(args.agent1_model_name_or_path)
     refiner_model = resolve_model_artifact(args.agent2_model_name_or_path)
@@ -2916,16 +3049,16 @@ def main() -> None:
             f"seed={role_profile_cfg.seed} direction={role_profile_cfg.direction}"
         )
 
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     model_dtype = resolve_dtype(args.dtype)
     outer_dtype = resolve_dtype(args.outer_dtype)
     if model_dtype is None or outer_dtype is None:
         raise ValueError("Unsupported dtype configuration.")
 
-    if device.type == "cpu" and model_dtype in {torch.float16, torch.bfloat16}:
+    any_cpu_role = any(value.type == "cpu" for value in role_devices.values())
+    if any_cpu_role and model_dtype in {torch.float16, torch.bfloat16}:
         print("[warn] CPU selected with fp16/bf16. Falling back model dtype to float32.")
         model_dtype = torch.float32
-    if device.type == "cpu" and outer_dtype in {torch.float16, torch.bfloat16}:
+    if any_cpu_role and outer_dtype in {torch.float16, torch.bfloat16}:
         print("[warn] CPU selected with fp16/bf16 outer adapter. Falling back outer dtype to float32.")
         outer_dtype = torch.float32
 
@@ -3012,6 +3145,7 @@ def main() -> None:
         )
         for idx in range(len(run_sample_ids))
     ]
+    inference_source_sha256 = source_tree_sha256()
     trace_recorder: Optional[LatentTraceRecorder] = None
     if args.lc_trace_path:
         trace_sites = parse_lc_trace_sites(args.lc_trace_sites)
@@ -3020,6 +3154,8 @@ def main() -> None:
         trace_recorder = LatentTraceRecorder(
             path=args.lc_trace_path,
             metadata={
+                "provenance_schema_version": PROVENANCE_SCHEMA_VERSION,
+                "source_tree_sha256": inference_source_sha256,
                 "dataset": dataset_label,
                 "style": args.style,
                 "method": args.method,
@@ -3034,6 +3170,9 @@ def main() -> None:
                 "prompt_footer_path": args.prompt_footer_path,
                 "role_response_regime": args.role_response_regime,
                 "role_response_regime_path": args.role_response_regime_path,
+                "role_devices": dict(resolved_role_device_names),
+                "relay_transfer_mode": str(args.relay_transfer_mode),
+                "scheduler_environment": dict(scheduler_environment),
             },
             sample_ids=run_sample_ids,
             sample_indices=(
@@ -3130,7 +3269,6 @@ def main() -> None:
             print("[warn] --num_rollouts > 1 but --do_sample is disabled; outputs may be identical.")
 
     base_sample_seed = args.sample_seed if args.sample_seed >= 0 else args.seed
-    inference_source_sha256 = source_tree_sha256()
     evaluation_protocol = "native"
     evaluation_config_provenance = {
         "protocol": evaluation_protocol,
@@ -3151,6 +3289,7 @@ def main() -> None:
         if str(args.role_response_regime).strip().lower() == "custom"
         else ""
     )
+    solver_artifact_provenance = artifact_identity(solver_model)
     generation_config_provenance = {
         "provenance_schema_version": PROVENANCE_SCHEMA_VERSION,
         "source_tree_sha256": inference_source_sha256,
@@ -3181,7 +3320,8 @@ def main() -> None:
         "models": {
             "planner": artifact_identity(planner_model),
             "critic": artifact_identity(refiner_model),
-            "solver": artifact_identity(solver_model),
+            "solver": solver_artifact_provenance,
+            "terminal_solver": solver_artifact_provenance,
         },
         "inner_aligners": {
             "planner": artifact_identity(args.agent1_inner_aligner_path),
@@ -3217,12 +3357,19 @@ def main() -> None:
             "deterministic_algorithms": bool(torch.are_deterministic_algorithms_enabled()),
             "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG", ""),
             "device_type": str(device.type),
+            "role_devices": dict(resolved_role_device_names),
+            "relay_transfer_mode": str(args.relay_transfer_mode),
             "requested_dtype": str(args.dtype),
             "effective_dtype": str(model_dtype),
             "requested_outer_dtype": str(args.outer_dtype),
             "effective_outer_dtype": str(outer_dtype),
             "trust_remote_code": bool(args.trust_remote_code),
             "environment": runtime_environment_identity(device),
+            "role_environments": {
+                role: runtime_environment_identity(role_device)
+                for role, role_device in role_devices.items()
+            },
+            "scheduler_environment": dict(scheduler_environment),
         },
         "role_response": {
             "regime": str(args.role_response_regime),
@@ -3462,7 +3609,7 @@ def main() -> None:
             do_sample=args.do_sample,
             temperature=args.temperature,
             top_p=args.top_p,
-            device=device,
+            device=terminal_solver_device,
             dtype=model_dtype,
             trust_remote_code=trust_remote_code,
             enable_thinking=enable_thinking,
@@ -3485,7 +3632,7 @@ def main() -> None:
             do_sample=args.do_sample,
             temperature=args.temperature,
             top_p=args.top_p,
-            device=device,
+            device=planner_device,
             dtype=model_dtype,
             trust_remote_code=trust_remote_code,
             enable_thinking=enable_thinking,
@@ -3505,7 +3652,7 @@ def main() -> None:
             do_sample=args.do_sample,
             temperature=args.temperature,
             top_p=args.top_p,
-            device=device,
+            device=critic_device,
             dtype=model_dtype,
             trust_remote_code=trust_remote_code,
             enable_thinking=enable_thinking,
@@ -3525,7 +3672,7 @@ def main() -> None:
             do_sample=args.do_sample,
             temperature=args.temperature,
             top_p=args.top_p,
-            device=device,
+            device=terminal_solver_device,
             dtype=model_dtype,
             trust_remote_code=trust_remote_code,
             enable_thinking=enable_thinking,
@@ -3575,7 +3722,7 @@ def main() -> None:
                 do_sample=args.do_sample,
                 temperature=args.temperature,
                 top_p=args.top_p,
-                device=device,
+                device=planner_device,
                 dtype=model_dtype,
                 trust_remote_code=trust_remote_code,
                 enable_thinking=enable_thinking,
@@ -3595,7 +3742,7 @@ def main() -> None:
                 do_sample=args.do_sample,
                 temperature=args.temperature,
                 top_p=args.top_p,
-                device=device,
+                device=critic_device,
                 dtype=model_dtype,
                 trust_remote_code=trust_remote_code,
                 enable_thinking=enable_thinking,
@@ -3615,7 +3762,7 @@ def main() -> None:
                 do_sample=args.do_sample,
                 temperature=args.temperature,
                 top_p=args.top_p,
-                device=device,
+                device=(terminal_solver_device if rid == recursive_rounds else solver_device),
                 dtype=model_dtype,
                 trust_remote_code=trust_remote_code,
                 enable_thinking=enable_thinking,
@@ -3681,7 +3828,7 @@ def main() -> None:
             outer_12_type=outer_12_type,
             latent_steps=args.latent_steps,
             batch_size=args.batch_size,
-            device=device,
+            device=planner_device,
             model_dtype=model_dtype,
             outer_dtype=outer_dtype,
             trust_remote_code=trust_remote_code,
@@ -3706,7 +3853,7 @@ def main() -> None:
             outer_23_type=outer_23_type,
             latent_steps=args.latent_steps,
             batch_size=args.batch_size,
-            device=device,
+            device=critic_device,
             model_dtype=model_dtype,
             outer_dtype=outer_dtype,
             trust_remote_code=trust_remote_code,
@@ -3732,7 +3879,7 @@ def main() -> None:
             do_sample=args.do_sample,
             temperature=args.temperature,
             top_p=args.top_p,
-            device=device,
+            device=terminal_solver_device,
             dtype=model_dtype,
             trust_remote_code=trust_remote_code,
             enable_thinking=enable_thinking,
@@ -3818,7 +3965,7 @@ def main() -> None:
                     outer_12_type=outer_12_type,
                     latent_steps=args.latent_steps,
                     batch_size=args.batch_size,
-                    device=device,
+                    device=planner_device,
                     model_dtype=model_dtype,
                     outer_dtype=outer_dtype,
                     trust_remote_code=trust_remote_code,
@@ -3846,7 +3993,7 @@ def main() -> None:
                     outer_12_type=outer_12_type,
                     latent_steps=args.latent_steps,
                     batch_size=args.batch_size,
-                    device=device,
+                    device=planner_device,
                     model_dtype=model_dtype,
                     outer_dtype=outer_dtype,
                     trust_remote_code=trust_remote_code,
@@ -3874,7 +4021,7 @@ def main() -> None:
                 outer_23_type=outer_23_type,
                 latent_steps=args.latent_steps,
                 batch_size=args.batch_size,
-                device=device,
+                device=critic_device,
                 model_dtype=model_dtype,
                 outer_dtype=outer_dtype,
                 trust_remote_code=trust_remote_code,
@@ -3903,7 +4050,7 @@ def main() -> None:
                     outer_31_type=outer_31_type,
                     latent_steps=args.latent_steps,
                     batch_size=args.batch_size,
-                    device=device,
+                    device=solver_device,
                     model_dtype=model_dtype,
                     outer_dtype=outer_dtype,
                     trust_remote_code=trust_remote_code,
@@ -3933,7 +4080,7 @@ def main() -> None:
             do_sample=args.do_sample,
             temperature=args.temperature,
             top_p=args.top_p,
-            device=device,
+            device=terminal_solver_device,
             dtype=model_dtype,
             trust_remote_code=trust_remote_code,
             enable_thinking=enable_thinking,
@@ -4093,7 +4240,7 @@ def main() -> None:
             outputs=agent3_outputs,
             dataset_name=dataset_name,
             batch_size=args.batch_size,
-            device=device,
+            device=terminal_solver_device,
             dtype=model_dtype,
             trust_remote_code=trust_remote_code,
             do_sample=args.do_sample,
@@ -4240,7 +4387,7 @@ def main() -> None:
                     do_sample=args.do_sample,
                     temperature=args.temperature,
                     top_p=args.top_p,
-                    device=device,
+                    device=terminal_solver_device,
                     dtype=model_dtype,
                     trust_remote_code=trust_remote_code,
                     enable_thinking=enable_thinking,
@@ -4255,7 +4402,7 @@ def main() -> None:
                     do_sample=args.do_sample,
                     temperature=args.temperature,
                     top_p=args.top_p,
-                    device=device,
+                    device=planner_device,
                     dtype=model_dtype,
                     trust_remote_code=trust_remote_code,
                     enable_thinking=enable_thinking,
@@ -4276,7 +4423,7 @@ def main() -> None:
                     do_sample=args.do_sample,
                     temperature=args.temperature,
                     top_p=args.top_p,
-                    device=device,
+                    device=critic_device,
                     dtype=model_dtype,
                     trust_remote_code=trust_remote_code,
                     enable_thinking=enable_thinking,
@@ -4297,7 +4444,7 @@ def main() -> None:
                     do_sample=args.do_sample,
                     temperature=args.temperature,
                     top_p=args.top_p,
-                    device=device,
+                    device=terminal_solver_device,
                     dtype=model_dtype,
                     trust_remote_code=trust_remote_code,
                     enable_thinking=enable_thinking,
@@ -4312,7 +4459,7 @@ def main() -> None:
                     do_sample=args.do_sample,
                     temperature=args.temperature,
                     top_p=args.top_p,
-                    device=device,
+                    device=planner_device,
                     dtype=model_dtype,
                     trust_remote_code=trust_remote_code,
                     enable_thinking=enable_thinking,
@@ -4333,7 +4480,7 @@ def main() -> None:
                     do_sample=args.do_sample,
                     temperature=args.temperature,
                     top_p=args.top_p,
-                    device=device,
+                    device=critic_device,
                     dtype=model_dtype,
                     trust_remote_code=trust_remote_code,
                     enable_thinking=enable_thinking,
@@ -4354,7 +4501,7 @@ def main() -> None:
                     do_sample=args.do_sample,
                     temperature=args.temperature,
                     top_p=args.top_p,
-                    device=device,
+                    device=solver_device,
                     dtype=model_dtype,
                     trust_remote_code=trust_remote_code,
                     enable_thinking=enable_thinking,
@@ -4372,7 +4519,7 @@ def main() -> None:
                     do_sample=args.do_sample,
                     temperature=args.temperature,
                     top_p=args.top_p,
-                    device=device,
+                    device=planner_device,
                     dtype=model_dtype,
                     trust_remote_code=trust_remote_code,
                     enable_thinking=enable_thinking,
@@ -4393,7 +4540,7 @@ def main() -> None:
                     do_sample=args.do_sample,
                     temperature=args.temperature,
                     top_p=args.top_p,
-                    device=device,
+                    device=critic_device,
                     dtype=model_dtype,
                     trust_remote_code=trust_remote_code,
                     enable_thinking=enable_thinking,
@@ -4414,7 +4561,7 @@ def main() -> None:
                     do_sample=args.do_sample,
                     temperature=args.temperature,
                     top_p=args.top_p,
-                    device=device,
+                    device=terminal_solver_device,
                     dtype=model_dtype,
                     trust_remote_code=trust_remote_code,
                     enable_thinking=enable_thinking,
@@ -4432,7 +4579,7 @@ def main() -> None:
                     do_sample=args.do_sample,
                     temperature=args.temperature,
                     top_p=args.top_p,
-                    device=device,
+                    device=terminal_solver_device,
                     dtype=model_dtype,
                     trust_remote_code=trust_remote_code,
                     enable_thinking=enable_thinking,
@@ -4447,7 +4594,7 @@ def main() -> None:
                     outputs=rollout_outputs,
                     dataset_name=dataset_name,
                     batch_size=args.batch_size,
-                    device=device,
+                    device=terminal_solver_device,
                     dtype=model_dtype,
                     trust_remote_code=trust_remote_code,
                     do_sample=args.do_sample,

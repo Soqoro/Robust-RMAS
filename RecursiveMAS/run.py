@@ -136,6 +136,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--role_profile_direction", default="random", choices=["random"])
     p.add_argument("--trust_remote_code", type=int, default=1, choices=[0, 1])
     p.add_argument("--device", default=None)
+    p.add_argument(
+        "--planner_device", "--planner-device", dest="planner_device", default=""
+    )
+    p.add_argument(
+        "--critic_device", "--critic-device", dest="critic_device", default=""
+    )
+    p.add_argument(
+        "--solver_device", "--solver-device", dest="solver_device", default=""
+    )
+    p.add_argument(
+        "--terminal_solver_device",
+        "--terminal-solver-device",
+        dest="terminal_solver_device",
+        default="",
+    )
+    p.add_argument(
+        "--relay_transfer_mode",
+        "--relay-transfer-mode",
+        dest="relay_transfer_mode",
+        default="cpu_staged",
+        choices=["cpu_staged"],
+    )
     return p
 
 
@@ -316,6 +338,15 @@ def build_common_cli(args: argparse.Namespace, dataset_arg: str, dataset_split: 
     if args.sample_indices:
         out.extend(["--sample_indices", str(args.sample_indices)])
     if str(STYLE_SPECS[args.style]["family"]) == "sequential":
+        out.extend(
+            [
+                "--planner_device", str(args.planner_device),
+                "--critic_device", str(args.critic_device),
+                "--solver_device", str(args.solver_device),
+                "--terminal_solver_device", str(args.terminal_solver_device),
+                "--relay_transfer_mode", str(args.relay_transfer_mode),
+            ]
+        )
         if args.question_suffix_path:
             out.extend(["--question_suffix_path", str(args.question_suffix_path)])
         if args.prompt_footer_path:
@@ -504,8 +535,20 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parent
     dataset_arg = resolve_medqa_dataset_arg(args.dataset, repo_root)
     dataset_split = infer_dataset_split(args.dataset, args.dataset_split)
-    paths = resolve_style_paths(args.style, args.dataset)
     family = str(STYLE_SPECS[args.style]["family"])
+    if family == "sequential":
+        # Validate the complete logical topology before resolving/downloading
+        # any checkpoint paths.  The inference entry point repeats this check
+        # so direct callers receive the same fail-fast contract.
+        inference_mas.resolve_sequential_role_devices(
+            device=args.device,
+            planner_device=args.planner_device,
+            critic_device=args.critic_device,
+            solver_device=args.solver_device,
+            terminal_solver_device=args.terminal_solver_device,
+            relay_transfer_mode=args.relay_transfer_mode,
+        )
+    paths = resolve_style_paths(args.style, args.dataset)
     latent_steps_values = resolve_latent_steps(args.latent_length)
 
     max_new_tokens = infer_max_new_tokens(args.style, args.dataset)

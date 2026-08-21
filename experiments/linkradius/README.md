@@ -171,6 +171,12 @@ export CLEAN_TRAJECTORY=/absolute/path/to/clean_trajectory.pt
 export RAW_INDEX=17                         # use the recorded value, not this example
 export LEGACY_RESULTS="$OUT_ROOT/legacy_release.jsonl"
 export LEGACY_TRACE="$OUT_ROOT/legacy_release_trace.pt"
+export DEVICE="${DEVICE:-cuda:0}"
+export PLANNER_DEVICE="${PLANNER_DEVICE:-$DEVICE}"
+export CRITIC_DEVICE="${CRITIC_DEVICE:-$DEVICE}"
+export SOLVER_DEVICE="${SOLVER_DEVICE:-$DEVICE}"
+export TERMINAL_SOLVER_DEVICE="${TERMINAL_SOLVER_DEVICE:-$SOLVER_DEVICE}"
+export RELAY_TRANSFER_MODE="${RELAY_TRANSFER_MODE:-cpu_staged}"
 
 "$PYTHON_BIN" RecursiveMAS/run.py \
   --style sequential_light \
@@ -178,7 +184,12 @@ export LEGACY_TRACE="$OUT_ROOT/legacy_release_trace.pt"
   --method ours_recursive --num_recursive_rounds 2 \
   --num_samples 1 --sample_indices "$RAW_INDEX" \
   --batch_size 1 --latent_length 32 \
-  --seed 42 --deterministic 1 --device cuda:0 \
+  --seed 42 --deterministic 1 --device "$DEVICE" \
+  --planner-device "$PLANNER_DEVICE" \
+  --critic-device "$CRITIC_DEVICE" \
+  --solver-device "$SOLVER_DEVICE" \
+  --terminal-solver-device "$TERMINAL_SOLVER_DEVICE" \
+  --relay-transfer-mode "$RELAY_TRANSFER_MODE" \
   --result_jsonl "$LEGACY_RESULTS" \
   --lc_trace_path "$LEGACY_TRACE" \
   --lc_trace_sites p2c,c2s,s2p \
@@ -194,9 +205,14 @@ LEGACY_EQUIVALENCE="$OUT_ROOT/legacy_equivalence.json" \
   LR_STAGE=validate bash experiments/linkradius/run_linkradius_engineering.sh
 ```
 
-The comparator reopens and hashes all three artifacts, recomputes the exact
+Run the release command inside an allocation that exposes every logical device
+named by the frozen trajectory. The comparator reopens and hashes all three
+artifacts, requires the release results and trace to authenticate that exact
+role topology and relay-transfer policy, recomputes the exact
 generation/strict-choice/five-relay checks, and binds the report to the current
-source tree. Regenerate it after any result-affecting source change. CPU toy
+release source tree. The relay tolerances are fixed at `atol=rtol=1e-5`; the
+validator rejects reports created with looser values. Regenerate it after any
+result-affecting source change. CPU toy
 checks are not accepted as a substitute for this audit or for real terminal
 finite differences.
 

@@ -5,10 +5,11 @@ import unittest
 from pathlib import Path
 
 from experiments.linkradius.compare_legacy_equivalence import (
+    RELEASE_PROVENANCE_SCHEMA_VERSION,
     build_equivalence_report,
     verify_equivalence_report,
 )
-from experiments.linkradius.io_utils import atomic_write_jsonl
+from experiments.linkradius.io_utils import atomic_write_jsonl, load_jsonl
 from experiments.linkradius.schemas import ContractError
 
 try:
@@ -30,6 +31,19 @@ except (ImportError, ModuleNotFoundError):  # pragma: no cover - lightweight CPU
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+class LegacyToleranceContractTests(unittest.TestCase):
+    def test_noncanonical_equivalence_tolerances_are_rejected_before_loading(self) -> None:
+        with self.assertRaisesRegex(ContractError, "fixed tolerances"):
+            build_equivalence_report(
+                trajectory_path="missing-trajectory.pt",
+                legacy_trace_path="missing-trace.pt",
+                legacy_results_path="missing-results.jsonl",
+                repo_root=REPO_ROOT,
+                atol=1.0,
+                rtol=1.0,
+            )
 
 
 @unittest.skipIf(torch is None, "PyTorch/legacy inference dependencies are unavailable")
@@ -102,6 +116,11 @@ class LegacyEquivalenceTests(unittest.TestCase):
         trajectory.clean_generation_audit = [{"final_text": "Final Choice: A"}]
         trajectory_path = directory / "trajectory.pt"
         torch.save(trajectory, trajectory_path)
+        role_devices = dict(trajectory.provenance["role_devices"])
+        relay_transfer_mode = str(
+            trajectory.provenance["runtime_config"]["relay_transfer_mode"]
+        )
+        release_source_sha256 = inference_mas.source_tree_sha256()
 
         latents = {"p2c": {}, "c2s": {}, "s2p": {}}
         for edge in ("p2c@0", "c2s@0", "s2p@0", "p2c@1", "c2s@1"):
@@ -109,6 +128,8 @@ class LegacyEquivalenceTests(unittest.TestCase):
             latents[site][int(round_text)] = trajectory.message(edge, receiver=False)
         trace = {
             "metadata": {
+                "provenance_schema_version": RELEASE_PROVENANCE_SCHEMA_VERSION,
+                "source_tree_sha256": release_source_sha256,
                 "dataset": "gpqa",
                 "style": "sequential_light",
                 "method": "ours_recursive",
@@ -118,6 +139,8 @@ class LegacyEquivalenceTests(unittest.TestCase):
                 "trace_sites": ["p2c", "c2s", "s2p"],
                 "trace_rounds": [0, 1],
                 "trace_dtype": "float32",
+                "role_devices": role_devices,
+                "relay_transfer_mode": relay_transfer_mode,
             },
             "sample_ids": ["gpqa_diamond:train:7"],
             "sample_indices": [7],
@@ -127,6 +150,8 @@ class LegacyEquivalenceTests(unittest.TestCase):
         torch.save(trace, trace_path)
 
         generation_config = {
+            "provenance_schema_version": RELEASE_PROVENANCE_SCHEMA_VERSION,
+            "source_tree_sha256": release_source_sha256,
             "experiment": {
                 "style": "sequential_light",
                 "method": "ours_recursive",
@@ -145,6 +170,10 @@ class LegacyEquivalenceTests(unittest.TestCase):
                 "do_sample": False,
                 "ans": True,
                 "enable_thinking": False,
+            },
+            "runtime": {
+                "role_devices": role_devices,
+                "relay_transfer_mode": relay_transfer_mode,
             },
         }
         summary = {
@@ -166,6 +195,45 @@ class LegacyEquivalenceTests(unittest.TestCase):
             ],
         )
         return trajectory_path, trace_path, results_path
+
+    @staticmethod
+    def _rewrite_results(results_path: Path, mutate) -> None:
+        rows = load_jsonl(results_path)
+        summaries = [row for row in rows if row.get("type") == "summary"]
+        if len(summaries) != 1:
+            raise AssertionError(f"expected one summary row, found {len(summaries)}")
+        generation_config = summaries[0]["generation_config"]
+        mutate(generation_config)
+        summaries[0]["generation_config_sha256"] = (
+            inference_mas.stable_json_sha256(generation_config)
+        )
+        atomic_write_jsonl(results_path, rows)
+
+    @staticmethod
+    def _rewrite_trace(trace_path: Path, mutate) -> None:
+        trace = torch.load(trace_path, map_location="cpu", weights_only=False)
+        mutate(trace["metadata"])
+        torch.save(trace, trace_path)
+
+    def _assert_rejected(
+        self,
+        trajectory: Path,
+        trace: Path,
+        results: Path,
+    ) -> None:
+        report = build_equivalence_report(
+            trajectory_path=trajectory,
+            legacy_trace_path=trace,
+            legacy_results_path=results,
+            repo_root=REPO_ROOT,
+        )
+        self.assertFalse(report["passed"])
+        self.assertTrue(
+            any(not check["passed"] for check in report["checks"]),
+            report,
+        )
+        with self.assertRaises(ContractError):
+            verify_equivalence_report(report, repo_root=REPO_ROOT)
 
     def test_real_artifacts_are_recomputed_and_authenticated(self) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
@@ -195,6 +263,103 @@ class LegacyEquivalenceTests(unittest.TestCase):
             report["checks"][0]["passed"] = False
             with self.assertRaises(ContractError):
                 verify_equivalence_report(report, repo_root=REPO_ROOT)
+
+    def test_rehashed_result_topology_mismatch_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            trajectory, trace, results = self._fixtures(Path(raw_directory))
+
+            def mutate(config):
+                config["runtime"]["role_devices"]["critic"] = "cuda:1"
+
+            self._rewrite_results(results, mutate)
+            self._assert_rejected(trajectory, trace, results)
+
+    def test_trace_topology_mismatch_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            trajectory, trace, results = self._fixtures(Path(raw_directory))
+
+            def mutate(metadata):
+                metadata["role_devices"]["solver"] = "cuda:2"
+
+            self._rewrite_trace(trace, mutate)
+            self._assert_rejected(trajectory, trace, results)
+
+    def test_result_execution_fields_are_mandatory(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            trajectory, trace, results = self._fixtures(Path(raw_directory))
+
+            def mutate(config):
+                config["runtime"].pop("role_devices")
+                config["runtime"].pop("relay_transfer_mode")
+
+            self._rewrite_results(results, mutate)
+            self._assert_rejected(trajectory, trace, results)
+
+    def test_trace_execution_fields_are_mandatory(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            trajectory, trace, results = self._fixtures(Path(raw_directory))
+
+            def mutate(metadata):
+                metadata.pop("role_devices")
+                metadata.pop("relay_transfer_mode")
+
+            self._rewrite_trace(trace, mutate)
+            self._assert_rejected(trajectory, trace, results)
+
+    def test_wrong_result_relay_policy_is_rejected_after_rehash(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            trajectory, trace, results = self._fixtures(Path(raw_directory))
+
+            def mutate(config):
+                config["runtime"]["relay_transfer_mode"] = "direct"
+
+            self._rewrite_results(results, mutate)
+            self._assert_rejected(trajectory, trace, results)
+
+    def test_wrong_trace_relay_policy_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            trajectory, trace, results = self._fixtures(Path(raw_directory))
+
+            def mutate(metadata):
+                metadata["relay_transfer_mode"] = "direct"
+
+            self._rewrite_trace(trace, mutate)
+            self._assert_rejected(trajectory, trace, results)
+
+    def test_mutually_stale_release_source_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            trajectory, trace, results = self._fixtures(Path(raw_directory))
+            stale_source = "0" * 64
+
+            def mutate_results(config):
+                config["source_tree_sha256"] = stale_source
+
+            def mutate_trace(metadata):
+                metadata["source_tree_sha256"] = stale_source
+
+            self._rewrite_results(results, mutate_results)
+            self._rewrite_trace(trace, mutate_trace)
+            self._assert_rejected(trajectory, trace, results)
+
+    def test_mutually_consistent_but_wrong_topology_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            trajectory, trace, results = self._fixtures(Path(raw_directory))
+            wrong_topology = {
+                "planner": "cuda:0",
+                "critic": "cuda:1",
+                "solver": "cuda:2",
+                "terminal_solver": "cuda:3",
+            }
+
+            def mutate_results(config):
+                config["runtime"]["role_devices"] = dict(wrong_topology)
+
+            def mutate_trace(metadata):
+                metadata["role_devices"] = dict(wrong_topology)
+
+            self._rewrite_results(results, mutate_results)
+            self._rewrite_trace(trace, mutate_trace)
+            self._assert_rejected(trajectory, trace, results)
 
 
 if __name__ == "__main__":

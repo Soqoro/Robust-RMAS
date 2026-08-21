@@ -14,8 +14,13 @@ from .io_utils import atomic_write_json, content_hash, file_sha256, load_jsonl, 
 from .schemas import ContractError
 
 
-EQUIVALENCE_VERSION = "linkradius.legacy_equivalence.v1"
+EQUIVALENCE_VERSION = "linkradius.legacy_equivalence.v2"
+EQUIVALENCE_CONTENT_DOMAIN = "linkradius:legacy_equivalence_report:v2"
 EXPECTED_R2_EDGES = ("p2c@0", "c2s@0", "s2p@0", "p2c@1", "c2s@1")
+EXPECTED_ROLE_KEYS = ("planner", "critic", "solver", "terminal_solver")
+RELEASE_PROVENANCE_SCHEMA_VERSION = 3
+STRICT_ATOL = 1e-5
+STRICT_RTOL = 1e-5
 
 
 def _torch_load(path: str | Path) -> Any:
@@ -98,20 +103,65 @@ def _result_settings(summary: Mapping[str, Any]) -> Mapping[str, Any]:
     return generation
 
 
+def _trajectory_execution_contract(
+    trajectory: Any,
+) -> tuple[dict[str, str], str, Mapping[str, Any]]:
+    provenance = getattr(trajectory, "provenance", None)
+    if not isinstance(provenance, Mapping):
+        raise ContractError("clean trajectory is missing runtime provenance")
+    runtime_config = provenance.get("runtime_config")
+    if not isinstance(runtime_config, Mapping):
+        raise ContractError("clean trajectory is missing runtime_config provenance")
+    declared_roles = provenance.get("role_devices")
+    if not isinstance(declared_roles, Mapping) or set(declared_roles) != set(
+        EXPECTED_ROLE_KEYS
+    ):
+        raise ContractError(
+            "clean trajectory must declare the exact sequential role-device topology"
+        )
+    role_devices = {
+        role: str(declared_roles[role]).strip() for role in EXPECTED_ROLE_KEYS
+    }
+    if any(not value for value in role_devices.values()):
+        raise ContractError("clean trajectory role devices must not be empty")
+    runtime_roles = {
+        role: str(runtime_config.get(f"{role}_device", "")).strip()
+        for role in EXPECTED_ROLE_KEYS
+    }
+    if runtime_roles != role_devices:
+        raise ContractError(
+            "clean trajectory role_devices disagree with its runtime_config"
+        )
+    relay_transfer_mode = str(
+        runtime_config.get("relay_transfer_mode", "")
+    ).strip()
+    if not relay_transfer_mode:
+        raise ContractError("clean trajectory is missing relay_transfer_mode provenance")
+    return role_devices, relay_transfer_mode, runtime_config
+
+
 def build_equivalence_report(
     *,
     trajectory_path: str | Path,
     legacy_trace_path: str | Path,
     legacy_results_path: str | Path,
     repo_root: str | Path,
-    atol: float = 1e-5,
-    rtol: float = 1e-5,
+    atol: float = STRICT_ATOL,
+    rtol: float = STRICT_RTOL,
     created_at: str | None = None,
 ) -> dict[str, Any]:
     """Recompute every equivalence check; no trusted boolean input is accepted."""
 
-    if atol < 0 or rtol < 0 or not math.isfinite(atol) or not math.isfinite(rtol):
-        raise ContractError("legacy equivalence tolerances must be finite and non-negative")
+    if (
+        not math.isfinite(atol)
+        or not math.isfinite(rtol)
+        or float(atol) != STRICT_ATOL
+        or float(rtol) != STRICT_RTOL
+    ):
+        raise ContractError(
+            "legacy equivalence requires the fixed tolerances "
+            f"atol={STRICT_ATOL:g}, rtol={STRICT_RTOL:g}"
+        )
     trajectory_file = Path(trajectory_path).resolve()
     trace_file = Path(legacy_trace_path).resolve()
     results_file = Path(legacy_results_path).resolve()
@@ -127,7 +177,9 @@ def build_equivalence_report(
     from RecursiveMAS.inference_utils import linkradius as lr
 
     raw_index = int(trajectory.raw_indices[0])
-    runtime_config = trajectory.provenance.get("runtime_config", {})
+    expected_role_devices, expected_relay_transfer_mode, runtime_config = (
+        _trajectory_execution_contract(trajectory)
+    )
     generation_config = _result_settings(summary)
     checks: list[dict[str, Any]] = []
 
@@ -166,6 +218,7 @@ def build_equivalence_report(
     experiment = generation_config.get("experiment", {})
     dataset_config = generation_config.get("dataset", {})
     generation = generation_config.get("generation", {})
+    release_runtime = generation_config.get("runtime", {})
     expected_generation = {
         "seed": int(runtime_config.get("seed", 42)),
         "num_rollouts": 1,
@@ -179,6 +232,7 @@ def build_equivalence_report(
         summary.get("generation_config_sha256")
         == inference_mas.stable_json_sha256(generation_config)
     )
+    current_release_source_sha256 = inference_mas.source_tree_sha256()
     checks.append(
         _check(
             "legacy_release_configuration",
@@ -198,6 +252,83 @@ def build_equivalence_report(
             experiment=dict(experiment) if isinstance(experiment, Mapping) else experiment,
             dataset=dict(dataset_config) if isinstance(dataset_config, Mapping) else dataset_config,
             generation=dict(generation) if isinstance(generation, Mapping) else generation,
+        )
+    )
+    observed_result_roles = (
+        dict(release_runtime.get("role_devices", {}))
+        if isinstance(release_runtime, Mapping)
+        and isinstance(release_runtime.get("role_devices"), Mapping)
+        else None
+    )
+    observed_trace_roles = (
+        dict(trace_metadata.get("role_devices", {}))
+        if isinstance(trace_metadata, Mapping)
+        and isinstance(trace_metadata.get("role_devices"), Mapping)
+        else None
+    )
+    checks.append(
+        _check(
+            "legacy_release_execution_topology",
+            provenance_hash_valid
+            and observed_result_roles == expected_role_devices
+            and observed_trace_roles == expected_role_devices,
+            expected=expected_role_devices,
+            result_runtime=observed_result_roles,
+            trace_metadata=observed_trace_roles,
+        )
+    )
+    checks.append(
+        _check(
+            "legacy_release_source_identity",
+            provenance_hash_valid
+            and generation_config.get("provenance_schema_version")
+            == RELEASE_PROVENANCE_SCHEMA_VERSION
+            and generation_config.get("source_tree_sha256")
+            == current_release_source_sha256
+            and isinstance(trace_metadata, Mapping)
+            and trace_metadata.get("provenance_schema_version")
+            == RELEASE_PROVENANCE_SCHEMA_VERSION
+            and trace_metadata.get("source_tree_sha256")
+            == current_release_source_sha256,
+            expected_schema_version=RELEASE_PROVENANCE_SCHEMA_VERSION,
+            expected_source_tree_sha256=current_release_source_sha256,
+            result_schema_version=generation_config.get(
+                "provenance_schema_version"
+            ),
+            result_source_tree_sha256=generation_config.get(
+                "source_tree_sha256"
+            ),
+            trace_schema_version=(
+                trace_metadata.get("provenance_schema_version")
+                if isinstance(trace_metadata, Mapping)
+                else None
+            ),
+            trace_source_tree_sha256=(
+                trace_metadata.get("source_tree_sha256")
+                if isinstance(trace_metadata, Mapping)
+                else None
+            ),
+        )
+    )
+    observed_result_transfer = (
+        release_runtime.get("relay_transfer_mode")
+        if isinstance(release_runtime, Mapping)
+        else None
+    )
+    observed_trace_transfer = (
+        trace_metadata.get("relay_transfer_mode")
+        if isinstance(trace_metadata, Mapping)
+        else None
+    )
+    checks.append(
+        _check(
+            "legacy_relay_transfer_policy",
+            provenance_hash_valid
+            and observed_result_transfer == expected_relay_transfer_mode
+            and observed_trace_transfer == expected_relay_transfer_mode,
+            expected=expected_relay_transfer_mode,
+            result_runtime=observed_result_transfer,
+            trace_metadata=observed_trace_transfer,
         )
     )
 
@@ -295,7 +426,7 @@ def build_equivalence_report(
         "created_at": created_at or datetime.now(timezone.utc).isoformat(),
     }
     report["report_content_hash"] = content_hash(
-        report, domain="linkradius:legacy_equivalence_report:v1"
+        report, domain=EQUIVALENCE_CONTENT_DOMAIN
     )
     return report
 
@@ -312,7 +443,7 @@ def verify_equivalence_report(
         raise ContractError("unsupported legacy-equivalence report schema")
     payload = dict(report)
     supplied_hash = payload.pop("report_content_hash", None)
-    if supplied_hash != content_hash(payload, domain="linkradius:legacy_equivalence_report:v1"):
+    if supplied_hash != content_hash(payload, domain=EQUIVALENCE_CONTENT_DOMAIN):
         raise ContractError("legacy-equivalence report hash is missing or stale")
     if expected_trajectory_path is not None:
         expected_path = str(Path(expected_trajectory_path).resolve())
@@ -341,8 +472,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--legacy-results", required=True)
     parser.add_argument("--repo-root", default=str(Path(__file__).resolve().parents[2]))
     parser.add_argument("--output", required=True)
-    parser.add_argument("--atol", type=float, default=1e-5)
-    parser.add_argument("--rtol", type=float, default=1e-5)
+    parser.add_argument("--atol", type=float, default=STRICT_ATOL)
+    parser.add_argument("--rtol", type=float, default=STRICT_RTOL)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
     report = build_equivalence_report(

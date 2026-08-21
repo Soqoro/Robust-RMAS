@@ -1,6 +1,6 @@
 # LinkRadius four-GPU memory-bounded experiment handoff
 
-Last updated: 2026-08-20 (Asia/Singapore)
+Last updated: 2026-08-22 (Asia/Singapore)
 
 ## Instruction for the next Codex session
 
@@ -52,8 +52,8 @@ identity for result-affecting code is the source hash below; commit and push the
 complete working tree before moving platforms.
 
 ```text
-four-GPU patch base commit: 174d773e6bb8a50dd0f18bf8951acb4d4ae92d3a
-expected LinkRadius source_hash: e009d574d9ac3124d4db15b934521f41cbc102941dc388e6fed9f71f87542c35
+release-topology patch base commit: bd859aa1d1894ddfdd3acd1bbc8ae672e0732310
+expected LinkRadius source_hash: 1834e2d6f06d11532c5d76641f92985c269cb79eba6a12d72d8073fb70fa4136
 strict parser: linkradius_choice_v2
 ```
 
@@ -78,10 +78,14 @@ The relevant implementation already includes:
   diagnostics;
 - sequential one-candidate terminal margin backpropagation to bound scorer
   memory;
-- strict artifact/completion/source authentication throughout the workflow.
+- strict artifact/completion/source authentication throughout the workflow;
+- independent release-runner placement on the same four logical role devices,
+  with CPU-float32 relay staging and topology/policy-authenticated equivalence;
+- release JSONL/trace producer-source authentication and fixed strict
+  equivalence tolerances (`atol=rtol=1e-5`).
 
-At this source revision, the complete local LinkRadius suite ran 171 tests with
-no failures (64 PyTorch-dependent skips in the local lightweight environment),
+At this source revision, the complete local LinkRadius suite ran 185 tests with
+no failures (77 PyTorch-dependent skips in the local lightweight environment),
 all Python files compiled, all seven launchers passed `bash -n`, the canonical
 discovery grid contained 20 tasks, and `git diff --check` passed.
 
@@ -95,7 +99,7 @@ from pathlib import Path
 from RecursiveMAS.inference_utils.linkradius import STRICT_CHOICE_VERSION
 from experiments.linkradius.io_utils import source_hash
 
-expected = "e009d574d9ac3124d4db15b934521f41cbc102941dc388e6fed9f71f87542c35"
+expected = "1834e2d6f06d11532c5d76641f92985c269cb79eba6a12d72d8073fb70fa4136"
 actual = source_hash(Path.cwd())
 print({
     "strict_parser": STRICT_CHOICE_VERSION,
@@ -249,7 +253,7 @@ Use a completely new root on the new platform:
 
 ```bash
 export PYTHON_BIN="$CONDA_PREFIX/bin/python"
-export OUT_ROOT="$PWD/outputs/linkradius-scaled-mp-checkpoint-4x80-v1"
+export OUT_ROOT="$PWD/outputs/linkradius-scaled-mp-checkpoint-4x80-v2"
 export STYLE=sequential_scaled
 export METHOD=ours_recursive
 export DATASETS=gpqa
@@ -352,7 +356,7 @@ from pathlib import Path
 from experiments.linkradius.io_utils import load_json, load_jsonl, source_hash, verify_completion
 
 repo = Path.cwd().resolve()
-root = Path("outputs/linkradius-scaled-mp-checkpoint-4x80-v1/engineering")
+root = Path("outputs/linkradius-scaled-mp-checkpoint-4x80-v2/engineering")
 current = source_hash(repo)
 matches = []
 
@@ -430,7 +434,7 @@ from experiments.linkradius.io_utils import load_json, load_jsonl, source_hash, 
 from experiments.linkradius.select_clean_correct import classify_screening_row
 
 repo = Path.cwd().resolve()
-root = Path("outputs/linkradius-scaled-mp-checkpoint-4x80-v1/engineering")
+root = Path("outputs/linkradius-scaled-mp-checkpoint-4x80-v2/engineering")
 current = source_hash(repo)
 seen = {}
 reasons = Counter()
@@ -567,7 +571,7 @@ import torch
 from experiments.linkradius.io_utils import source_hash, verify_completion
 
 repo = Path.cwd().resolve()
-root = repo / "outputs/linkradius-scaled-mp-checkpoint-4x80-v1/engineering/gpqa/R2/validation/clean"
+root = repo / "outputs/linkradius-scaled-mp-checkpoint-4x80-v2/engineering/gpqa/R2/validation/clean"
 current = source_hash(repo)
 candidates = []
 
@@ -589,8 +593,10 @@ print(f"export RAW_INDEX={int(trajectory.raw_indices[0])}")
 PY
 ```
 
-Copy the two printed exports. Run the release path inside a one-GPU 80 GB
-allocation in the same environment:
+Copy the two printed exports. Run the release path inside a four-GPU allocation
+in the same environment. The independent release runner must reproduce the
+trajectory's logical planner/critic/recurrent-solver/terminal-solver placement;
+running it on one GPU is not an acceptable equivalence control for this root:
 
 ```bash
 export LEGACY_RESULTS="$OUT_ROOT/legacy_release.jsonl"
@@ -603,6 +609,11 @@ python RecursiveMAS/run.py \
   --num_samples 1 --sample_indices "$RAW_INDEX" \
   --batch_size 1 --latent_length 48 \
   --seed 42 --deterministic 1 --device cuda:0 \
+  --planner-device "$PLANNER_DEVICE" \
+  --critic-device "$CRITIC_DEVICE" \
+  --solver-device "$SOLVER_DEVICE" \
+  --terminal-solver-device "$TERMINAL_SOLVER_DEVICE" \
+  --relay-transfer-mode "$RELAY_TRANSFER_MODE" \
   --result_jsonl "$LEGACY_RESULTS" \
   --lc_trace_path "$LEGACY_TRACE" \
   --lc_trace_sites p2c,c2s,s2p \
@@ -614,6 +625,12 @@ python -m experiments.linkradius.compare_legacy_equivalence \
   --legacy-results "$LEGACY_RESULTS" \
   --output "$OUT_ROOT/legacy_equivalence.json"
 ```
+
+On Slurm, place the `RecursiveMAS/run.py` command in a batch job submitted with
+the same `"${SBATCH_GPU[@]}"` four-GPU allocation used above. The wrapper
+validates all four logical CUDA indices before resolving or loading any model.
+The release JSONL and trace both record the role map and `cpu_staged` policy;
+the comparator fails closed if either artifact omits or changes them.
 
 If the comparator reports `"passed": true`, run the CPU validator with the
 same exported topology and transfer mode:
