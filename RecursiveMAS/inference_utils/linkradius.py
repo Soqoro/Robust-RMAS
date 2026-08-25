@@ -979,6 +979,72 @@ def requested_additive_delta(
     return int(sign) * float(h) * _flat_norm(reference) * direction
 
 
+def postcast_budget_fitted_delta(
+    z_ref: Any,
+    lifted_unit_direction: Any,
+    *,
+    relative_budget: float,
+    consumer_dtype: Any,
+    iterations: int = 40,
+) -> Any:
+    """Fit a directional delta to the largest feasible post-cast norm.
+
+    The returned float32 request follows ``lifted_unit_direction``, while the
+    budget is enforced on ``cast(z_ref + delta) - z_ref``.  A short expansion
+    followed by bisection compensates for low-precision rounding that can make
+    a pre-cast normalized request either exceed or substantially undershoot the
+    declared realized budget.
+    """
+
+    if not math.isfinite(float(relative_budget)) or float(relative_budget) < 0.0:
+        raise ValueError("relative_budget must be finite and non-negative")
+    if isinstance(iterations, bool) or int(iterations) < 1:
+        raise ValueError("iterations must be a positive integer")
+    reference = _float32_tensor(z_ref)
+    direction = _float32_tensor(lifted_unit_direction).to(device=reference.device)
+    if tuple(reference.shape) != tuple(direction.shape):
+        raise ValueError("lifted direction and z_ref must have the same shape")
+    direction_norm = _flat_norm(direction)
+    if not torch.isfinite(direction_norm) or float(direction_norm.item()) == 0.0:
+        raise ValueError("lifted direction must have a finite, non-zero norm")
+    unit = direction / direction_norm
+    clean_norm = float(_flat_norm(reference).item())
+    target = float(relative_budget) * clean_norm
+    if target == 0.0:
+        return torch.zeros_like(reference)
+
+    def realized_norm(scale: float) -> float:
+        realized = (
+            cast_receiver_tensor(reference + float(scale) * unit, consumer_dtype)
+            .to(dtype=torch.float32)
+            - reference
+        )
+        value = float(_flat_norm(realized).item())
+        return value if math.isfinite(value) else math.inf
+
+    tolerance = 1e-7 * max(1.0, target)
+    lower = 0.0
+    upper = target
+    best = 0.0
+    # The nominal coefficient is normally already close.  Expansion matters
+    # only when the consumer cast rounds much of a small request away.
+    for _ in range(16):
+        if realized_norm(upper) <= target + tolerance:
+            best = upper
+            lower = upper
+            upper *= 2.0
+        else:
+            break
+    for _ in range(int(iterations)):
+        midpoint = (lower + upper) / 2.0
+        if realized_norm(midpoint) <= target + tolerance:
+            best = midpoint
+            lower = midpoint
+        else:
+            upper = midpoint
+    return float(best) * unit
+
+
 @dataclass(frozen=True)
 class MomentNoiseDiagnostics:
     seed: int
@@ -1648,6 +1714,7 @@ __all__ = [
     "normalize_gpqa_identity_text",
     "parse_edge",
     "parse_strict_choice",
+    "postcast_budget_fitted_delta",
     "probe_pair_diagnostics",
     "project_subspace_coefficients",
     "raw_split_assignment",

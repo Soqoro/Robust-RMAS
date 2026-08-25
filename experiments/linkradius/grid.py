@@ -88,11 +88,13 @@ WORKFLOW_STAGES: dict[str, tuple[str, ...]] = {
         "grid",
     ),
     "attacks": (
-        "train_grid",
-        "train",
+        "split",
+        "freeze_execution",
         "val_grid",
         "val",
         "freeze_attack",
+        "clean_grid",
+        "clean",
         "test_probe_grid",
         "test_probe",
         "test_grid",
@@ -234,11 +236,9 @@ def _default_partitions(workflow: str, stage: str) -> tuple[str, ...]:
         # Phase 3 is forbidden from loading test outcomes.
         return ("attack_train", "validation")
     if workflow == "attacks":
-        if stage == "train":
-            return ("attack_train",)
         if stage == "val":
             return ("validation",)
-        if stage in {"test_probe", "test"}:
+        if stage in {"freeze_execution", "clean", "test_probe", "test"}:
             return ("test",)
     return ("validation",)
 
@@ -330,6 +330,13 @@ def _edge_tokens_for(config: GridConfig, R: int, stage: str) -> tuple[str, ...]:
             return ("p2c@0",)
         if stage == "gradient":
             return ("c2s@1", "p2c@0")
+    if config.workflow == "attacks":
+        if R != 2:
+            raise ContractError(
+                "the first held-out failure-boundary experiment is frozen at R=2"
+            )
+        if stage in {"val", "test_probe", "test"}:
+            return EARLY_R2_EDGES
     return all_edges
 
 
@@ -503,36 +510,43 @@ def _task_payloads(config: GridConfig) -> list[dict[str, Any]]:
                     family_edges = ("c2s@1",)
                 else:
                     family_edges = _edge_tokens_for(config, R, stage)
-                family_batches = (
-                    _eligible_batch_ids(config, partition, batches)
-                    if family == "pgd_autograd"
-                    else batches
-                )
-                for batch_id, edge, epsilon in itertools.product(
-                    family_batches, family_edges, config.attack_epsilons
-                ):
-                    payloads.append(
-                        {
-                            **_with_edge(base, edge, R),
-                            "execution_batch_id": batch_id,
-                            "intervention_mode": "additive",
-                            "attack_family": family,
-                            "epsilon": float(epsilon),
-                            "subspace": config.subspace,
-                        }
-                    )
-        elif stage == "train":
-            for edge, family in itertools.product(
-                _edge_tokens_for(config, R, stage),
-                tuple(value for value in config.attack_families if value != "random_independent"),
-            ):
-                payloads.append(
-                    {
-                        **_with_edge(base, edge, R),
-                        "attack_family": family,
-                        "subspace": config.subspace,
-                    }
-                )
+                family_batches = _eligible_batch_ids(config, partition, batches)
+                if config.workflow == "attacks":
+                    # Sweep every dose under one loaded runtime.  Metadata is
+                    # included in the canonical task key, so changing any
+                    # budget invalidates all dependent completions.
+                    for batch_id, edge in itertools.product(
+                        family_batches, family_edges
+                    ):
+                        payloads.append(
+                            {
+                                **_with_edge(base, edge, R),
+                                "execution_batch_id": batch_id,
+                                "intervention_mode": "additive",
+                                "attack_family": family,
+                                "subspace": config.subspace,
+                                "metadata": {
+                                    "attack_epsilons": [
+                                        float(value)
+                                        for value in config.attack_epsilons
+                                    ]
+                                },
+                            }
+                        )
+                else:
+                    for batch_id, edge, epsilon in itertools.product(
+                        family_batches, family_edges, config.attack_epsilons
+                    ):
+                        payloads.append(
+                            {
+                                **_with_edge(base, edge, R),
+                                "execution_batch_id": batch_id,
+                                "intervention_mode": "additive",
+                                "attack_family": family,
+                                "epsilon": float(epsilon),
+                                "subspace": config.subspace,
+                            }
+                        )
         else:
             raise ContractError(f"no canonical grid is defined for {config.workflow}/{stage}")
     return payloads
@@ -588,6 +602,7 @@ TSV_COLUMNS = (
     "probe_seed",
     "K",
     "subspace",
+    "metadata",
     "config_key",
 )
 
@@ -596,7 +611,16 @@ def grid_tsv(tasks: Sequence[GridTask]) -> str:
     lines = ["\t".join(TSV_COLUMNS)]
     for task in tasks:
         data = task.as_dict()
-        lines.append("\t".join("" if data.get(column) is None else str(data.get(column)) for column in TSV_COLUMNS))
+        lines.append(
+            "\t".join(
+                json.dumps(data.get(column), sort_keys=True)
+                if column == "metadata"
+                else ""
+                if data.get(column) is None
+                else str(data.get(column))
+                for column in TSV_COLUMNS
+            )
+        )
     return "\n".join(lines)
 
 

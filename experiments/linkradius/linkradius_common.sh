@@ -41,6 +41,8 @@ DISCOVERY_BATCHES="${DISCOVERY_BATCHES:-20}"
 PARTITIONS="${PARTITIONS:-}"
 ATTACK_FAMILIES="${ATTACK_FAMILIES:-random_independent pgd_autograd}"
 ATTACK_EPSILONS="${ATTACK_EPSILONS:-1e-3 3e-3 1e-2}"
+PGD_STEPS="${PGD_STEPS:-5}"
+RANDOM_ATTACK_SEED_OFFSET="${RANDOM_ATTACK_SEED_OFFSET:-1000000}"
 REUSE_COMPLETE="${REUSE_COMPLETE:-1}"
 OVERWRITE="${OVERWRITE:-0}"
 SPLIT_MANIFEST="${SPLIT_MANIFEST:-$OUT_ROOT/split_manifest.json}"
@@ -63,7 +65,7 @@ case "$AGGREGATE_PHASE" in
   engineering) LR_REQUIRED_VERIFY_STAGES="split discover freeze_execution clean replay probe gradient validate" ;;
   smoke) LR_REQUIRED_VERIFY_STAGES="split screen freeze_execution clean causal probe gradient attack estimate aggregate validate" ;;
   pilot) LR_REQUIRED_VERIFY_STAGES="split screen_clean freeze_execution clean causal probe_calibration gradient freeze_probe validate_probe aggregate" ;;
-  attacks) LR_REQUIRED_VERIFY_STAGES="train val freeze_attack test_probe test thresholds analyze validate" ;;
+  attacks) LR_REQUIRED_VERIFY_STAGES="split freeze_execution val freeze_attack clean test_probe test thresholds analyze validate" ;;
   *) LR_REQUIRED_VERIFY_STAGES="" ;;
 esac
 VERIFY_STAGES="${VERIFY_STAGES:-$LR_REQUIRED_VERIFY_STAGES}"
@@ -202,6 +204,8 @@ lr_build_command() {
     --subspace "$SUBSPACE"
     --attack-families "$ATTACK_FAMILIES"
     --attack-epsilons "$ATTACK_EPSILONS"
+    --pgd-steps "$PGD_STEPS"
+    --random-attack-seed-offset "$RANDOM_ATTACK_SEED_OFFSET"
     --reuse-complete "$REUSE_COMPLETE"
     --overwrite "$OVERWRITE"
     --max-eligible "$MAX_ELIGIBLE"

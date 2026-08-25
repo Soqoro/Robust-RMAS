@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import asdict, is_dataclass
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -28,6 +30,7 @@ from .io_utils import (
     atomic_write_json,
     atomic_write_jsonl,
     atomic_write_text,
+    atomic_write_csv,
     compatible_complete,
     content_hash,
     file_sha256,
@@ -40,7 +43,12 @@ from .io_utils import (
 )
 from .make_execution_manifest import build_execution_manifest, verify_execution_manifest
 from .make_split_manifest import build_split_manifest, create_or_verify, load_gpqa_raw_records, verify_split_manifest
-from .schemas import ContractError, validate_intervention_row
+from .schemas import (
+    EARLY_R2_EDGES,
+    ContractError,
+    validate_completion_record,
+    validate_intervention_row,
+)
 from .select_clean_correct import annotate_screening_rows
 from .validate_stage import make_gate
 
@@ -156,7 +164,7 @@ GRID_DEFAULT_STAGE = {
     "engineering": "probe",
     "smoke": "probe",
     "pilot": "probe_calibration",
-    "attacks": "train",
+    "attacks": "val",
     "expansion": "r2",
 }
 
@@ -201,9 +209,11 @@ REQUIRED_AGGREGATE_STAGES = {
         "aggregate",
     ),
     "attacks": (
-        "train",
+        "split",
+        "freeze_execution",
         "val",
         "freeze_attack",
+        "clean",
         "test_probe",
         "test",
         "thresholds",
@@ -266,6 +276,26 @@ def _cached_source_hash(args: argparse.Namespace, repo_root: Path) -> str:
 
 def _phase_root(args: argparse.Namespace) -> Path:
     return Path(args.out_root).resolve() / PHASE_DIR[args.workflow]
+
+
+def _producer_namespace(
+    args: argparse.Namespace, workflow: str | None
+) -> argparse.Namespace:
+    """Return an isolated namespace for a cross-phase authenticated producer.
+
+    Reconstructing a producer grid must never mutate the consumer's arguments:
+    those arguments are themselves part of canonical task identity.
+    """
+
+    if workflow is None or workflow == args.workflow:
+        return args
+    if workflow not in PHASE_DIR:
+        raise ContractError(f"unknown producer workflow: {workflow}")
+    producer = argparse.Namespace(**vars(args))
+    producer.workflow = workflow
+    producer.stage = "grid"
+    producer._current_source_hash = getattr(args, "_current_source_hash", None)
+    return producer
 
 
 def _execution_manifest_path(
@@ -385,7 +415,7 @@ def _authenticated_execution_manifest(
 
 
 def _task_manifest(args: argparse.Namespace, task: Mapping[str, Any], repo_root: Path) -> dict[str, Any]:
-    return {
+    manifest = {
         "schema_version": "linkradius.task_manifest.v1",
         "task": dict(task),
         "style": args.style,
@@ -413,6 +443,9 @@ def _task_manifest(args: argparse.Namespace, task: Mapping[str, Any], repo_root:
         "cwd": str(Path.cwd()),
         "python": sys.executable,
     }
+    if str(task.get("stage")) in GPU_STAGES:
+        manifest["runtime_environment"] = _runtime_environment_identity()
+    return manifest
 
 
 def _resolved_role_devices(args: argparse.Namespace) -> dict[str, str]:
@@ -448,6 +481,41 @@ def _configured_artifact_identity(path_value: str) -> Mapping[str, Any] | None:
     }
 
 
+_RUNTIME_DISTRIBUTIONS = (
+    "torch",
+    "transformers",
+    "triton",
+    "fla-core",
+    "flash-linear-attention",
+    "causal-conv1d",
+    "einops",
+    "ninja",
+)
+
+
+def _runtime_environment_identity() -> dict[str, Any]:
+    """Return the software identity that can change model numerics.
+
+    Physical CUDA allocation is intentionally excluded: a clean GPU on a
+    different node is a safe placement change.  Python and inference-backend
+    packages are included so artifacts from the fallback and FLA paths cannot
+    be mixed under one scientific task identity.
+    """
+
+    distributions: dict[str, str | None] = {}
+    for name in _RUNTIME_DISTRIBUTIONS:
+        try:
+            distributions[name] = package_version(name)
+        except PackageNotFoundError:
+            distributions[name] = None
+    return {
+        "schema_version": "linkradius.runtime_environment.v1",
+        "python_executable": str(Path(sys.executable).resolve()),
+        "python_version": ".".join(str(value) for value in sys.version_info[:3]),
+        "distributions": distributions,
+    }
+
+
 UPSTREAM_COMPLETION_STAGES: Mapping[tuple[str, str], tuple[str, ...]] = {
     ("engineering", "freeze_execution"): ("discover",),
     ("engineering", "replay"): ("clean",),
@@ -478,6 +546,22 @@ UPSTREAM_COMPLETION_STAGES: Mapping[tuple[str, str], tuple[str, ...]] = {
     ("pilot", "validate_probe"): ("clean", "causal", "probe_calibration", "gradient", "freeze_probe"),
     ("pilot", "validate"): ("clean", "causal", "probe_calibration", "gradient", "freeze_probe"),
     ("pilot", "aggregate"): ("causal", "probe_calibration", "freeze_probe", "validate_probe"),
+    ("attacks", "freeze_attack"): ("freeze_execution", "val"),
+    ("attacks", "clean"): ("freeze_attack",),
+    ("attacks", "test_probe"): ("clean",),
+    ("attacks", "test"): ("clean",),
+    ("attacks", "thresholds"): ("clean", "test"),
+    ("attacks", "analyze"): ("clean", "test_probe", "test", "thresholds"),
+    ("attacks", "validate"): (
+        "freeze_execution",
+        "val",
+        "freeze_attack",
+        "clean",
+        "test_probe",
+        "test",
+        "thresholds",
+        "analyze",
+    ),
 }
 
 
@@ -501,7 +585,14 @@ def _upstream_completion_fingerprint(
             upstream_stage = manifest.get("task", {}).get("stage")
             if upstream_stage not in stages:
                 continue
-            record = verify_completion(completion_path.parent)
+            # The completion record already commits to every artifact hash.
+            # Fingerprinting that small record is sufficient for stage-global
+            # task identity; the concrete artifact consumed by a task is
+            # authenticated separately.  Re-hashing every clean trajectory in
+            # every array process would create an avoidable shared-filesystem
+            # storm.
+            record = load_json(completion_path)
+            validate_completion_record(record)
             items.append(
                 {
                     "stage": upstream_stage,
@@ -592,7 +683,21 @@ def _runner_config_digest(
             "autograd_memory_mode": str(
                 getattr(args, "autograd_memory_mode", "none")
             ),
-            "explicit_trajectory": _configured_artifact_identity(args.trajectory),
+            "environment": _runtime_environment_identity(),
+        }
+    if stage in {
+        "replay",
+        "causal",
+        "probe",
+        "probe_calibration",
+        "gradient",
+        "attack",
+        "val",
+        "test_probe",
+        "test",
+    }:
+        payload["trajectory_input"] = {
+            "explicit_trajectory": _configured_artifact_identity(args.trajectory)
         }
     if stage in {"replay", "causal"}:
         payload["donor"] = {
@@ -612,6 +717,54 @@ def _runner_config_digest(
         payload["attack_runtime"] = {
             "pgd_steps": int(args.pgd_steps),
             "random_attack_seed_offset": int(args.random_attack_seed_offset),
+        }
+    if workflow == "attacks" and stage in {
+        "freeze_execution",
+        "val",
+        "freeze_attack",
+    }:
+        pilot_args = _producer_namespace(args, "pilot")
+        payload["failure_boundary_prerequisites"] = {
+            "engineering_gate": _configured_artifact_identity(args.engineering_gate),
+            "smoke_gate": _configured_artifact_identity(args.smoke_gate),
+            "probe_gate": _configured_artifact_identity(args.probe_gate),
+            "frozen_probe_config": _configured_artifact_identity(args.frozen_config),
+            "validation_execution_manifest": _configured_artifact_identity(
+                _execution_manifest_path(pilot_args, "validation")
+            ),
+            # Attack validation consumes Phase-3 clean trajectories.  Bind the
+            # complete producer inventory so an overwritten trajectory cannot
+            # leave a previously compatible attack-validation task reusable.
+            "validation_clean_completions": _upstream_completion_fingerprint(
+                pilot_args, workflow="pilot", stage="causal"
+            ),
+        }
+    if workflow == "attacks" and stage in {"val", "freeze_attack"}:
+        payload["failure_boundary_attack_design"] = {
+            "attack_families": str(args.attack_families).split(),
+            "attack_epsilons": [
+                float(value) for value in str(args.attack_epsilons).split()
+            ],
+            "pgd_steps": int(args.pgd_steps),
+            "random_attack_seed_offset": int(args.random_attack_seed_offset),
+            "subspace": str(args.subspace),
+        }
+    if workflow == "attacks" and stage in {
+        "clean",
+        "test_probe",
+        "test",
+        "thresholds",
+        "analyze",
+        "validate",
+    }:
+        payload["frozen_attack_protocol"] = {
+            "gate": _configured_artifact_identity(args.attack_freeze_gate),
+            "config": _configured_artifact_identity(args.frozen_attack_config),
+        }
+    if workflow == "attacks" and stage == "analyze":
+        payload["failure_boundary_analysis"] = {
+            "bootstrap_draws": int(args.bootstrap_draws),
+            "calibration_bins": 10,
         }
     if stage == "freeze_execution":
         payload["execution_freeze"] = {
@@ -898,6 +1051,18 @@ def _authenticate_gate_completion(
             "probe_validation_result.json",
             "probe_gate",
         ),
+        "attack_freeze_gate": (
+            "attacks",
+            "freeze_attack",
+            "attack_freeze_result.json",
+            "attack_freeze_gate",
+        ),
+        "attack_validation_gate": (
+            "attacks",
+            "validate",
+            "attack_validation_result.json",
+            "attack_validation_gate",
+        ),
         "aggregate_verification_gate": (
             "aggregate",
             "verify",
@@ -1004,6 +1169,9 @@ def _authenticated_frozen_probe_config(
         frozen.get("content_hash") != expected_hash
         or frozen.get("source_hash") != current_source_hash
         or frozen.get("test_accessed") is not False
+        or not isinstance(frozen.get("runtime"), Mapping)
+        or frozen["runtime"].get("environment")
+        != _runtime_environment_identity()
     ):
         raise ContractError("frozen probe configuration is stale or test-contaminated")
     _authenticate_completed_global_pointer(
@@ -1019,6 +1187,146 @@ def _authenticated_frozen_probe_config(
         current_source_hash=current_source_hash,
     )
     return frozen
+
+
+def _authenticated_frozen_attack_config(
+    args: argparse.Namespace,
+    task: Mapping[str, Any] | None,
+    *,
+    current_source_hash: str,
+) -> Mapping[str, Any]:
+    if not args.frozen_attack_config or not Path(args.frozen_attack_config).is_file():
+        raise ContractError("a completed frozen_attack_config.json is required")
+    path = Path(args.frozen_attack_config)
+    frozen = load_json(path)
+    expected_hash = content_hash(
+        {key: value for key, value in frozen.items() if key != "content_hash"},
+        domain="linkradius:frozen_attack_config:v1",
+    )
+    if (
+        frozen.get("schema_version")
+        != "linkradius.frozen_attack_config.v1"
+        or frozen.get("content_hash") != expected_hash
+        or frozen.get("source_hash") != current_source_hash
+        or frozen.get("test_outcomes_accessed_before_freeze") is not False
+        or not isinstance(frozen.get("runtime"), Mapping)
+        or frozen["runtime"].get("environment")
+        != _runtime_environment_identity()
+    ):
+        raise ContractError("frozen attack configuration is stale or test-contaminated")
+    frozen_probe_seeds = frozen.get("probe", {}).get("seeds", [])
+    if (
+        not isinstance(frozen_probe_seeds, list)
+        or len(frozen_probe_seeds) < 3
+        or len({int(value) for value in frozen_probe_seeds})
+        != len(frozen_probe_seeds)
+    ):
+        raise ContractError(
+            "frozen attack configuration requires at least three unique probe seeds"
+        )
+    _authenticate_completed_global_pointer(
+        args,
+        task,
+        producer_workflow="attacks",
+        producer_stage="freeze_attack",
+        pointer_name="attack_freeze_result.json",
+        pointer_path_field="frozen_attack_config",
+        canonical_path=path,
+        pointer_hash_field="content_hash",
+        expected_hash=expected_hash,
+        current_source_hash=current_source_hash,
+    )
+    return frozen
+
+
+def _assert_frozen_attack_arguments(
+    args: argparse.Namespace,
+    frozen: Mapping[str, Any],
+    *,
+    stage: str,
+) -> None:
+    """Reject test-time protocol drift, even when no override flag was used."""
+
+    shared = {
+        "dataset": str(args.datasets).split(),
+        "R": [int(value) for value in str(args.rounds).split()],
+        "seeds": [int(value) for value in str(args.seeds).split()],
+        "style": str(args.style),
+        "method": str(args.method),
+        "batch_size": int(args.batch_size),
+        "latent_length": int(args.latent_length),
+        "subspace": str(args.subspace),
+        "runtime": {
+            "role_devices": _resolved_role_devices(args),
+            "relay_transfer_mode": str(args.relay_transfer_mode),
+            "autograd_memory_mode": str(args.autograd_memory_mode),
+            "trust_remote_code": int(args.trust_remote_code),
+            "round_label_mode": str(args.round_label_mode),
+            "environment": _runtime_environment_identity(),
+        },
+    }
+    expected_shared = {
+        "dataset": [str(frozen["dataset"])],
+        "R": [int(frozen["R"])],
+        "seeds": [int(frozen["seed"])],
+        "style": str(frozen["style"]),
+        "method": str(frozen["method"]),
+        "batch_size": int(frozen["batch_size"]),
+        "latent_length": int(frozen["latent_length"]),
+        "subspace": str(frozen["subspace"]),
+        "runtime": dict(frozen["runtime"]),
+    }
+    if shared != expected_shared:
+        raise ContractError(
+            f"{stage} runtime arguments differ from the frozen attack protocol"
+        )
+    if args.split_manifest and Path(args.split_manifest).is_file():
+        if verify_split_manifest(load_json(args.split_manifest)) != frozen.get(
+            "split_manifest_hash"
+        ):
+            raise ContractError(f"{stage} split manifest differs from the frozen protocol")
+    if stage in {"clean", "test_probe", "test", "thresholds", "analyze", "validate"}:
+        execution_path = _execution_manifest_path(args, "test")
+        if not execution_path or verify_execution_manifest(
+            load_json(execution_path)
+        ) != frozen.get("test_execution_manifest_hash"):
+            raise ContractError(
+                f"{stage} test execution manifest differs from the frozen protocol"
+            )
+    if stage in {"test", "thresholds", "analyze", "validate"}:
+        actual_attack = {
+            "families": str(args.attack_families).split(),
+            "epsilons": [float(value) for value in str(args.attack_epsilons).split()],
+            "pgd_steps": int(args.pgd_steps),
+            "random_attack_seed_offset": int(args.random_attack_seed_offset),
+        }
+        expected_attack = {
+            "families": list(frozen["attack_families"]),
+            "epsilons": [float(value) for value in frozen["attack_epsilons"]],
+            "pgd_steps": int(frozen["pgd"]["steps"]),
+            "random_attack_seed_offset": int(
+                frozen["random_independent"]["seed_offset"]
+            ),
+        }
+        if actual_attack != expected_attack:
+            raise ContractError(
+                f"{stage} attack arguments differ from frozen_attack_config.json"
+            )
+    if stage in {"test_probe", "analyze", "validate"}:
+        actual_probe = {
+            "radii": [float(value) for value in str(args.probe_radii).split()],
+            "seeds": [int(value) for value in str(args.probe_seeds).split()],
+            "K": int(args.K),
+        }
+        expected_probe = {
+            "radii": [float(frozen["probe"]["h"])],
+            "seeds": [int(value) for value in frozen["probe"]["seeds"]],
+            "K": int(frozen["probe"]["K"]),
+        }
+        if actual_probe != expected_probe:
+            raise ContractError(
+                "test_probe h/seed/K differ from frozen_attack_config.json"
+            )
 
 
 def enforce_prerequisites(
@@ -1114,15 +1422,25 @@ def enforce_prerequisites(
         )
         if probe_gate.get("frozen_config_hash") != frozen_probe.get("content_hash"):
             raise ContractError("probe gate and frozen probe configuration hashes are incompatible")
-        if stage in {"test_probe", "test", "thresholds", "analyze", "validate"}:
-            attack_gate = current_gate(args.attack_freeze_gate, "attack_freeze_gate")
-            if not args.frozen_attack_config or not Path(args.frozen_attack_config).is_file():
-                raise ContractError("test stages require frozen_attack_config.json")
-            frozen_attack = load_json(args.frozen_attack_config)
+        if stage in {"clean", "test_probe", "test", "thresholds", "analyze", "validate"}:
+            attack_gate = current_gate(
+                args.attack_freeze_gate,
+                "attack_freeze_gate",
+                required_hashes={
+                    "split_manifest_hash": current_split_hash,
+                    "probe_gate_hash": probe_gate["gate_content_hash"],
+                },
+            )
+            frozen_attack = _authenticated_frozen_attack_config(
+                args, task, current_source_hash=current_source_hash
+            )
             if attack_gate.get("frozen_attack_config_hash") != frozen_attack.get("content_hash"):
                 raise ContractError("attack-freeze gate and frozen attack configuration hashes differ")
             if args.tuning_override:
                 raise ContractError("frozen test-probe/test-attack stages reject tuning overrides")
+            _assert_frozen_attack_arguments(
+                args, frozen_attack, stage=stage
+            )
     elif args.workflow == "expansion":
         current_gate(args.pilot_gate, "pilot_gate")
         current_gate(args.attack_validation_gate, "attack_validation_gate")
@@ -1197,7 +1515,14 @@ def _build_grid_config(args: argparse.Namespace, stage: str | None = None) -> Gr
     candidate_partitions = base.partitions or ("attack_train", "validation", "test")
     if consumes_execution:
         for partition in candidate_partitions:
-            path = _execution_manifest_path(args, partition)
+            manifest_args = (
+                _producer_namespace(args, "pilot")
+                if args.workflow == "attacks"
+                and canonical_stage == "val"
+                and partition == "validation"
+                else args
+            )
+            path = _execution_manifest_path(manifest_args, partition)
             if path:
                 manifests.setdefault(partition, path)
     values["execution_manifests"] = manifests
@@ -1649,6 +1974,16 @@ def _trajectory_rows(
     token_counts = _to_plain(trajectory.clean_scoring.token_counts)
     scorer_metadata = _to_plain(trajectory.clean_scoring.metadata)
     trajectory_provenance = trajectory.provenance
+    model_hash = trajectory_provenance.get("model_hash")
+    adapter_hash = trajectory_provenance.get("adapter_hash")
+    system_resolution = trajectory_provenance.get("system_resolution")
+    scorer_hash = trajectory_provenance.get("scorer_hash") or content_hash(
+        scorer_metadata, domain="linkradius:scorer:v1"
+    )
+    prompt_hash = content_hash(
+        trajectory_provenance.get("release_settings", {}),
+        domain="linkradius:prompt_settings:v1",
+    )
     exclusion_reasons = list(
         trajectory_provenance.get("execution_exclusion_reasons", [])
     )
@@ -1790,6 +2125,15 @@ def _trajectory_rows(
                 "ordered_cohort_hash": trajectory.provenance.get("global_ordered_cohort_hash") or trajectory.ordered_cohort_hash,
                 "batch_boundary_hash": trajectory.provenance.get("global_batch_boundary_hash") or trajectory.batch_boundary_hash,
                 "source_hash": source_digest,
+                "model_hash": model_hash,
+                "adapter_hash": adapter_hash,
+                "system_resolution": (
+                    dict(system_resolution)
+                    if isinstance(system_resolution, Mapping)
+                    else None
+                ),
+                "scorer_hash": scorer_hash,
+                "prompt_hash": prompt_hash,
                 "config_hash": task.get("config_key"),
                 "task": dict(task),
                 "generation_audit": _to_plain(generation),
@@ -1823,22 +2167,29 @@ def _load_trajectory(path: str | Path) -> Any:
 
 
 def _completed_clean_trajectories(
-    args: argparse.Namespace, task: Mapping[str, Any]
+    args: argparse.Namespace,
+    task: Mapping[str, Any],
+    *,
+    producer_workflow: str | None = None,
+    execution_batch_ids: Iterable[int] | None = None,
 ) -> list[Path]:
+    producer_args = _producer_namespace(args, producer_workflow)
     clean_root = (
-        _phase_root(args)
+        _phase_root(producer_args)
         / str(task["dataset"])
         / f"R{int(task['R'])}"
         / str(task["partition"])
         / "clean"
     )
-    execution_path = _execution_manifest_path(args, str(task["partition"]), task)
+    execution_path = _execution_manifest_path(
+        producer_args, str(task["partition"]), task
+    )
     if not execution_path:
         raise ContractError("clean trajectory authentication requires an execution manifest")
     expected_execution_hash = verify_execution_manifest(load_json(execution_path))
     expected_tasks = {
         int(candidate.execution_batch_id): candidate.as_dict()
-        for candidate in build_grid(_build_grid_config(args, "clean"))
+        for candidate in build_grid(_build_grid_config(producer_args, "clean"))
         if candidate.dataset == str(task["dataset"])
         and int(candidate.R) == int(task["R"])
         and candidate.partition == str(task["partition"])
@@ -1846,17 +2197,30 @@ def _completed_clean_trajectories(
     }
     if not expected_tasks:
         raise ContractError("canonical clean grid has no tasks for the requested partition")
+    selected_batch_ids = (
+        set(expected_tasks)
+        if execution_batch_ids is None
+        else {int(value) for value in execution_batch_ids}
+    )
+    unknown_batch_ids = selected_batch_ids - set(expected_tasks)
+    if unknown_batch_ids:
+        raise ContractError(
+            "requested execution batch is absent from the canonical clean grid: "
+            f"{sorted(unknown_batch_ids)}"
+        )
     repo_root = Path(__file__).resolve().parents[2]
     found: dict[int, Path] = {}
     for batch_id, expected_task in sorted(expected_tasks.items()):
-        expected_dir = task_output_dir(args, expected_task)
+        if batch_id not in selected_batch_ids:
+            continue
+        expected_dir = task_output_dir(producer_args, expected_task)
         completion_path = expected_dir / ".complete.json"
         if not completion_path.is_file():
             continue
         completion = verify_completion(
             expected_dir, expected_config_hash=str(expected_task["config_key"])
         )
-        if completion.get("source_hash") != _cached_source_hash(args, repo_root):
+        if completion.get("source_hash") != _cached_source_hash(producer_args, repo_root):
             raise ContractError("clean trajectory completion has a stale source hash")
         declared = [
             artifact
@@ -1890,9 +2254,19 @@ def _completed_clean_trajectories(
     return [found[key] for key in sorted(found)]
 
 
-def _resolve_trajectory_path(args: argparse.Namespace, task: Mapping[str, Any]) -> Path:
+def _resolve_trajectory_path(
+    args: argparse.Namespace,
+    task: Mapping[str, Any],
+    *,
+    producer_workflow: str | None = None,
+) -> Path:
     batch_id = int(task["execution_batch_id"])
-    authenticated = _completed_clean_trajectories(args, task)
+    authenticated = _completed_clean_trajectories(
+        args,
+        task,
+        producer_workflow=producer_workflow,
+        execution_batch_ids=(batch_id,),
+    )
     if args.trajectory:
         requested = Path(args.trajectory).resolve()
         matches = [path for path in authenticated if path.resolve() == requested]
@@ -1904,10 +2278,8 @@ def _resolve_trajectory_path(args: argparse.Namespace, task: Mapping[str, Any]) 
         if int(completion["execution_batch_id"]) != batch_id:
             raise ContractError("explicit --trajectory is for a different execution batch")
         return matches[0]
-    for path in authenticated:
-        completion = load_json(path.parent / ".complete.json")
-        if int(completion["execution_batch_id"]) == batch_id:
-            return path
+    if len(authenticated) == 1:
+        return authenticated[0]
     raise ContractError(
         f"no compatible completed clean trajectory found for execution batch {batch_id}; "
         "pass --trajectory explicitly"
@@ -1941,7 +2313,8 @@ def _mismatch_intervention(
             raise ContractError(
                 "explicit --donor-trajectory must be an authenticated canonical clean artifact"
             )
-        if resolved in seen_paths or (args.trajectory and resolved == str(Path(args.trajectory).resolve())):
+        active_path = str(getattr(args, "_active_trajectory_path", "") or "")
+        if resolved in seen_paths or (active_path and resolved == active_path):
             continue
         seen_paths.add(resolved)
         donor_trajectory = _load_trajectory(authenticated_by_resolved[resolved])
@@ -2127,6 +2500,20 @@ def _capture_stage(args: argparse.Namespace, task_dir: Path, task: Mapping[str, 
                 "fresh clean dual-correct status differs from screening under the frozen execution "
                 f"settings: {', '.join(changed)}"
             )
+    if args.workflow == "attacks" and task["stage"] == "clean":
+        frozen_attack = _authenticated_frozen_attack_config(
+            args,
+            task,
+            current_source_hash=_cached_source_hash(args, repo_root),
+        )
+        clean_system_identity = _common_system_identity(
+            rows, where="held-out clean capture"
+        )
+        if clean_system_identity != frozen_attack.get("system_identity"):
+            raise ContractError(
+                "held-out clean capture resolved a different model/adapter/"
+                "scorer/prompt identity than the frozen attack protocol"
+            )
     if task["stage"] in {"discover", "screen", "screen_clean"}:
         annotated, summary = annotate_screening_rows(rows)
         artifact_name = "screening_rows.jsonl"
@@ -2306,10 +2693,74 @@ def _autograd_sample_index(trajectory: Any) -> int:
     raise ContractError("autograd stage has no analysis-eligible row in this execution batch")
 
 
+def _fresh_dual_correct_trajectory_indices(trajectory: Any) -> list[int]:
+    """Recompute the predeclared analysis cohort from frozen clean outcomes."""
+
+    selected: list[int] = []
+    for index, gold in enumerate(trajectory.gold_labels):
+        generation = (
+            trajectory.clean_generation_audit[index]
+            if index < len(trajectory.clean_generation_audit)
+            else {}
+        )
+        margins = trajectory.clean_margins[index]
+        if (
+            bool(trajectory.analysis_eligibility_mask[index])
+            and generation.get("strict_choice") == gold
+            and not bool(generation.get("answer_invalid", True))
+            and not bool(generation.get("answer_conflict", False))
+            and trajectory.clean_scoring.predictions[index] == gold
+            and not bool(trajectory.clean_scoring.score_ties[index])
+            and isinstance(margins, Mapping)
+            and bool(margins)
+            and all(
+                math.isfinite(float(value)) and float(value) > 0.0
+                for value in margins.values()
+            )
+        ):
+            selected.append(index)
+    return selected
+
+
+def _publish_outcome_excluded_task(
+    args: argparse.Namespace,
+    task_dir: Path,
+    task: Mapping[str, Any],
+    repo_root: Path,
+    *,
+    artifact_name: str,
+) -> None:
+    """Complete a frozen grid cell that has no fresh dual-correct test row."""
+
+    rows = [
+        {
+            "record_type": "shard_metadata",
+            "array_index": task["array_index"],
+            "config_key": task["config_key"],
+            "row_count": 0,
+            "skip_reason": "no_fresh_dual_correct_row",
+        }
+    ]
+    atomic_write_jsonl(task_dir / artifact_name, rows, overwrite=args.overwrite)
+    publish_completion(
+        task_dir,
+        config_hash=str(task["config_key"]),
+        source_hash_value=_cached_source_hash(args, repo_root),
+        artifact_paths=["manifest.json", "command.txt", artifact_name],
+        row_counts={artifact_name: 1},
+        extra={
+            "array_index": int(task["array_index"]),
+            "execution_batch_id": task["execution_batch_id"],
+            "analysis_row_count": 0,
+        },
+        overwrite=args.overwrite,
+    )
+
+
 def _replay_stage(args: argparse.Namespace, task_dir: Path, task: Mapping[str, Any], repo_root: Path) -> None:
     args._active_task = task
     trajectory_path = _resolve_trajectory_path(args, task)
-    args.trajectory = str(trajectory_path)
+    args._active_trajectory_path = str(trajectory_path.resolve())
     trajectory = _load_trajectory(trajectory_path)
     execution_path = _execution_manifest_path(args, str(task["partition"]), task)
     if not execution_path:
@@ -2320,6 +2771,22 @@ def _replay_stage(args: argparse.Namespace, task_dir: Path, task: Mapping[str, A
     if trajectory.execution_manifest_hash != authenticated_execution_hash:
         raise ContractError("trajectory and execution manifest hashes differ")
     edge = str(task["edge_id"])
+    selected_probe_indices: list[int] | None = None
+    if task["stage"] in {"probe", "probe_calibration", "test_probe"}:
+        selected_probe_indices = list(range(len(trajectory.raw_sample_ids)))
+        if args.workflow == "attacks" and task["stage"] == "test_probe":
+            selected_probe_indices = _fresh_dual_correct_trajectory_indices(
+                trajectory
+            )
+            if not selected_probe_indices:
+                _publish_outcome_excluded_task(
+                    args,
+                    task_dir,
+                    task,
+                    repo_root,
+                    artifact_name="probe_runs.jsonl",
+                )
+                return
     runtime = _runtime(args, requested_edge=edge)
     try:
         if task["stage"] in {"replay", "causal"}:
@@ -2364,6 +2831,8 @@ def _replay_stage(args: argparse.Namespace, task_dir: Path, task: Mapping[str, A
                     row.update(metadata)
             artifact_name = "replay_runs.jsonl" if task["stage"] == "replay" else "causal_runs.jsonl"
         elif task["stage"] in {"probe", "probe_calibration", "test_probe"}:
+            if selected_probe_indices is None:
+                raise ContractError("probe selection was not initialized")
             rows = []
             for direction_id in range(int(task["K"])):
                 probe = runtime.run_antithetic_probe(
@@ -2397,7 +2866,8 @@ def _replay_stage(args: argparse.Namespace, task_dir: Path, task: Mapping[str, A
                     requested={"h": task["h"], "sign": -1, "probe_seed": task["probe_seed"], "direction_id": direction_id, "subspace": task["subspace"]},
                     realized_rows=[_to_plain(value) for value in probe.minus_diagnostics],
                 )
-                for index, raw_id in enumerate(trajectory.raw_sample_ids):
+                for index in selected_probe_indices:
+                    raw_id = trajectory.raw_sample_ids[index]
                     plus_run_id = content_hash(
                         {"task": task["config_key"], "raw_sample_id": raw_id, "direction_id": direction_id, "sign": 1},
                         domain="linkradius:signed_probe_run:v1",
@@ -2650,14 +3120,26 @@ def _replay_stage(args: argparse.Namespace, task_dir: Path, task: Mapping[str, A
 
 
 def _attack_stage(args: argparse.Namespace, task_dir: Path, task: Mapping[str, Any], repo_root: Path) -> None:
+    """Run every frozen dose for one batch/edge/family under one runtime load."""
+
     args._active_task = task
-    trajectory_path = _resolve_trajectory_path(args, task)
-    args.trajectory = str(trajectory_path)
+    producer_workflow = (
+        "pilot"
+        if args.workflow == "attacks" and str(task["partition"]) == "validation"
+        else None
+    )
+    producer_args = _producer_namespace(args, producer_workflow)
+    trajectory_path = _resolve_trajectory_path(
+        args, task, producer_workflow=producer_workflow
+    )
+    args._active_trajectory_path = str(trajectory_path.resolve())
     trajectory = _load_trajectory(trajectory_path)
-    execution_path = _execution_manifest_path(args, str(task["partition"]), task)
+    execution_path = _execution_manifest_path(
+        producer_args, str(task["partition"]), task
+    )
     authenticated_execution_hash = (
         _authenticated_execution_manifest(
-            args, str(task["partition"]), task, repo_root
+            producer_args, str(task["partition"]), task, repo_root
         )[2]
         if execution_path
         else None
@@ -2666,7 +3148,39 @@ def _attack_stage(args: argparse.Namespace, task_dir: Path, task: Mapping[str, A
         raise ContractError("attack trajectory is not tied to the selected execution manifest")
     edge = str(task["edge_id"])
     family = str(task["attack_family"])
-    epsilon = float(task["epsilon"])
+    metadata = task.get("metadata")
+    raw_budgets = (
+        metadata.get("attack_epsilons", [])
+        if isinstance(metadata, Mapping)
+        else []
+    )
+    if not raw_budgets and task.get("epsilon") is not None:
+        raw_budgets = [task["epsilon"]]
+    budgets = [float(value) for value in raw_budgets]
+    if (
+        not budgets
+        or any(not math.isfinite(value) or value <= 0.0 for value in budgets)
+        or budgets != sorted(set(budgets))
+    ):
+        raise ContractError("attack budgets must be unique, positive, finite, and increasing")
+    eligible_indices = (
+        _fresh_dual_correct_trajectory_indices(trajectory)
+        if args.workflow == "attacks"
+        else [
+            index
+            for index, eligible in enumerate(trajectory.analysis_eligibility_mask)
+            if bool(eligible)
+        ]
+    )
+    if not eligible_indices:
+        _publish_outcome_excluded_task(
+            args,
+            task_dir,
+            task,
+            repo_root,
+            artifact_name="attack_results.jsonl",
+        )
+        return
     runtime = _runtime(args, requested_edge=edge)
     rows: list[dict[str, Any]] = []
     try:
@@ -2676,10 +3190,13 @@ def _attack_stage(args: argparse.Namespace, task_dir: Path, task: Mapping[str, A
             from RecursiveMAS.inference_utils.linkradius_runtime import ReplayIntervention
 
             clean = trajectory.message(edge, receiver=True).float().cpu()
-            subspace = lr.get_subspace(str(task["subspace"]), int(clean.size(1)), int(clean.size(2)))
-            deltas, directions, seeds = [], [], []
+            subspace = lr.get_subspace(
+                str(task["subspace"]), int(clean.size(1)), int(clean.size(2))
+            )
             attack_seed = int(task["seed"]) + int(args.random_attack_seed_offset)
-            for index, raw_id in enumerate(trajectory.raw_sample_ids):
+            directions = []
+            direction_seeds = []
+            for raw_id in trajectory.raw_sample_ids:
                 direction = lr.sample_stable_unit_direction(
                     attack_seed,
                     raw_id,
@@ -2689,91 +3206,217 @@ def _attack_stage(args: argparse.Namespace, task_dir: Path, task: Mapping[str, A
                     direction_id=0,
                     purpose="random_independent_attack",
                 )
-                lifted = subspace.lift(direction).float().cpu()
-                directions.append(lifted)
-                deltas.append(lr.requested_additive_delta(clean[index], lifted, h=epsilon, sign=1))
-                seeds.append(lr.stable_intervention_seed(attack_seed, raw_id, edge, probe_seed=0, direction_id=0, purpose="random_independent_attack"))
-            delta = torch.stack(deltas, dim=0)
-            result = runtime.replay(
-                trajectory,
-                edge,
-                ReplayIntervention(mode="additive", delta=delta, metadata={"attack_family": family, "requested_epsilon": epsilon, "attack_seed": attack_seed}),
-            )
+                directions.append(subspace.lift(direction).float().cpu())
+                direction_seeds.append(
+                    lr.stable_intervention_seed(
+                        attack_seed,
+                        raw_id,
+                        edge,
+                        probe_seed=0,
+                        direction_id=0,
+                        purpose="random_independent_attack",
+                    )
+                )
             consumer_dtype = trajectory.dtype_metadata(edge).consumer_dtype
-            diagnostics = [
-                {
-                    **lr.realized_delta_diagnostics(
-                        clean[index],
-                        delta[index],
-                        consumer_dtype=consumer_dtype,
-                        lifted_unit_direction=directions[index],
-                    ).to_dict(),
-                    "attack_seed": seeds[index],
-                    "requested_epsilon": epsilon,
-                }
-                for index in range(len(trajectory.raw_sample_ids))
-            ]
-            rows = _score_rows(
-                result.scoring,
-                result.margins,
-                trajectory,
-                args=args,
-                task=task,
-                repo_root=repo_root,
-                intervention_mode="additive",
-                requested={"requested_epsilon": epsilon, "attack_family": family, "seed_domain": "random_independent_attack"},
-                realized_rows=diagnostics,
-            )
-            for row in rows:
-                row.update({"attack_family": family, "requested_epsilon": epsilon, "realized_epsilon": row["realized_intervention"].get("realized_relative_norm")})
-        elif family == "pgd_autograd":
-            sample_index = _autograd_sample_index(trajectory)
-            try:
-                result = runtime.autograd_pgd(
+            for epsilon in budgets:
+                delta = torch.stack(
+                    [
+                        lr.postcast_budget_fitted_delta(
+                            clean[index],
+                            directions[index],
+                            relative_budget=epsilon,
+                            consumer_dtype=consumer_dtype,
+                        )
+                        for index in range(len(trajectory.raw_sample_ids))
+                    ],
+                    dim=0,
+                )
+                result = runtime.replay(
                     trajectory,
                     edge,
-                    epsilon=epsilon,
-                    steps=args.pgd_steps,
-                    subspace_name=str(task["subspace"]),
-                    sample_index=sample_index,
+                    ReplayIntervention(
+                        mode="additive",
+                        delta=delta,
+                        metadata={
+                            "attack_family": family,
+                            "requested_epsilon": epsilon,
+                            "attack_seed": attack_seed,
+                        },
+                    ),
                 )
-            except (RuntimeError, ValueError, IndexError) as exc:
-                rows = [
+                diagnostics = [
                     {
-                        **_row_envelope(
-                            args=args,
-                            task=task,
-                            trajectory=trajectory,
-                            index=sample_index,
-                            repo_root=repo_root,
-                            intervention_mode="pgd_autograd",
-                            requested={"requested_epsilon": epsilon, "steps": args.pgd_steps},
-                        ),
-                        "record_type": "unsupported",
-                        "gold": trajectory.gold_labels[sample_index],
-                        "option_scores": {},
-                        "margins": {},
-                        "failure": "unsupported_or_oom",
-                        "unsupported_reason": str(exc),
-                        "autograd_semantics": "not_substituted",
-                        "sample_index": sample_index,
-                        "frozen_batch_size": len(trajectory.sample_ids),
+                        **lr.realized_delta_diagnostics(
+                            clean[index],
+                            delta[index],
+                            consumer_dtype=consumer_dtype,
+                            lifted_unit_direction=directions[index],
+                        ).to_dict(),
+                        "attack_seed": attack_seed,
+                        "direction_seed": direction_seeds[index],
+                        "requested_epsilon": epsilon,
                     }
+                    for index in range(len(trajectory.raw_sample_ids))
                 ]
-            else:
-                strongest = next(
-                    (value for value in result.targets if value.target_label == result.strongest_target),
-                    result.targets[0],
+                scored = _score_rows(
+                    result.scoring,
+                    result.margins,
+                    trajectory,
+                    args=args,
+                    task=task,
+                    repo_root=repo_root,
+                    intervention_mode="additive",
+                    requested={
+                        "requested_epsilon": epsilon,
+                        "attack_family": family,
+                        "seed_domain": "random_independent_attack",
+                    },
+                    realized_rows=diagnostics,
                 )
-                labels = list(trajectory.clean_scoring.labels)
-                option_scores = {label: float(strongest.scores[pos]) for pos, label in enumerate(labels)}
-                gold = trajectory.gold_labels[sample_index]
-                margins = {label: option_scores[gold] - option_scores[label] for label in labels if label != gold}
-                maximum = max(option_scores.values())
-                winners = [label for label in labels if option_scores[label] == maximum]
-                scorer_prediction = winners[0] if len(winners) == 1 else None
-                rows = [
-                    {
+                for index in eligible_indices:
+                    row = scored[index]
+                    row.update(
+                        {
+                            "run_id": content_hash(
+                                {
+                                    "task": task["config_key"],
+                                    "raw_sample_id": row["raw_sample_id"],
+                                    "requested_epsilon": epsilon,
+                                },
+                                domain="linkradius:attack_run:v1",
+                            ),
+                            "attack_family": family,
+                            "attack_seed": attack_seed,
+                            "attack_restart": 0,
+                            "requested_epsilon": epsilon,
+                            "realized_epsilon": row["realized_intervention"].get(
+                                "realized_relative_norm"
+                            ),
+                            "clean_margins": {
+                                str(label): float(value)
+                                for label, value in trajectory.clean_margins[index].items()
+                            },
+                            "minimum_clean_margin": min(
+                                float(value)
+                                for value in trajectory.clean_margins[index].values()
+                            ),
+                            "flipped": float(row["minimum_margin"]) <= 0.0,
+                        }
+                    )
+                    rows.append(row)
+        elif family == "pgd_autograd":
+            import torch
+
+            labels = list(trajectory.clean_scoring.labels)
+            clean_receiver = trajectory.message(edge, receiver=True).float().cpu()
+            for sample_index in eligible_indices:
+                clean_norm = float(
+                    torch.linalg.vector_norm(clean_receiver[sample_index]).item()
+                )
+                for epsilon in budgets:
+                    try:
+                        result = runtime.autograd_pgd(
+                            trajectory,
+                            edge,
+                            epsilon=epsilon,
+                            steps=args.pgd_steps,
+                            subspace_name=str(task["subspace"]),
+                            sample_index=sample_index,
+                        )
+                    except (RuntimeError, ValueError, IndexError) as exc:
+                        if args.workflow == "attacks":
+                            raise ContractError(
+                                "PGD attack execution failed; no completed attack "
+                                "artifact will be published for "
+                                f"raw_sample_id={trajectory.raw_sample_ids[sample_index]}, "
+                                f"edge={edge}, requested_epsilon={epsilon}: {exc}"
+                            ) from exc
+                        rows.append(
+                            {
+                                **_row_envelope(
+                                    args=args,
+                                    task=task,
+                                    trajectory=trajectory,
+                                    index=sample_index,
+                                    repo_root=repo_root,
+                                    intervention_mode="pgd_autograd",
+                                    requested={
+                                        "requested_epsilon": epsilon,
+                                        "steps": args.pgd_steps,
+                                    },
+                                ),
+                                "record_type": "unsupported",
+                                "attack_family": family,
+                                "attack_seed": int(task["seed"]),
+                                "attack_restart": 0,
+                                "requested_epsilon": epsilon,
+                                "gold": trajectory.gold_labels[sample_index],
+                                "option_scores": {},
+                                "margins": {},
+                                "failure": "unsupported_or_oom",
+                                "unsupported_reason": str(exc),
+                                "autograd_semantics": "not_substituted",
+                                "sample_index": sample_index,
+                                "frozen_batch_size": len(trajectory.sample_ids),
+                            }
+                        )
+                        continue
+                    strongest = next(
+                        (
+                            value
+                            for value in result.targets
+                            if value.target_label == result.strongest_target
+                        ),
+                        result.targets[0],
+                    )
+                    gold = trajectory.gold_labels[sample_index]
+
+                    def scored_values(target_result: Any) -> tuple[dict[str, float], dict[str, float], str | None, bool]:
+                        option_scores = {
+                            label: float(target_result.scores[pos])
+                            for pos, label in enumerate(labels)
+                        }
+                        margins = {
+                            label: option_scores[gold] - option_scores[label]
+                            for label in labels
+                            if label != gold
+                        }
+                        maximum = max(option_scores.values())
+                        winners = [
+                            label for label in labels if option_scores[label] == maximum
+                        ]
+                        return (
+                            option_scores,
+                            margins,
+                            winners[0] if len(winners) == 1 else None,
+                            len(winners) > 1,
+                        )
+
+                    option_scores, margins, prediction, score_tie = scored_values(
+                        strongest
+                    )
+                    realized_epsilon = (
+                        float(strongest.realized_delta_norm) / clean_norm
+                        if clean_norm
+                        else None
+                    )
+                    requested_epsilon = (
+                        float(strongest.requested_delta_norm) / clean_norm
+                        if clean_norm
+                        else None
+                    )
+                    realized = {
+                        "target_label": strongest.target_label,
+                        "initial_margin": float(strongest.initial_margin),
+                        "final_margin": float(strongest.final_margin),
+                        "requested_delta_norm": float(strongest.requested_delta_norm),
+                        "realized_delta_norm": float(strongest.realized_delta_norm),
+                        "requested_relative_norm": requested_epsilon,
+                        "realized_relative_norm": realized_epsilon,
+                        "absolute_budget": float(strongest.budget),
+                        "budget_respected": bool(strongest.budget_respected),
+                    }
+                    summary = {
                         **_row_envelope(
                             args=args,
                             task=task,
@@ -2781,49 +3424,282 @@ def _attack_stage(args: argparse.Namespace, task_dir: Path, task: Mapping[str, A
                             index=sample_index,
                             repo_root=repo_root,
                             intervention_mode="pgd_autograd",
-                            requested={"requested_epsilon": epsilon, "steps": args.pgd_steps, "step_size": result.step_size},
-                            realized=_to_plain(strongest),
+                            requested={
+                                "requested_epsilon": epsilon,
+                                "steps": args.pgd_steps,
+                                "step_size": result.step_size,
+                                "initialization": "zero",
+                                "restart": 0,
+                            },
+                            realized=realized,
+                        ),
+                        "run_id": content_hash(
+                            {
+                                "task": task["config_key"],
+                                "raw_sample_id": trajectory.raw_sample_ids[sample_index],
+                                "requested_epsilon": epsilon,
+                            },
+                            domain="linkradius:attack_run:v1",
                         ),
                         "gold": gold,
                         "option_scores": option_scores,
                         "margins": margins,
                         "minimum_margin": min(margins.values()),
                         "binding_competitor": min(margins, key=margins.get),
-                        "scorer_prediction": scorer_prediction,
-                        "scorer_correct": scorer_prediction == gold,
-                        "score_tie": len(winners) > 1,
+                        "scorer_prediction": prediction,
+                        "scorer_correct": prediction == gold,
+                        "score_tie": score_tie,
                         "strict_generated_choice": None,
                         "strict_generated_valid": None,
                         "strict_generated_correct": None,
                         "autograd_semantics": result.autograd_semantics,
                         "attack_family": family,
+                        "attack_seed": int(task["seed"]),
+                        "attack_restart": 0,
                         "requested_epsilon": epsilon,
+                        "realized_epsilon": realized_epsilon,
+                        "clean_margins": {
+                            str(label): float(value)
+                            for label, value in trajectory.clean_margins[sample_index].items()
+                        },
+                        "minimum_clean_margin": min(
+                            float(value)
+                            for value in trajectory.clean_margins[sample_index].values()
+                        ),
+                        "flipped": min(margins.values()) <= 0.0,
                         "sample_index": sample_index,
                         "frozen_batch_size": len(trajectory.sample_ids),
+                        "pgd_target_count": len(result.targets),
                     }
-                ]
+                    rows.append(summary)
+                    for target_result in result.targets:
+                        target_scores, target_margins, target_prediction, target_tie = scored_values(
+                            target_result
+                        )
+                        target_realized_epsilon = (
+                            float(target_result.realized_delta_norm) / clean_norm
+                            if clean_norm
+                            else None
+                        )
+                        target_requested_epsilon = (
+                            float(target_result.requested_delta_norm) / clean_norm
+                            if clean_norm
+                            else None
+                        )
+                        rows.append(
+                            {
+                                **summary,
+                                "record_type": "attack_target",
+                                "run_id": content_hash(
+                                    {
+                                        "summary_run_id": summary["run_id"],
+                                        "target_label": target_result.target_label,
+                                    },
+                                    domain="linkradius:attack_target_run:v1",
+                                ),
+                                "target_label": target_result.target_label,
+                                "competitor": target_result.target_label,
+                                "option_scores": target_scores,
+                                "margins": target_margins,
+                                "minimum_margin": float(
+                                    target_margins[target_result.target_label]
+                                ),
+                                "binding_competitor": target_result.target_label,
+                                "scorer_prediction": target_prediction,
+                                "scorer_correct": target_prediction == gold,
+                                "score_tie": target_tie,
+                                "flipped": float(
+                                    target_margins[target_result.target_label]
+                                )
+                                <= 0.0,
+                                "realized_epsilon": target_realized_epsilon,
+                                "realized_intervention": {
+                                    "target_label": target_result.target_label,
+                                    "initial_margin": float(
+                                        target_result.initial_margin
+                                    ),
+                                    "final_margin": float(target_result.final_margin),
+                                    "requested_delta_norm": float(
+                                        target_result.requested_delta_norm
+                                    ),
+                                    "realized_delta_norm": float(
+                                        target_result.realized_delta_norm
+                                    ),
+                                    "requested_relative_norm": target_requested_epsilon,
+                                    "realized_relative_norm": target_realized_epsilon,
+                                    "absolute_budget": float(target_result.budget),
+                                    "budget_respected": bool(
+                                        target_result.budget_respected
+                                    ),
+                                },
+                            }
+                        )
         else:
-            raise ContractError(f"unsupported smoke attack family: {family}")
+            raise ContractError(
+                f"failure-boundary v1 does not support attack family: {family}"
+            )
     finally:
         runtime.unload()
     sample_count = len(rows)
     for row in rows:
         if row.get("record_type") == "sample":
             validate_intervention_row(row)
-    rows.append({"record_type": "shard_metadata", "array_index": task["array_index"], "config_key": task["config_key"], "row_count": sample_count})
-    atomic_write_jsonl(task_dir / "attack_results.jsonl", rows, overwrite=args.overwrite)
+    rows.append(
+        {
+            "record_type": "shard_metadata",
+            "array_index": task["array_index"],
+            "config_key": task["config_key"],
+            "row_count": sample_count,
+        }
+    )
+    atomic_write_jsonl(
+        task_dir / "attack_results.jsonl", rows, overwrite=args.overwrite
+    )
     publish_completion(
         task_dir,
         config_hash=str(task["config_key"]),
         source_hash_value=_cached_source_hash(args, repo_root),
         artifact_paths=["manifest.json", "command.txt", "attack_results.jsonl"],
         row_counts={"attack_results.jsonl": len(rows)},
-        extra={"array_index": int(task["array_index"]), "execution_batch_id": task["execution_batch_id"]},
+        extra={
+            "array_index": int(task["array_index"]),
+            "execution_batch_id": task["execution_batch_id"],
+        },
+        overwrite=args.overwrite,
+    )
+
+
+def _test_outcome_evidence(test_root: Path) -> list[str]:
+    """Return any durable sign that a held-out outcome stage has started.
+
+    A completion marker alone is too weak: a killed job can already have
+    written a manifest, log, partial/final outcome artifact, or pending marker.
+    Once that happens the output root is contaminated for a pre-outcome freeze,
+    even if the task never finalized successfully.
+    """
+
+    evidence: list[str] = []
+    for stage in ("clean", "test_probe", "test"):
+        stage_root = test_root / stage
+        if not stage_root.is_dir():
+            continue
+        evidence.extend(
+            str(path)
+            for path in sorted(stage_root.rglob("*"))
+            if path.is_file() or path.is_symlink()
+        )
+    return evidence
+
+
+def _freeze_heldout_execution(
+    args: argparse.Namespace,
+    task_dir: Path,
+    task: Mapping[str, Any],
+    repo_root: Path,
+) -> None:
+    """Freeze the raw held-out cohort without reading a single test outcome."""
+
+    if str(task["partition"]) != "test":
+        raise ContractError("held-out execution freeze is restricted to test")
+    test_root = (
+        _phase_root(args)
+        / str(task["dataset"])
+        / f"R{int(task['R'])}"
+        / "test"
+    )
+    contaminated = _test_outcome_evidence(test_root)
+    if contaminated:
+        raise ContractError(
+            "held-out execution must be frozen before any test outcome task; "
+            f"found {contaminated[:3]}"
+        )
+    split, split_hash = _authenticated_split_manifest(args, task, repo_root)
+    partition_rows = list(split["partitions"]["test"])
+    screening_rows = []
+    for value in partition_rows:
+        row = value if isinstance(value, Mapping) else {"raw_sample_id": value}
+        raw_id = str(row["raw_sample_id"])
+        screening_rows.append(
+            {
+                "raw_sample_id": raw_id,
+                "sample_id": raw_id,
+                "raw_index": row.get("raw_index"),
+                "analysis_eligible": True,
+                "dual_correct": None,
+                "exclusion_reason": "",
+            }
+        )
+    freeze_protocol = {
+        "schema_version": "linkradius.heldout_execution_freeze.v1",
+        "partition": "test",
+        "split_manifest_hash": split_hash,
+        "batch_size": int(args.batch_size),
+        "selection": "all_raw_test_rows_before_outcomes",
+        "outcomes_observed": False,
+    }
+    manifest = build_execution_manifest(
+        split_manifest=split,
+        partition="test",
+        screening_rows=screening_rows,
+        batch_size=int(args.batch_size),
+        batches_per_shard=int(args.batches_per_shard),
+        screening_config_hash=content_hash(
+            freeze_protocol, domain="linkradius:heldout_execution_freeze:v1"
+        ),
+        screening_run_hash=content_hash(
+            [row["raw_sample_id"] for row in screening_rows],
+            domain="linkradius:heldout_raw_cohort:v1",
+        ),
+        retain_all_partition_rows=True,
+    )
+    output = (
+        Path(args.execution_output)
+        if args.execution_output
+        else test_root / "execution_manifest.json"
+    )
+    if output.exists() and not args.overwrite:
+        existing_hash = verify_execution_manifest(
+            load_json(output), split_manifest=split
+        )
+        if existing_hash != manifest["content_hash"]:
+            raise ContractError("existing held-out execution manifest is incompatible")
+    else:
+        atomic_write_json(output, manifest, overwrite=True)
+    atomic_write_json(
+        task_dir / "execution_manifest.json", manifest, overwrite=args.overwrite
+    )
+    atomic_write_json(
+        task_dir / "freeze_execution_result.json",
+        {
+            "path": str(output.resolve()),
+            "content_hash": manifest["content_hash"],
+            "outcomes_observed": False,
+            "row_count": len(screening_rows),
+        },
+        overwrite=args.overwrite,
+    )
+    publish_completion(
+        task_dir,
+        config_hash=str(task["config_key"]),
+        source_hash_value=_cached_source_hash(args, repo_root),
+        artifact_paths=[
+            "manifest.json",
+            "command.txt",
+            "freeze_execution_result.json",
+            "execution_manifest.json",
+        ],
+        extra={
+            "array_index": int(task["array_index"]),
+            "execution_manifest_hash": manifest["content_hash"],
+        },
         overwrite=args.overwrite,
     )
 
 
 def _freeze_execution(args: argparse.Namespace, task_dir: Path, task: Mapping[str, Any], repo_root: Path) -> None:
+    if args.workflow == "attacks":
+        _freeze_heldout_execution(args, task_dir, task, repo_root)
+        return
     screening_stage = {
         "engineering": "discover",
         "smoke": "screen",
@@ -2980,14 +3856,529 @@ def _freeze_execution(args: argparse.Namespace, task_dir: Path, task: Mapping[st
     )
 
 
+def _validation_pgd_straddle(
+    pgd_rows: Sequence[Mapping[str, Any]],
+    budgets: Sequence[float],
+) -> dict[str, Any]:
+    """Count validation boundaries bracketed on the same example/edge curve."""
+
+    if not budgets:
+        raise ContractError("validation PGD straddle requires budgets")
+    minimum_budget, maximum_budget = float(budgets[0]), float(budgets[-1])
+    curves: dict[tuple[str, str], dict[float, Mapping[str, Any]]] = {}
+    for row in pgd_rows:
+        curve_key = (str(row["raw_sample_id"]), str(row["edge_id"]))
+        budget = float(row["requested_epsilon"])
+        curve = curves.setdefault(curve_key, {})
+        if budget in curve:
+            raise ContractError(f"duplicate validation PGD curve cell: {curve_key}/{budget}")
+        curve[budget] = row
+    incomplete = [
+        curve_key
+        for curve_key, curve in curves.items()
+        if minimum_budget not in curve or maximum_budget not in curve
+    ]
+    if incomplete:
+        raise ContractError(
+            f"validation PGD curves lack endpoint budgets: {incomplete[:3]}"
+        )
+    safe_at_min = sum(
+        float(curve[minimum_budget]["minimum_margin"]) > 0.0
+        for curve in curves.values()
+    )
+    crossed_at_max = sum(
+        float(curve[maximum_budget]["minimum_margin"]) <= 0.0
+        for curve in curves.values()
+    )
+    straddled = [
+        curve_key
+        for curve_key, curve in curves.items()
+        if float(curve[minimum_budget]["minimum_margin"]) > 0.0
+        and float(curve[maximum_budget]["minimum_margin"]) <= 0.0
+    ]
+    return {
+        "curve_count": len(curves),
+        "safe_at_smallest": safe_at_min,
+        "crossed_at_largest": crossed_at_max,
+        "paired_straddled_curves": len(straddled),
+        "paired_straddled_curve_fraction": (
+            len(straddled) / len(curves) if curves else 0.0
+        ),
+    }
+
+
+def _freeze_attack_stage(
+    args: argparse.Namespace,
+    task_dir: Path,
+    task: Mapping[str, Any],
+    repo_root: Path,
+) -> None:
+    """Freeze the RQ2 attack/probe protocol using validation evidence only."""
+
+    current_source = _cached_source_hash(args, repo_root)
+    if int(task["R"]) != 2:
+        raise ContractError("failure-boundary v1 is frozen at R=2")
+    families = str(args.attack_families).split()
+    if families != ["pgd_autograd", "random_independent"]:
+        raise ContractError(
+            "failure-boundary v1 requires exactly: pgd_autograd random_independent"
+        )
+    budgets = [float(value) for value in str(args.attack_epsilons).split()]
+    if (
+        not budgets
+        or budgets != sorted(set(budgets))
+        or any(not math.isfinite(value) or value <= 0.0 for value in budgets)
+    ):
+        raise ContractError(
+            "validation attack budgets must be unique, positive, finite, and increasing"
+        )
+    if int(args.pgd_steps) < 1:
+        raise ContractError("PGD steps must be positive")
+
+    test_root = (
+        _phase_root(args)
+        / str(task["dataset"])
+        / f"R{int(task['R'])}"
+        / "test"
+    )
+    contaminated = _test_outcome_evidence(test_root)
+    if contaminated:
+        raise ContractError(
+            "freeze_attack refuses pre-existing test outcome evidence: "
+            f"{contaminated[:3]}"
+        )
+
+    grid_report = _verify_source_stage_grid(
+        args, task, repo_root, stage="val", partition="validation"
+    )
+    validation_root = (
+        _phase_root(args)
+        / str(task["dataset"])
+        / f"R{int(task['R'])}"
+        / "validation"
+        / "val"
+    )
+    all_rows = _completed_rows(
+        validation_root,
+        "attack_results.jsonl",
+        expected_source_hash=current_source,
+        expected_config_keys=_current_stage_config_keys(
+            args, task, stage="val", partition="validation"
+        ),
+    )
+    bad_records = [
+        row
+        for row in all_rows
+        if row.get("record_type") not in {
+            "sample",
+            "attack_target",
+            "shard_metadata",
+        }
+        or row.get("failure")
+    ]
+    if bad_records:
+        first = bad_records[0]
+        raise ContractError(
+            "validation attack evidence contains an unsupported/failed row: "
+            f"{first.get('unsupported_reason') or first.get('failure') or first.get('record_type')}"
+        )
+    rows = [row for row in all_rows if row.get("record_type") == "sample"]
+    if not rows:
+        raise ContractError("freeze_attack found no validation attack samples")
+    pgd_target_report = _validate_pgd_target_evidence(
+        all_rows, where="validation attack evidence"
+    )
+
+    pilot_args = _producer_namespace(args, "pilot")
+    split, split_hash = _authenticated_split_manifest(pilot_args, task, repo_root)
+    _, validation_execution, validation_execution_hash = (
+        _authenticated_execution_manifest(
+            pilot_args, "validation", task, repo_root
+        )
+    )
+    _, test_execution, test_execution_hash = _authenticated_execution_manifest(
+        args, "test", task, repo_root
+    )
+    frozen_probe = _authenticated_frozen_probe_config(
+        args, task, current_source_hash=current_source
+    )
+    expected_probe_protocol = {
+        "dataset": str(task["dataset"]),
+        "R": int(task["R"]),
+        "style": str(args.style),
+        "method": str(args.method),
+        "seed": int(task["seed"]),
+        "batch_size": int(args.batch_size),
+        "latent_length": int(args.latent_length),
+        "subspace": str(args.subspace),
+        "runtime": {
+            "role_devices": _resolved_role_devices(args),
+            "relay_transfer_mode": str(args.relay_transfer_mode),
+            "autograd_memory_mode": str(args.autograd_memory_mode),
+            "trust_remote_code": int(args.trust_remote_code),
+            "round_label_mode": str(args.round_label_mode),
+            "environment": _runtime_environment_identity(),
+        },
+    }
+    observed_probe_protocol = {
+        key: frozen_probe.get(key) for key in expected_probe_protocol
+    }
+    if observed_probe_protocol != expected_probe_protocol:
+        raise ContractError(
+            "frozen Phase-3 probe protocol is incompatible with the "
+            "failure-boundary attack configuration"
+        )
+    if not set(EARLY_R2_EDGES).issubset(set(frozen_probe.get("grid_edges", []))):
+        raise ContractError(
+            "frozen Phase-3 probe grid does not cover every early R=2 edge"
+        )
+    validation_system_identity = _common_system_identity(
+        all_rows, where="validation attack evidence"
+    )
+    if validation_system_identity != frozen_probe.get("system_identity"):
+        raise ContractError(
+            "validation attacks resolved a different model/adapter/scorer/"
+            "prompt identity than the frozen Phase-3 probe protocol"
+        )
+    attack_cast_thresholds = frozen_probe["acceptance_thresholds"]
+    eligible_ids = {
+        str(raw_id)
+        for raw_id, eligible in zip(
+            validation_execution["ordered_raw_sample_ids"],
+            validation_execution["analysis_eligible"],
+        )
+        if bool(eligible)
+    }
+    edges = list(EARLY_R2_EDGES)
+    expected = {
+        (raw_id, edge, family, epsilon)
+        for raw_id in eligible_ids
+        for edge in edges
+        for family in families
+        for epsilon in budgets
+    }
+    observed: dict[tuple[str, str, str, float], Mapping[str, Any]] = {}
+    nonfinite: list[str] = []
+    budget_violations: list[str] = []
+    attack_quality_violations: list[str] = []
+    for row in rows:
+        key = (
+            str(row.get("raw_sample_id")),
+            str(row.get("edge_id")),
+            str(row.get("attack_family")),
+            float(row.get("requested_epsilon")),
+        )
+        if key in observed:
+            raise ContractError(f"duplicate validation attack cell: {key}")
+        observed[key] = row
+        margins = row.get("margins")
+        if (
+            not isinstance(margins, Mapping)
+            or not margins
+            or any(
+                not math.isfinite(float(value)) for value in margins.values()
+            )
+        ):
+            nonfinite.append(str(key))
+        realized = row.get("realized_epsilon")
+        if realized is None or not math.isfinite(float(realized)):
+            nonfinite.append(f"{key}:realized_epsilon")
+        elif float(realized) > float(key[3]) + 1e-6 * max(1.0, float(key[3])):
+            budget_violations.append(str(key))
+        elif float(realized) <= 0.0:
+            attack_quality_violations.append(f"{key}:collapsed_budget")
+        if row.get("attack_family") == "random_independent":
+            diagnostics = row.get("realized_intervention")
+            if not isinstance(diagnostics, Mapping):
+                attack_quality_violations.append(f"{key}:missing_diagnostics")
+            else:
+                cosine = diagnostics.get("requested_realized_cosine")
+                off_direction = diagnostics.get("off_direction_relative")
+                if (
+                    bool(diagnostics.get("collapsed", True))
+                    or cosine is None
+                    or not math.isfinite(float(cosine))
+                    or float(cosine)
+                    < float(
+                        attack_cast_thresholds[
+                            "minimum_requested_realized_cosine"
+                        ]
+                    )
+                    or off_direction is None
+                    or not math.isfinite(float(off_direction))
+                    or float(off_direction)
+                    > float(
+                        attack_cast_thresholds["maximum_off_direction_relative"]
+                    )
+                ):
+                    attack_quality_violations.append(
+                        f"{key}:random_postcast_direction"
+                    )
+        elif row.get("attack_family") == "pgd_autograd":
+            requested = row.get("requested_intervention")
+            diagnostics = row.get("realized_intervention")
+            if (
+                row.get("autograd_semantics") != "relaxed_autograd"
+                or int(row.get("pgd_target_count", -1)) != 3
+                or not isinstance(requested, Mapping)
+                or int(requested.get("steps", -1)) != int(args.pgd_steps)
+                or int(requested.get("restart", -1)) != 0
+                or not isinstance(diagnostics, Mapping)
+                or diagnostics.get("budget_respected") is not True
+            ):
+                attack_quality_violations.append(f"{key}:pgd_protocol")
+        if row.get("analysis_eligible") is not True:
+            raise ContractError(f"validation attack emitted an ineligible row: {key}")
+    realized_curves: dict[tuple[str, str, str], list[tuple[float, float]]] = {}
+    for key, row in observed.items():
+        curve = key[:3]
+        realized_curves.setdefault(curve, []).append(
+            (float(key[3]), float(row.get("realized_epsilon", float("nan"))))
+        )
+    nonincreasing_realized_curves: list[str] = []
+    for curve, values in realized_curves.items():
+        ordered_realized = [
+            realized for _, realized in sorted(values, key=lambda item: item[0])
+        ]
+        if any(
+            not math.isfinite(right) or right <= left
+            for left, right in zip(ordered_realized, ordered_realized[1:])
+        ):
+            # Requested budgets define the pre-registered attack curve.  A
+            # constrained optimizer can legitimately finish inside its ball,
+            # so achieved norms are diagnostic rather than required to be
+            # monotone.  Such curves retain requested-grid thresholds, while
+            # downstream actual-norm thresholds are ordered by achieved norm.
+            nonincreasing_realized_curves.append(str(curve))
+    missing = sorted(expected - set(observed))
+    extra = sorted(set(observed) - expected)
+    if (
+        missing
+        or extra
+        or nonfinite
+        or budget_violations
+        or attack_quality_violations
+    ):
+        raise ContractError(
+            "validation attack cube is invalid; "
+            f"missing={missing[:3]}, extra={extra[:3]}, "
+            f"nonfinite={nonfinite[:3]}, budget_violations={budget_violations[:3]}, "
+            f"quality_violations={attack_quality_violations[:3]}"
+        )
+    provenance = _provenance_check(
+        all_rows,
+        partition="validation",
+        allowed_raw_ids=eligible_ids,
+        split_hash=split_hash,
+        execution_hash=validation_execution_hash,
+        current_source_hash=current_source,
+        ordered_cohort_hash=validation_execution["ordered_cohort_hash"],
+        batch_boundary_hash=validation_execution["batch_boundary_hash"],
+    )
+    if not provenance["passed"]:
+        raise ContractError(f"validation attack provenance failed: {provenance}")
+
+    pgd_rows = [row for row in rows if row["attack_family"] == "pgd_autograd"]
+    straddle = _validation_pgd_straddle(pgd_rows, budgets)
+    safe_at_min = int(straddle["safe_at_smallest"])
+    crossed_at_max = int(straddle["crossed_at_largest"])
+    paired_straddled_curves = int(straddle["paired_straddled_curves"])
+    minimum_straddled_curves = 1
+    if paired_straddled_curves < minimum_straddled_curves:
+        raise ContractError(
+            "validation PGD grid does not straddle an observed boundary on "
+            "the same raw-example/edge curve: "
+            f"safe_at_min={safe_at_min}, crossed_at_max={crossed_at_max}; "
+            f"paired_straddled_curves={paired_straddled_curves}, "
+            f"required={minimum_straddled_curves}; "
+            "widen ATTACK_EPSILONS and rerun validation"
+        )
+
+    probe_seeds = [int(value) for value in frozen_probe["probe_seeds"]]
+    if len(probe_seeds) < 3 or len(set(probe_seeds)) != len(probe_seeds):
+        raise ContractError(
+            "failure-boundary evaluation requires at least three unique "
+            "probe seeds in the frozen Phase-3 protocol"
+        )
+    primary_probe_seed = min(probe_seeds)
+    evidence_rows = sorted(
+        rows,
+        key=lambda row: (
+            str(row["raw_sample_id"]),
+            str(row["edge_id"]),
+            str(row["attack_family"]),
+            float(row["requested_epsilon"]),
+        ),
+    )
+    config: dict[str, Any] = {
+        "schema_version": "linkradius.frozen_attack_config.v1",
+        "experiment_scope": "rq2_failure_boundary_pgd_plus_random_v1",
+        "dataset": str(task["dataset"]),
+        "R": int(task["R"]),
+        "style": str(args.style),
+        "method": str(args.method),
+        "seed": int(task["seed"]),
+        "batch_size": int(args.batch_size),
+        "latent_length": int(args.latent_length),
+        "edges": edges,
+        "subspace": str(args.subspace),
+        "runtime": {
+            "role_devices": _resolved_role_devices(args),
+            "relay_transfer_mode": str(args.relay_transfer_mode),
+            "autograd_memory_mode": str(args.autograd_memory_mode),
+            "trust_remote_code": int(args.trust_remote_code),
+            "round_label_mode": str(args.round_label_mode),
+            "environment": _runtime_environment_identity(),
+        },
+        "attack_families": families,
+        "attack_epsilons": budgets,
+        "threshold_tie_rule": "minimum_pairwise_gold_margin_le_zero",
+        "pgd": {
+            "steps": int(args.pgd_steps),
+            "restarts": 1,
+            "initialization": "zero",
+            "step_size_rule": "2_times_relative_budget_times_reference_norm_div_steps",
+            "target_rule": "all_three_wrong_labels_keep_minimum_margin",
+        },
+        "random_independent": {
+            "seed_offset": int(args.random_attack_seed_offset),
+            "direction_count": 1,
+            "direction_reused_across_budgets": True,
+            "seed_domain": "random_independent_attack",
+        },
+        "probe": {
+            "h": float(frozen_probe["selected_h"]),
+            "K": int(frozen_probe["K"]),
+            "seeds": probe_seeds,
+            "primary_seed": primary_probe_seed,
+            "acceptance_thresholds": frozen_probe["acceptance_thresholds"],
+            "frozen_probe_config_hash": frozen_probe["content_hash"],
+        },
+        "validation_summary": {
+            "eligible_raw_ids": len(eligible_ids),
+            "attack_cells": len(rows),
+            "safe_at_smallest_pgd_budget": safe_at_min,
+            "crossed_at_largest_pgd_budget": crossed_at_max,
+            "paired_straddled_pgd_curves": paired_straddled_curves,
+            "paired_straddled_pgd_curve_fraction": straddle[
+                "paired_straddled_curve_fraction"
+            ],
+            "minimum_paired_straddled_pgd_curves": minimum_straddled_curves,
+            "nonincreasing_realized_curves": len(
+                nonincreasing_realized_curves
+            ),
+        },
+        "system_identity": validation_system_identity,
+        "test_outcomes_accessed_before_freeze": False,
+        "source_hash": current_source,
+        "split_manifest_hash": split_hash,
+        "validation_execution_manifest_hash": validation_execution_hash,
+        "test_execution_manifest_hash": test_execution_hash,
+        "test_ordered_cohort_hash": test_execution["ordered_cohort_hash"],
+        "test_batch_boundary_hash": test_execution["batch_boundary_hash"],
+        "validation_attack_evidence_hash": content_hash(
+            evidence_rows, domain="linkradius:validation_attack_evidence:v1"
+        ),
+        "validation_grid_verification": grid_report,
+    }
+    config["content_hash"] = content_hash(
+        config, domain="linkradius:frozen_attack_config:v1"
+    )
+    output = Path(args.frozen_attack_config)
+    if output.exists() and not args.overwrite:
+        existing = load_json(output)
+        if existing.get("content_hash") != config["content_hash"]:
+            raise ContractError(
+                "refusing to overwrite an incompatible frozen attack configuration"
+            )
+    else:
+        atomic_write_json(output, config, overwrite=True)
+
+    engineering = require_passed_gate(
+        args.engineering_gate, gate_type="engineering_gate"
+    )
+    smoke = require_passed_gate(args.smoke_gate, gate_type="smoke_gate")
+    probe_gate = require_passed_gate(args.probe_gate, gate_type="probe_gate")
+    checks = [
+        {"name": "no_test_outcomes_before_freeze", "passed": True},
+        {"name": "validation_attack_grid_complete", "passed": True, **grid_report},
+        {"name": "validation_attack_cube_exact", "passed": True, "cells": len(rows)},
+        {"name": "validation_attack_provenance", **provenance},
+        pgd_target_report,
+        {
+            "name": "validation_budget_grid_straddles_boundary",
+            "passed": True,
+            "safe_at_smallest": safe_at_min,
+            "crossed_at_largest": crossed_at_max,
+            "paired_straddled_curves": paired_straddled_curves,
+            "paired_straddled_curve_fraction": straddle[
+                "paired_straddled_curve_fraction"
+            ],
+            "minimum_required": minimum_straddled_curves,
+        },
+        {
+            "name": "heldout_execution_frozen_without_outcomes",
+            "passed": True,
+            "test_rows": len(test_execution["ordered_raw_sample_ids"]),
+        },
+    ]
+    gate = make_gate(
+        gate_type="attack_freeze_gate",
+        checks=checks,
+        config_hash=str(task["config_key"]),
+        source_hash=current_source,
+        prerequisite_hashes={
+            "engineering_gate_hash": engineering["gate_content_hash"],
+            "smoke_gate_hash": smoke["gate_content_hash"],
+            "probe_gate_hash": probe_gate["gate_content_hash"],
+            "frozen_attack_config_hash": config["content_hash"],
+            "split_manifest_hash": split_hash,
+            "validation_execution_manifest_hash": validation_execution_hash,
+            "test_execution_manifest_hash": test_execution_hash,
+        },
+    )
+    gate_path = Path(args.attack_freeze_gate)
+    atomic_write_json(gate_path, gate, overwrite=args.overwrite)
+    _record_global_pointer_completion(
+        args,
+        task_dir,
+        task,
+        repo_root,
+        pointer_name="attack_freeze_result.json",
+        pointer={
+            "passed": True,
+            "frozen_attack_config": str(output.resolve()),
+            "content_hash": config["content_hash"],
+            "attack_freeze_gate": str(gate_path.resolve()),
+            "gate_content_hash": gate["gate_content_hash"],
+        },
+    )
+
+
 def _completed_rows(
     root: Path,
     filename: str,
     *,
     expected_source_hash: str,
+    expected_config_keys: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for completion_path in sorted(root.rglob(".complete.json")):
+        manifest_path = completion_path.parent / "manifest.json"
+        if expected_config_keys is not None:
+            if not manifest_path.is_file():
+                continue
+            candidate_manifest = load_json(manifest_path)
+            candidate_task = candidate_manifest.get("task", {})
+            if (
+                candidate_task.get("stage") != root.name
+                or str(candidate_task.get("config_key") or "")
+                not in expected_config_keys
+            ):
+                # Content-addressed historical attempts are intentionally
+                # retained, but only the currently requested canonical grid
+                # may contribute rows to a freeze or aggregate.
+                continue
         path = completion_path.parent / filename
         completion = verify_completion(completion_path.parent)
         if completion.get("source_hash") != expected_source_hash:
@@ -3013,7 +4404,7 @@ def _completed_rows(
                 f"{filename} must be uniquely declared by its completion record"
             )
         shard_rows = load_jsonl(path)
-        manifest = load_json(path.parent / "manifest.json")
+        manifest = load_json(manifest_path)
         manifest_task = manifest.get("task")
         metadata = [
             row
@@ -3042,6 +4433,24 @@ def _completed_rows(
             )
         rows.extend(shard_rows)
     return rows
+
+
+def _current_stage_config_keys(
+    args: argparse.Namespace,
+    task: Mapping[str, Any],
+    *,
+    stage: str,
+    partition: str,
+) -> set[str]:
+    """Return the exact content-addressed keys in the current canonical grid."""
+
+    return {
+        str(candidate.config_key)
+        for candidate in build_grid(_build_grid_config(args, stage))
+        if candidate.dataset == str(task["dataset"])
+        and int(candidate.R) == int(task["R"])
+        and candidate.partition == partition
+    }
 
 
 def _verify_source_stage_grid(
@@ -3073,6 +4482,9 @@ def _verify_source_stage_grid(
         / stage
     )
     records = []
+    expected_keys = _current_stage_config_keys(
+        args, task, stage=stage, partition=partition
+    )
     if stage_root.is_dir():
         for completion_path in sorted(stage_root.rglob(".complete.json")):
             manifest_path = completion_path.parent / "manifest.json"
@@ -3081,6 +4493,11 @@ def _verify_source_stage_grid(
             manifest = load_json(manifest_path)
             manifest_task = manifest.get("task", {})
             if manifest_task.get("stage") != stage:
+                continue
+            if str(manifest_task.get("config_key") or "") not in expected_keys:
+                # Content-addressed historical attempts intentionally coexist
+                # with a retuned validation grid.  Only the exact current task
+                # keys participate in the current freeze/audit.
                 continue
             records.append((completion_path, verify_completion(completion_path.parent)))
     report = verify_expected_completions(
@@ -3208,7 +4625,7 @@ def _provenance_check(
     relevant = [
         row
         for row in rows
-        if row.get("record_type") in {"sample", "probe_pair"}
+        if row.get("record_type") in {"sample", "probe_pair", "attack_target"}
     ]
     violations: list[str] = []
     for row in relevant:
@@ -3231,6 +4648,317 @@ def _provenance_check(
         "row_count": len(relevant),
         "violation_count": len(violations),
         "violation_examples": sorted(set(violations))[:20],
+    }
+
+
+_SYSTEM_IDENTITY_FIELDS = (
+    "model_hash",
+    "adapter_hash",
+    "scorer_hash",
+    "prompt_hash",
+    "system_resolution",
+)
+
+
+def _common_system_identity(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    where: str,
+) -> dict[str, Any]:
+    """Require one exact model/adapter/scorer/prompt identity across rows."""
+
+    identities: dict[str, dict[str, Any]] = {}
+    relevant = [
+        row
+        for row in rows
+        if row.get("record_type") != "shard_metadata"
+        and row.get("raw_sample_id") not in (None, "")
+    ]
+    for row in relevant:
+        identity = {field: row.get(field) for field in _SYSTEM_IDENTITY_FIELDS}
+        if (
+            any(identity[field] in (None, "") for field in _SYSTEM_IDENTITY_FIELDS)
+            or not isinstance(identity["system_resolution"], Mapping)
+        ):
+            raise ContractError(f"{where} row is missing resolved system identity")
+        key = content_hash(identity, domain="linkradius:system_identity:v1")
+        identities[key] = identity
+    if not relevant or len(identities) != 1:
+        raise ContractError(
+            f"{where} must contain exactly one resolved system identity; "
+            f"rows={len(relevant)}, identities={len(identities)}"
+        )
+    identity_hash, identity = next(iter(identities.items()))
+    return {**identity, "content_hash": identity_hash}
+
+
+def _validate_pgd_target_evidence(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    where: str,
+) -> dict[str, Any]:
+    """Authenticate every PGD edge summary against all three target runs."""
+
+    def coordinate(row: Mapping[str, Any]) -> tuple[str, str, float, int, int]:
+        return (
+            str(row.get("raw_sample_id") or ""),
+            str(row.get("edge_id") or ""),
+            float(row.get("requested_epsilon")),
+            int(row.get("attack_seed")),
+            int(row.get("attack_restart")),
+        )
+
+    summaries: dict[tuple[str, str, float, int, int], Mapping[str, Any]] = {}
+    targets: dict[
+        tuple[str, str, float, int, int], dict[str, Mapping[str, Any]]
+    ] = {}
+    for row in rows:
+        if row.get("attack_family") != "pgd_autograd":
+            if row.get("record_type") == "attack_target":
+                raise ContractError(f"{where} contains a non-PGD attack_target row")
+            continue
+        kind = row.get("record_type")
+        if kind not in {"sample", "attack_target"}:
+            continue
+        try:
+            key = coordinate(row)
+        except (TypeError, ValueError) as exc:
+            raise ContractError(f"{where} PGD row has invalid coordinates") from exc
+        if not key[0] or not key[1]:
+            raise ContractError(f"{where} PGD row has empty coordinates")
+        if kind == "sample":
+            if key in summaries:
+                raise ContractError(f"{where} has a duplicate PGD summary: {key}")
+            summaries[key] = row
+            continue
+        label = str(row.get("target_label") or "")
+        by_label = targets.setdefault(key, {})
+        if not label or label in by_label:
+            raise ContractError(
+                f"{where} has an empty/duplicate PGD target label at {key}"
+            )
+        by_label[label] = row
+
+    if not summaries:
+        raise ContractError(f"{where} contains no PGD edge summaries")
+    if set(targets) != set(summaries):
+        raise ContractError(
+            f"{where} PGD target coordinates differ from summary coordinates"
+        )
+    for key, summary in summaries.items():
+        gold = str(summary.get("gold") or "")
+        summary_margins = summary.get("margins")
+        summary_scores = summary.get("option_scores")
+        if gold not in {"A", "B", "C", "D"} or not isinstance(
+            summary_margins, Mapping
+        ) or not isinstance(summary_scores, Mapping):
+            raise ContractError(f"{where} PGD summary has invalid gold/margins: {key}")
+        expected_labels = {label for label in ("A", "B", "C", "D") if label != gold}
+        try:
+            parsed_summary_scores = {
+                str(name): float(value)
+                for name, value in dict(summary_scores).items()
+            }
+            parsed_summary_margins = {
+                str(name): float(value)
+                for name, value in dict(summary_margins).items()
+            }
+            summary_realized_epsilon = float(summary.get("realized_epsilon"))
+        except (TypeError, ValueError) as exc:
+            raise ContractError(
+                f"{where} malformed PGD summary numerics at {key}"
+            ) from exc
+        if (
+            set(parsed_summary_scores) != {"A", "B", "C", "D"}
+            or set(parsed_summary_margins) != expected_labels
+            or any(
+                not math.isfinite(value)
+                for value in (
+                    *parsed_summary_scores.values(),
+                    *parsed_summary_margins.values(),
+                    summary_realized_epsilon,
+                )
+            )
+            or any(
+                not math.isclose(
+                    parsed_summary_margins[label],
+                    parsed_summary_scores[gold] - parsed_summary_scores[label],
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
+                for label in expected_labels
+            )
+        ):
+            raise ContractError(
+                f"{where} PGD summary scores/margins are inconsistent at {key}"
+            )
+        by_label = targets[key]
+        if set(by_label) != expected_labels or int(
+            summary.get("pgd_target_count", -1)
+        ) != len(expected_labels):
+            raise ContractError(
+                f"{where} PGD target set is incomplete at {key}: "
+                f"expected={sorted(expected_labels)}, observed={sorted(by_label)}"
+            )
+        target_minima: dict[str, float] = {}
+        for label in sorted(expected_labels):
+            target = by_label[label]
+            margins = target.get("margins")
+            scores = target.get("option_scores")
+            diagnostics = target.get("realized_intervention")
+            clean_margins = target.get("clean_margins")
+            try:
+                parsed_margins = {
+                    str(name): float(value)
+                    for name, value in dict(margins or {}).items()
+                }
+                parsed_scores = {
+                    str(name): float(value)
+                    for name, value in dict(scores or {}).items()
+                }
+                declared_target_margin = float(target.get("minimum_margin"))
+                realized_epsilon = float(target.get("realized_epsilon"))
+                requested_relative = float(
+                    dict(diagnostics or {}).get("requested_relative_norm")
+                )
+                realized_relative = float(
+                    dict(diagnostics or {}).get("realized_relative_norm")
+                )
+                requested_delta = float(
+                    dict(diagnostics or {}).get("requested_delta_norm")
+                )
+                realized_delta = float(
+                    dict(diagnostics or {}).get("realized_delta_norm")
+                )
+                absolute_budget = float(
+                    dict(diagnostics or {}).get("absolute_budget")
+                )
+                initial_margin = float(
+                    dict(diagnostics or {}).get("initial_margin")
+                )
+                final_margin = float(
+                    dict(diagnostics or {}).get("final_margin")
+                )
+                parsed_clean_margins = {
+                    str(name): float(value)
+                    for name, value in dict(clean_margins or {}).items()
+                }
+            except (TypeError, ValueError) as exc:
+                raise ContractError(
+                    f"{where} malformed PGD target numerics at {key}/{label}"
+                ) from exc
+            tolerance = 1e-6 * max(1.0, float(key[2]))
+            if (
+                str(target.get("gold") or "") != gold
+                or not isinstance(margins, Mapping)
+                or not isinstance(scores, Mapping)
+                or not isinstance(diagnostics, Mapping)
+                or not isinstance(clean_margins, Mapping)
+                or set(parsed_margins) != expected_labels
+                or set(parsed_scores) != {"A", "B", "C", "D"}
+                or set(parsed_clean_margins) != expected_labels
+                or any(
+                    not math.isfinite(value)
+                    for value in (
+                        *parsed_margins.values(),
+                        *parsed_scores.values(),
+                        declared_target_margin,
+                        realized_epsilon,
+                        requested_relative,
+                        realized_relative,
+                        requested_delta,
+                        realized_delta,
+                        absolute_budget,
+                        initial_margin,
+                        final_margin,
+                        *parsed_clean_margins.values(),
+                    )
+                )
+                or any(
+                    not math.isclose(
+                        parsed_margins[competitor],
+                        parsed_scores[gold] - parsed_scores[competitor],
+                        rel_tol=1e-12,
+                        abs_tol=1e-12,
+                    )
+                    for competitor in expected_labels
+                )
+                or str(target.get("competitor") or "") != label
+                or str(target.get("binding_competitor") or "") != label
+                or declared_target_margin != parsed_margins[label]
+                or not math.isclose(
+                    initial_margin,
+                    parsed_clean_margins[label],
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
+                or not math.isclose(
+                    final_margin,
+                    parsed_margins[label],
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
+                or str(diagnostics.get("target_label") or "") != label
+                or diagnostics.get("budget_respected") is not True
+                or requested_delta <= 0.0
+                or realized_delta <= 0.0
+                or absolute_budget <= 0.0
+                or requested_delta
+                > absolute_budget + 1e-6 * max(1.0, absolute_budget)
+                or realized_delta
+                > absolute_budget + 1e-6 * max(1.0, absolute_budget)
+                or requested_relative <= 0.0
+                or requested_relative > float(key[2]) + tolerance
+                or realized_epsilon <= 0.0
+                or realized_epsilon > float(key[2]) + tolerance
+                or not math.isclose(
+                    realized_epsilon,
+                    realized_relative,
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
+                or not math.isclose(
+                    realized_delta / requested_delta,
+                    realized_relative / requested_relative,
+                    rel_tol=1e-9,
+                    abs_tol=1e-9,
+                )
+                or not math.isclose(
+                    absolute_budget / (requested_delta / requested_relative),
+                    float(key[2]),
+                    rel_tol=1e-6,
+                    abs_tol=tolerance,
+                )
+            ):
+                raise ContractError(
+                    f"{where} malformed PGD target evidence at {key}/{label}"
+                )
+            target_minima[label] = min(parsed_margins.values())
+        strongest_label = min(sorted(expected_labels), key=target_minima.get)
+        strongest = by_label[strongest_label]
+        realized = summary.get("realized_intervention")
+        try:
+            declared_summary_minimum = float(summary.get("minimum_margin"))
+        except (TypeError, ValueError) as exc:
+            raise ContractError(f"{where} malformed PGD summary numerics at {key}") from exc
+        if (
+            summary.get("option_scores") != strongest.get("option_scores")
+            or summary.get("margins") != strongest.get("margins")
+            or declared_summary_minimum != target_minima[strongest_label]
+            or not isinstance(realized, Mapping)
+            or str(realized.get("target_label") or "") != strongest_label
+            or summary_realized_epsilon
+            != float(strongest.get("realized_epsilon"))
+            or dict(realized) != dict(strongest.get("realized_intervention") or {})
+        ):
+            raise ContractError(
+                f"{where} PGD summary is not the strongest full-margin target at {key}"
+            )
+    return {
+        "name": "pgd_target_evidence",
+        "passed": True,
+        "summary_rows": len(summaries),
+        "target_rows": sum(len(value) for value in targets.values()),
     }
 
 
@@ -3940,10 +5668,28 @@ def _freeze_probe_stage(
         selected_h=float(calibration["selected_h"]),
         selected_K=int(calibration["selected_K"]),
     )
+    system_identity = _common_system_identity(
+        [*probe_rows, *causal_rows, *gradient_rows],
+        where="Phase-3 validation evidence",
+    )
     config = {
         "schema_version": "linkradius.frozen_probe_config.v1",
         "dataset": task["dataset"],
         "R": int(task["R"]),
+        "style": str(args.style),
+        "method": str(args.method),
+        "seed": int(task["seed"]),
+        "batch_size": int(args.batch_size),
+        "latent_length": int(args.latent_length),
+        "runtime": {
+            "role_devices": _resolved_role_devices(args),
+            "relay_transfer_mode": str(args.relay_transfer_mode),
+            "autograd_memory_mode": str(args.autograd_memory_mode),
+            "trust_remote_code": int(args.trust_remote_code),
+            "round_label_mode": str(args.round_label_mode),
+            "environment": _runtime_environment_identity(),
+        },
+        "system_identity": system_identity,
         "selected_h": calibration["selected_h"],
         "K": calibration["selected_K"],
         "nested_K": calibration["nested_K"],
@@ -3959,6 +5705,9 @@ def _freeze_probe_stage(
         "probe_calibration": calibration,
         "probe_autograd_agreement": autograd_agreement,
         "causally_useful_edge_rule": causal_rule,
+        "causal_positive_control_required": not bool(
+            causal_rule.get("useful_edges")
+        ),
         "stability_criteria": {
             "minimum_rank_correlation": float(args.minimum_rank_stability),
             "minimum_binding_agreement": float(args.minimum_binding_stability),
@@ -4166,13 +5915,15 @@ def _validate_probe_stage(
             "name": "causally_useful_edge_rule_reproduced",
             "passed": causal_rule.get("content_hash")
             == frozen_causal_rule.get("content_hash")
-            and bool(causal_rule.get("useful_edges"))
             and frozen.get("validation_causal_evidence_hash")
             == content_hash(
                 sorted(replay, key=lambda row: str(row.get("run_id"))),
                 domain="linkradius:validation_causal_evidence:v1",
             ),
             "useful_edges": causal_rule.get("useful_edges", []),
+            "positive_control_required": not bool(
+                causal_rule.get("useful_edges")
+            ),
         },
         {"name": "scorer_generation_agreement", "passed": scorer_agreement["total_clean_rows"] > 0 and scorer_agreement["agreement_all_rows"] >= float(gate_criteria["minimum_scorer_agreement"]), **scorer_agreement, "minimum_all_row_agreement": float(gate_criteria["minimum_scorer_agreement"])},
         identity_check,
@@ -5110,7 +6861,11 @@ def _aggregate_cpu_stage(
         if not rows:
             raise ContractError("no completed compatible attack sample rows")
         thresholds = aggregate_thresholds(rows)
-        atomic_write_csv(task_dir / "attack_thresholds.csv", thresholds, overwrite=args.overwrite)
+        _write_union_csv(
+            task_dir / "attack_thresholds.csv",
+            thresholds,
+            overwrite=args.overwrite,
+        )
         artifacts.append("attack_thresholds.csv")
     elif stage == "metrics":
         from .aggregate_causal_use import common_provenance
@@ -5256,6 +7011,1214 @@ def _aggregate_cpu_stage(
     )
 
 
+def _write_union_csv(
+    path: Path,
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    overwrite: bool,
+) -> None:
+    fieldnames = sorted({str(key) for row in rows for key in row})
+    atomic_write_csv(
+        path,
+        rows,
+        fieldnames=fieldnames,
+        overwrite=overwrite,
+    )
+
+
+def _read_csv_rows(path: Path) -> list[dict[str, str]]:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _fresh_dual_correct_ids(
+    clean_rows: Sequence[Mapping[str, Any]],
+) -> set[str]:
+    from .select_clean_correct import classify_screening_row
+
+    return {
+        str(row["raw_sample_id"])
+        for row in clean_rows
+        if row.get("record_type") == "sample"
+        and classify_screening_row(row)[0]
+    }
+
+
+def _attack_threshold_stage(
+    args: argparse.Namespace,
+    task_dir: Path,
+    task: Mapping[str, Any],
+    repo_root: Path,
+) -> None:
+    from .aggregate_attack_thresholds import aggregate_thresholds
+
+    frozen = _authenticated_frozen_attack_config(
+        args,
+        task,
+        current_source_hash=_cached_source_hash(args, repo_root),
+    )
+    for stage in ("clean", "test"):
+        _verify_source_stage_grid(
+            args, task, repo_root, stage=stage, partition="test"
+        )
+    root = (
+        _phase_root(args)
+        / str(task["dataset"])
+        / f"R{int(task['R'])}"
+        / "test"
+    )
+    clean_rows = _completed_rows(
+        root / "clean",
+        "clean_baseline.jsonl",
+        expected_source_hash=_cached_source_hash(args, repo_root),
+    )
+    eligible_ids = _fresh_dual_correct_ids(clean_rows)
+    if not eligible_ids:
+        raise ContractError(
+            "held-out test contains no fresh dual-correct rows for boundary analysis"
+        )
+    attack_rows = [
+        row
+        for row in _completed_rows(
+            root / "test",
+            "attack_results.jsonl",
+            expected_source_hash=_cached_source_hash(args, repo_root),
+        )
+        if row.get("record_type") != "shard_metadata"
+        and str(row.get("raw_sample_id") or "") in eligible_ids
+    ]
+    if _common_system_identity(
+        [*clean_rows, *attack_rows], where="held-out threshold evidence"
+    ) != frozen.get("system_identity"):
+        raise ContractError(
+            "held-out threshold evidence differs from the frozen system identity"
+        )
+    pgd_target_report = _validate_pgd_target_evidence(
+        attack_rows, where="held-out threshold evidence"
+    )
+    thresholds = aggregate_thresholds(
+        attack_rows,
+        requested_budget_grid=[float(value) for value in frozen["attack_epsilons"]],
+        tie_tolerance=0.0,
+    )
+    if not thresholds:
+        raise ContractError("failure-threshold aggregation produced no rows")
+    _write_union_csv(
+        task_dir / "failure_thresholds.csv",
+        thresholds,
+        overwrite=args.overwrite,
+    )
+    summary = {
+        "schema_version": "linkradius.failure_threshold_summary.v1",
+        "eligible_raw_sample_count": len(eligible_ids),
+        "threshold_rows": len(thresholds),
+        "edge_summary_rows": sum(
+            row.get("curve_kind") == "edge_summary" for row in thresholds
+        ),
+        "attack_target_rows": sum(
+            row.get("curve_kind") == "attack_target" for row in thresholds
+        ),
+        "right_censored_rows": sum(
+            row.get("crossing_status") == "right_censored" for row in thresholds
+        ),
+        "nonmonotonic_rows": sum(bool(row.get("nonmonotonic")) for row in thresholds),
+        "realized_interval_unavailable_rows": sum(
+            row.get("realized_interval_available") is not True
+            for row in thresholds
+        ),
+        "frozen_attack_config_hash": frozen["content_hash"],
+        "pgd_target_evidence": pgd_target_report,
+    }
+    atomic_write_json(
+        task_dir / "threshold_summary.json", summary, overwrite=args.overwrite
+    )
+    publish_completion(
+        task_dir,
+        config_hash=str(task["config_key"]),
+        source_hash_value=_cached_source_hash(args, repo_root),
+        artifact_paths=[
+            "manifest.json",
+            "command.txt",
+            "failure_thresholds.csv",
+            "threshold_summary.json",
+        ],
+        extra={"array_index": int(task["array_index"])},
+        overwrite=args.overwrite,
+    )
+
+
+def _attack_analyze_stage(
+    args: argparse.Namespace,
+    task_dir: Path,
+    task: Mapping[str, Any],
+    repo_root: Path,
+) -> None:
+    from .assemble_failure_boundary import assemble_failure_boundary
+    from .evaluate_failure_boundary import (
+        binary_auprc,
+        binary_auroc,
+        calibration_bins,
+        cluster_bootstrap,
+        family_budget_metrics,
+        interval_censored_concordance,
+        mean_over_probe_seeds,
+        site_ranking_metrics,
+        threshold_spearman,
+    )
+
+    current_source = _cached_source_hash(args, repo_root)
+    frozen = _authenticated_frozen_attack_config(
+        args, task, current_source_hash=current_source
+    )
+    for stage in ("clean", "test_probe", "test"):
+        _verify_source_stage_grid(
+            args, task, repo_root, stage=stage, partition="test"
+        )
+    root = (
+        _phase_root(args)
+        / str(task["dataset"])
+        / f"R{int(task['R'])}"
+        / "test"
+    )
+    clean_rows = _completed_rows(
+        root / "clean", "clean_baseline.jsonl", expected_source_hash=current_source
+    )
+    probe_rows = _completed_rows(
+        root / "test_probe", "probe_runs.jsonl", expected_source_hash=current_source
+    )
+    attack_rows = _completed_rows(
+        root / "test", "attack_results.jsonl", expected_source_hash=current_source
+    )
+    bad_attack_rows = [
+        row
+        for row in attack_rows
+        if row.get("record_type") not in {
+            "sample",
+            "attack_target",
+            "shard_metadata",
+        }
+        or row.get("failure")
+    ]
+    if bad_attack_rows:
+        raise ContractError("held-out attack evidence contains failed/unsupported rows")
+    if _common_system_identity(
+        [*clean_rows, *probe_rows, *attack_rows],
+        where="held-out failure-boundary evidence",
+    ) != frozen.get("system_identity"):
+        raise ContractError(
+            "held-out evidence differs from the frozen system identity"
+        )
+    _validate_pgd_target_evidence(
+        attack_rows, where="held-out failure-boundary evidence"
+    )
+    assembly = assemble_failure_boundary(
+        clean_rows,
+        probe_rows,
+        attack_rows,
+        frozen_edges=[str(value) for value in frozen["edges"]],
+        frozen_budgets=[float(value) for value in frozen["attack_epsilons"]],
+        frozen_families=[str(value) for value in frozen["attack_families"]],
+        requested_K=int(frozen["probe"]["K"]),
+        selected_h=float(frozen["probe"]["h"]),
+        probe_seeds=[int(value) for value in frozen["probe"]["seeds"]],
+        probe_acceptance_thresholds=frozen["probe"]["acceptance_thresholds"],
+    )
+    frozen_probe_seeds = tuple(int(value) for value in frozen["probe"]["seeds"])
+    units = [dict(row) for row in assembly["prediction_units"]]
+    predictors = [dict(row) for row in assembly["edge_predictors"]]
+    probe_exclusions = [dict(row) for row in assembly["probe_exclusions"]]
+    seeds_by_edge: dict[tuple[str, str], set[int]] = {}
+    for predictor in predictors:
+        key = (
+            str(predictor["raw_sample_id"]),
+            str(predictor["edge_id"]),
+        )
+        seeds_by_edge.setdefault(key, set()).add(int(predictor["probe_seed"]))
+    complete_seed_set = set(frozen_probe_seeds)
+    seed_complete_edges = {
+        key for key, observed_seeds in seeds_by_edge.items()
+        if observed_seeds == complete_seed_set
+    }
+    for (raw_id, edge_id), observed_seeds in sorted(seeds_by_edge.items()):
+        if (raw_id, edge_id) in seed_complete_edges:
+            continue
+        probe_exclusions.append(
+            {
+                "raw_sample_id": raw_id,
+                "raw_id": raw_id,
+                "edge_id": edge_id,
+                "probe_seed": None,
+                "reason": "incomplete_across_frozen_probe_seeds",
+                "observed_probe_seeds": sorted(observed_seeds),
+                "required_probe_seeds": list(frozen_probe_seeds),
+            }
+        )
+    predictors = [
+        row
+        for row in predictors
+        if (str(row["raw_sample_id"]), str(row["edge_id"]))
+        in seed_complete_edges
+    ]
+    units = [
+        row
+        for row in units
+        if (str(row["raw_sample_id"]), str(row["edge_id"]))
+        in seed_complete_edges
+    ]
+    if not units or not predictors:
+        raise ContractError(
+            "held-out boundary assembly produced no probe-seed-complete "
+            "evaluation units"
+        )
+    maximum_budget = max(float(value) for value in frozen["attack_epsilons"])
+    finite_radii = [
+        float(row["edge_radius"])
+        for row in predictors
+        if math.isfinite(float(row["edge_radius"]))
+    ]
+    radius_sentinel = 2.0 * max([maximum_budget, *finite_radii])
+    finite_inverse_susceptibilities = [
+        1.0 / float(row["maximum_susceptibility"])
+        for row in predictors
+        if float(row["maximum_susceptibility"]) > 0.0
+    ]
+    susceptibility_sentinel = 2.0 * max(
+        [maximum_budget, *finite_inverse_susceptibilities]
+    )
+    for row in units:
+        radius = float(row["edge_radius"])
+        row["metric_edge_radius"] = (
+            radius if math.isfinite(radius) else radius_sentinel
+        )
+    for row in predictors:
+        radius = float(row["edge_radius"])
+        row["metric_edge_radius"] = (
+            radius if math.isfinite(radius) else radius_sentinel
+        )
+
+    _, threshold_paths = _authenticated_canonical_task_artifacts(
+        args,
+        task,
+        repo_root,
+        stage="thresholds",
+        filenames=("failure_thresholds.csv", "threshold_summary.json"),
+    )
+    threshold_rows = [
+        row
+        for row in _read_csv_rows(threshold_paths["failure_thresholds.csv"])
+        if row.get("curve_kind") == "edge_summary"
+    ]
+    predictors_by_edge: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for predictor in predictors:
+        key = (
+            str(predictor["raw_sample_id"]),
+            str(predictor["edge_id"]),
+        )
+        predictors_by_edge.setdefault(key, []).append(predictor)
+    for values in predictors_by_edge.values():
+        values.sort(key=lambda value: int(value["probe_seed"]))
+    threshold_eval: list[dict[str, Any]] = []
+    threshold_exclusions: list[dict[str, Any]] = []
+    all_thresholds: set[tuple[str, str, str]] = set()
+    evaluated_thresholds: set[tuple[str, str, str, int]] = set()
+    for row in threshold_rows:
+        raw_id = str(row["raw_sample_id"])
+        edge = str(row["edge_id"])
+        family = str(row["attack_family"])
+        key = (raw_id, edge, family)
+        if key in all_thresholds:
+            raise ContractError(f"duplicate edge threshold curve: {key}")
+        all_thresholds.add(key)
+        edge_predictors = predictors_by_edge.get((raw_id, edge), [])
+        if not edge_predictors:
+            # A complete held-out probe prefix can be present but rejected by
+            # the frozen cast-quality rule.  Its attacks and threshold remain
+            # authenticated, while the raw-edge unit is transparently excluded
+            # from prediction metrics.
+            continue
+        realized_available = str(
+            row.get("realized_interval_available", "")
+        ).strip().lower() in {"1", "true", "yes"}
+        if not realized_available:
+            threshold_exclusions.append(
+                {
+                    "raw_sample_id": raw_id,
+                    "edge_id": edge,
+                    "attack_family": family,
+                    "reason": "realized_threshold_interval_unavailable",
+                    "realized_grid_status": row.get("realized_grid_status"),
+                    "requested_interval_lower": row.get(
+                        "requested_interval_lower"
+                    ),
+                    "requested_interval_upper": row.get(
+                        "requested_interval_upper"
+                    ),
+                }
+            )
+
+        def optional_float(value: Any) -> float | None:
+            return None if value in (None, "") else float(value)
+
+        for predictor in edge_predictors:
+            probe_seed = int(predictor["probe_seed"])
+            evaluated_thresholds.add((*key, probe_seed))
+            susceptibility = float(predictor["maximum_susceptibility"])
+            common_threshold = {
+                **row,
+                "raw_id": raw_id,
+                "probe_seed": probe_seed,
+                "requested_threshold_lower": optional_float(
+                    row.get("requested_interval_lower")
+                ),
+                "requested_threshold_upper": optional_float(
+                    row.get("requested_interval_upper")
+                ),
+                "linkradius": float(predictor["metric_edge_radius"]),
+                "margin_only": float(predictor["minimum_clean_margin"]),
+                "susceptibility_only": (
+                    1.0 / susceptibility
+                    if susceptibility > 0.0
+                    else susceptibility_sentinel
+                ),
+            }
+            # Requested-grid metrics are a complete pre-registered sensitivity
+            # analysis.  Actual post-cast norms are the manuscript's primary
+            # coordinate and are included whenever the complete curve reports them.
+            threshold_eval.append(
+                {
+                    **common_threshold,
+                    "budget_coordinate": "requested_grid",
+                    "threshold_lower": optional_float(
+                        row.get("requested_interval_lower")
+                    ),
+                    "threshold_upper": optional_float(
+                        row.get("requested_interval_upper")
+                    ),
+                }
+            )
+            if realized_available:
+                threshold_eval.append(
+                    {
+                        **common_threshold,
+                        "budget_coordinate": "realized_postcast",
+                        "threshold_lower": optional_float(
+                            row.get("realized_interval_lower")
+                        ),
+                        "threshold_upper": optional_float(
+                            row.get("realized_interval_upper")
+                        ),
+                    }
+                )
+    expected_all_thresholds = {
+        (raw_id, edge, str(family))
+        for raw_id in assembly["eligible_raw_sample_ids"]
+        for edge in frozen["edges"]
+        for family in frozen["attack_families"]
+    }
+    if all_thresholds != expected_all_thresholds:
+        missing = sorted(expected_all_thresholds - all_thresholds)
+        extra = sorted(all_thresholds - expected_all_thresholds)
+        raise ContractError(
+            "held-out threshold cube is incomplete: "
+            f"missing={missing[:3]}, extra={extra[:3]}"
+        )
+    expected_evaluated_thresholds = {
+        (
+            str(predictor["raw_sample_id"]),
+            str(predictor["edge_id"]),
+            str(family),
+            int(predictor["probe_seed"]),
+        )
+        for predictor in predictors
+        for family in frozen["attack_families"]
+    }
+    if evaluated_thresholds != expected_evaluated_thresholds:
+        missing = sorted(expected_evaluated_thresholds - evaluated_thresholds)
+        extra = sorted(evaluated_thresholds - expected_evaluated_thresholds)
+        raise ContractError(
+            f"threshold/predictor join is incomplete: missing={missing[:3]}, extra={extra[:3]}"
+        )
+
+    flip_metrics: list[dict[str, Any]] = []
+    for probe_seed in frozen_probe_seeds:
+        seed_units = [
+            row for row in units if int(row["probe_seed"]) == probe_seed
+        ]
+        for metric in family_budget_metrics(
+            seed_units, radius_field="metric_edge_radius"
+        ):
+            flip_metrics.append({"probe_seed": probe_seed, **metric})
+    threshold_metrics: list[dict[str, Any]] = []
+    frozen_edge_set = {str(value) for value in frozen["edges"]}
+
+    def complete_site_rows(
+        rows: Sequence[Mapping[str, Any]],
+        *,
+        require_all_probe_seeds: bool = False,
+    ) -> list[Mapping[str, Any]]:
+        observed: dict[tuple[str, int], set[str]] = {}
+        for row in rows:
+            observed.setdefault(
+                (str(row["raw_id"]), int(row["probe_seed"])), set()
+            ).add(
+                str(row["edge_id"])
+            )
+        present_seeds = {seed for _, seed in observed}
+        required_seeds = (
+            set(frozen_probe_seeds)
+            if require_all_probe_seeds
+            else present_seeds
+        )
+        complete_ids = {
+            raw_id
+            for raw_id, _ in observed
+            if all(
+                observed.get((raw_id, seed)) == frozen_edge_set
+                for seed in required_seeds
+            )
+        }
+        return [row for row in rows if str(row["raw_id"]) in complete_ids]
+
+    for probe_seed in frozen_probe_seeds:
+        for budget_coordinate in ("realized_postcast", "requested_grid"):
+            for family in frozen["attack_families"]:
+                family_rows = [
+                    row
+                    for row in threshold_eval
+                    if int(row["probe_seed"]) == probe_seed
+                    and row["attack_family"] == family
+                    and row["budget_coordinate"] == budget_coordinate
+                ]
+                family_site_rows = complete_site_rows(family_rows)
+                for predictor_name in (
+                    "linkradius",
+                    "margin_only",
+                    "susceptibility_only",
+                ):
+                    concordance = interval_censored_concordance(
+                        family_rows,
+                        prediction_field=predictor_name,
+                    )
+                    correlation = threshold_spearman(
+                        family_rows,
+                        prediction_field=predictor_name,
+                    )
+                    ranking = site_ranking_metrics(
+                        family_site_rows,
+                        prediction_field=predictor_name,
+                    )
+                    threshold_metrics.extend(
+                        [
+                            {
+                                "probe_seed": probe_seed,
+                                "budget_coordinate": budget_coordinate,
+                                "attack_family": family,
+                                "predictor": predictor_name,
+                                "metric": "interval_censored_concordance",
+                                "n": concordance["n"],
+                                "support": concordance["comparable_pairs"],
+                                "value": concordance["concordance"],
+                            },
+                            {
+                                "probe_seed": probe_seed,
+                                "budget_coordinate": budget_coordinate,
+                                "attack_family": family,
+                                "predictor": predictor_name,
+                                "metric": "crossed_threshold_spearman",
+                                "n": correlation["n"],
+                                "support": correlation["n"],
+                                "value": correlation["spearman"],
+                            },
+                            {
+                                "probe_seed": probe_seed,
+                                "budget_coordinate": budget_coordinate,
+                                "attack_family": family,
+                                "predictor": predictor_name,
+                                "metric": "vulnerable_site_top1",
+                                "n": ranking["groups"],
+                                "support": ranking["top1_groups"],
+                                "value": ranking["top1_accuracy"],
+                            },
+                            {
+                                "probe_seed": probe_seed,
+                                "budget_coordinate": budget_coordinate,
+                                "attack_family": family,
+                                "predictor": predictor_name,
+                                "metric": "vulnerable_site_pair_concordance",
+                                "n": ranking["groups"],
+                                "support": ranking["comparable_site_pairs"],
+                                "value": ranking["site_kendall"],
+                            },
+                        ]
+                    )
+
+    calibration: list[dict[str, Any]] = []
+    for probe_seed in frozen_probe_seeds:
+        for family in frozen["attack_families"]:
+            family_units = [
+                row
+                for row in units
+                if int(row["probe_seed"]) == probe_seed
+                and row["attack_family"] == family
+            ]
+            calibration_scopes = [
+                ("overall", family_units),
+                *[
+                    (
+                        str(edge),
+                        [row for row in family_units if row["edge_id"] == edge],
+                    )
+                    for edge in frozen["edges"]
+                ],
+            ]
+            for edge_scope, scoped_units in calibration_scopes:
+                if not scoped_units:
+                    continue
+                raw_count = len({str(row["raw_id"]) for row in scoped_units})
+                for row in calibration_bins(
+                    scoped_units,
+                    score_field="linkradius_score",
+                    num_bins=min(10, max(1, raw_count)),
+                ):
+                    calibration.append(
+                        {
+                            "probe_seed": probe_seed,
+                            "attack_family": family,
+                            "edge_id": edge_scope,
+                            **row,
+                        }
+                    )
+
+    paired_intervals: list[dict[str, Any]] = []
+    for family in frozen["attack_families"]:
+        for budget in frozen["attack_epsilons"]:
+            stratum = [
+                row
+                for row in units
+                if row["attack_family"] == family
+                and float(row["requested_epsilon"]) == float(budget)
+            ]
+            labels = [bool(row["flipped"]) for row in stratum]
+            if not labels or all(labels) or not any(labels):
+                continue
+            for baseline in ("margin_score", "susceptibility_score"):
+                for metric_name, metric_fn in (
+                    ("auroc", binary_auroc),
+                    ("auprc", binary_auprc),
+                ):
+
+                    def paired_statistic(
+                        sampled: Sequence[Mapping[str, Any]],
+                        *,
+                        _baseline: str = baseline,
+                        _metric: Any = metric_fn,
+                    ) -> float:
+                        def seed_contrast(
+                            seed_rows: Sequence[Mapping[str, Any]],
+                        ) -> float:
+                            sampled_labels = [
+                                bool(row["flipped"]) for row in seed_rows
+                            ]
+                            return _metric(
+                                sampled_labels,
+                                [
+                                    float(row["linkradius_score"])
+                                    for row in seed_rows
+                                ],
+                            ) - _metric(
+                                sampled_labels,
+                                [float(row[_baseline]) for row in seed_rows],
+                            )
+
+                        return mean_over_probe_seeds(
+                            sampled,
+                            seed_contrast,
+                            expected_seeds=frozen_probe_seeds,
+                        )
+
+                    try:
+                        interval = cluster_bootstrap(
+                            stratum,
+                            paired_statistic,
+                            cluster_field="raw_id",
+                            repetitions=int(args.bootstrap_draws),
+                            seed=int(task["seed"]),
+                        )
+                    except ContractError:
+                        continue
+                    paired_intervals.append(
+                        {
+                            "probe_seed_aggregation": "equal_mean_over_frozen_seeds",
+                            "probe_seed_count": len(frozen_probe_seeds),
+                            "budget_coordinate": "realized_postcast",
+                            "attack_family": family,
+                            "requested_epsilon": float(budget),
+                            "metric": metric_name,
+                            "contrast": f"linkradius_minus_{baseline}",
+                            **interval,
+                        }
+                    )
+
+    threshold_statistics = (
+        (
+            "interval_censored_concordance",
+            lambda sampled, field: interval_censored_concordance(
+                sampled, prediction_field=field
+            )["concordance"],
+        ),
+        (
+            "crossed_threshold_spearman",
+            lambda sampled, field: threshold_spearman(
+                sampled, prediction_field=field
+            )["spearman"],
+        ),
+        (
+            "vulnerable_site_top1",
+            lambda sampled, field: site_ranking_metrics(
+                sampled, prediction_field=field
+            )["top1_accuracy"],
+        ),
+        (
+            "vulnerable_site_pair_concordance",
+            lambda sampled, field: site_ranking_metrics(
+                sampled, prediction_field=field
+            )["site_kendall"],
+        ),
+    )
+    for budget_coordinate in ("realized_postcast", "requested_grid"):
+        for family in frozen["attack_families"]:
+            stratum = [
+                row
+                for row in threshold_eval
+                if row["attack_family"] == family
+                and row["budget_coordinate"] == budget_coordinate
+            ]
+            for baseline in ("margin_only", "susceptibility_only"):
+                for metric_name, metric_fn in threshold_statistics:
+
+                    def paired_threshold_statistic(
+                        sampled: Sequence[Mapping[str, Any]],
+                        *,
+                        _baseline: str = baseline,
+                        _metric: Any = metric_fn,
+                    ) -> float:
+                        return mean_over_probe_seeds(
+                            sampled,
+                            lambda seed_rows: float(
+                                _metric(seed_rows, "linkradius")
+                            )
+                            - float(_metric(seed_rows, _baseline)),
+                            expected_seeds=frozen_probe_seeds,
+                        )
+
+                    try:
+                        bootstrap_stratum = (
+                            complete_site_rows(
+                                stratum, require_all_probe_seeds=True
+                            )
+                            if metric_name.startswith("vulnerable_site_")
+                            else stratum
+                        )
+                        interval = cluster_bootstrap(
+                            bootstrap_stratum,
+                            paired_threshold_statistic,
+                            cluster_field="raw_id",
+                            repetitions=int(args.bootstrap_draws),
+                            seed=int(task["seed"]),
+                        )
+                    except ContractError:
+                        continue
+                    paired_intervals.append(
+                        {
+                            "probe_seed_aggregation": "equal_mean_over_frozen_seeds",
+                            "probe_seed_count": len(frozen_probe_seeds),
+                            "budget_coordinate": budget_coordinate,
+                            "attack_family": family,
+                            "requested_epsilon": None,
+                            "metric": metric_name,
+                            "contrast": f"linkradius_minus_{baseline}",
+                            **interval,
+                        }
+                    )
+
+    _write_union_csv(
+        task_dir / "prediction_units.csv", units, overwrite=args.overwrite
+    )
+    _write_union_csv(
+        task_dir / "edge_predictors.csv", predictors, overwrite=args.overwrite
+    )
+    _write_union_csv(
+        task_dir / "probe_exclusions.csv",
+        probe_exclusions,
+        overwrite=args.overwrite,
+    )
+    _write_union_csv(
+        task_dir / "threshold_prediction_rows.csv",
+        threshold_eval,
+        overwrite=args.overwrite,
+    )
+    _write_union_csv(
+        task_dir / "threshold_exclusions.csv",
+        threshold_exclusions,
+        overwrite=args.overwrite,
+    )
+    _write_union_csv(
+        task_dir / "flip_prediction_metrics.csv",
+        flip_metrics,
+        overwrite=args.overwrite,
+    )
+    _write_union_csv(
+        task_dir / "threshold_prediction_metrics.csv",
+        threshold_metrics,
+        overwrite=args.overwrite,
+    )
+    _write_union_csv(
+        task_dir / "calibration_bins.csv", calibration, overwrite=args.overwrite
+    )
+    _write_union_csv(
+        task_dir / "paired_bootstrap_intervals.csv",
+        paired_intervals,
+        overwrite=args.overwrite,
+    )
+    # A final gate must distinguish "files were produced" from "the central
+    # RQ2 statistics are actually estimable".  Require the named metrics in
+    # the proposal, meaningful (albeit pilot-scale) support, and paired CIs
+    # against *both* components for every required metric.  The sign of those
+    # contrasts is deliberately not gated: a valid negative result must pass.
+    minimum_support = {
+        "evaluated_raw_examples": 10,
+        "flip_positive_raw_examples": 2,
+        "flip_negative_raw_examples": 2,
+        "interval_censored_concordance": 3,
+        "crossed_threshold_spearman": 3,
+        "vulnerable_site_top1": 3,
+        "vulnerable_site_pair_concordance": 3,
+    }
+
+    def finite_interval(row: Mapping[str, Any]) -> bool:
+        return all(
+            math.isfinite(float(row.get(field, float("nan"))))
+            for field in ("estimate", "ci_lower", "ci_upper")
+        )
+
+    required_baselines = ("margin", "susceptibility")
+    pgd_flip_candidates: list[dict[str, Any]] = []
+    for budget in (float(value) for value in frozen["attack_epsilons"]):
+        point_rows = [
+            row
+            for row in flip_metrics
+            if row.get("attack_family") == "pgd_autograd"
+            and row.get("predictor") == "linkradius"
+            and float(row.get("requested_epsilon")) == budget
+        ]
+        point_by_seed = {int(row["probe_seed"]): row for row in point_rows}
+        all_seed_point_metrics_finite = bool(
+            len(point_rows) == len(frozen_probe_seeds)
+            and set(point_by_seed) == set(frozen_probe_seeds)
+            and all(
+                math.isfinite(float(row.get("auroc", float("nan"))))
+                and math.isfinite(float(row.get("auprc", float("nan"))))
+                for row in point_by_seed.values()
+            )
+        )
+        if not all_seed_point_metrics_finite:
+            continue
+        budget_units = [
+            row
+            for row in units
+            if row.get("attack_family") == "pgd_autograd"
+            and float(row.get("requested_epsilon")) == budget
+        ]
+        per_seed_flip_support = {
+            seed: {
+                "raw_examples": len(
+                    {
+                        str(row["raw_id"])
+                        for row in budget_units
+                        if int(row["probe_seed"]) == seed
+                    }
+                ),
+                "positive_raw_examples": len(
+                    {
+                        str(row["raw_id"])
+                        for row in budget_units
+                        if int(row["probe_seed"]) == seed
+                        and bool(row["flipped"])
+                    }
+                ),
+                "negative_raw_examples": len(
+                    {
+                        str(row["raw_id"])
+                        for row in budget_units
+                        if int(row["probe_seed"]) == seed
+                        and not bool(row["flipped"])
+                    }
+                ),
+            }
+            for seed in frozen_probe_seeds
+        }
+        required_flip_cis = {
+            (metric, baseline): any(
+                row.get("budget_coordinate") == "realized_postcast"
+                and row.get("attack_family") == "pgd_autograd"
+                and row.get("metric") == metric
+                and row.get("requested_epsilon") not in (None, "")
+                and float(row.get("requested_epsilon")) == budget
+                and row.get("contrast")
+                == f"linkradius_minus_{baseline}_score"
+                and finite_interval(row)
+                for row in paired_intervals
+            )
+            for metric in ("auroc", "auprc")
+            for baseline in required_baselines
+        }
+        if (
+            all(
+                support["raw_examples"]
+                >= minimum_support["evaluated_raw_examples"]
+                and support["positive_raw_examples"]
+                >= minimum_support["flip_positive_raw_examples"]
+                and support["negative_raw_examples"]
+                >= minimum_support["flip_negative_raw_examples"]
+                for support in per_seed_flip_support.values()
+            )
+            and all_seed_point_metrics_finite
+            and all(required_flip_cis.values())
+        ):
+            pgd_flip_candidates.append(
+                {
+                    "requested_epsilon": budget,
+                    "per_seed_support": per_seed_flip_support,
+                    "finite_probe_seeds": sorted(point_by_seed),
+                    "paired_ci_coverage": {
+                        f"{metric}_vs_{baseline}": passed
+                        for (metric, baseline), passed in required_flip_cis.items()
+                    },
+                }
+            )
+
+    required_threshold_metrics = (
+        "interval_censored_concordance",
+        "crossed_threshold_spearman",
+        "vulnerable_site_top1",
+        "vulnerable_site_pair_concordance",
+    )
+    pgd_threshold_support: dict[str, dict[str, Any]] = {}
+    for metric in required_threshold_metrics:
+        matches = [
+            row
+            for row in threshold_metrics
+            if row.get("budget_coordinate") == "realized_postcast"
+            and row.get("attack_family") == "pgd_autograd"
+            and row.get("predictor") == "linkradius"
+            and row.get("metric") == metric
+        ]
+        matches_by_seed = {int(row["probe_seed"]): row for row in matches}
+        paired_coverage = {
+            baseline: any(
+                row.get("budget_coordinate") == "realized_postcast"
+                and row.get("attack_family") == "pgd_autograd"
+                and row.get("requested_epsilon") in (None, "")
+                and row.get("metric") == metric
+                and row.get("contrast") == f"linkradius_minus_{baseline}_only"
+                and finite_interval(row)
+                for row in paired_intervals
+            )
+            for baseline in required_baselines
+        }
+        per_seed = {
+            seed: {
+                "support": int(matches_by_seed.get(seed, {}).get("support", 0)),
+                "value": float(
+                    matches_by_seed.get(seed, {}).get("value", float("nan"))
+                ),
+            }
+            for seed in frozen_probe_seeds
+        }
+        all_seeds_present = (
+            len(matches) == len(frozen_probe_seeds)
+            and set(matches_by_seed) == set(frozen_probe_seeds)
+        )
+        minimum_observed_support = min(
+            (value["support"] for value in per_seed.values()),
+            default=0,
+        )
+        every_seed_finite = bool(
+            all_seeds_present
+            and all(math.isfinite(value["value"]) for value in per_seed.values())
+        )
+        pgd_threshold_support[metric] = {
+            "per_seed": per_seed,
+            "minimum_observed_support": minimum_observed_support,
+            "minimum_required": minimum_support[metric],
+            "all_frozen_seeds_present": all_seeds_present,
+            "every_seed_finite": every_seed_finite,
+            "paired_ci_coverage": paired_coverage,
+            "passed": bool(
+                every_seed_finite
+                and minimum_observed_support >= minimum_support[metric]
+                and all(paired_coverage.values())
+            ),
+        }
+
+    evaluated_raw_ids_by_seed = {
+        seed: {
+            str(row["raw_sample_id"])
+            for row in predictors
+            if int(row["probe_seed"]) == seed
+        }
+        for seed in frozen_probe_seeds
+    }
+    common_evaluated_raw_ids = set.intersection(
+        *(set(values) for values in evaluated_raw_ids_by_seed.values())
+    )
+    evaluated_raw_examples = len(common_evaluated_raw_ids)
+    scientific_support = {
+        "minimum_support": minimum_support,
+        "evaluated_raw_examples": evaluated_raw_examples,
+        "evaluated_raw_examples_per_seed": {
+            seed: len(values)
+            for seed, values in evaluated_raw_ids_by_seed.items()
+        },
+        "pgd_fully_supported_flip_budgets": pgd_flip_candidates,
+        "pgd_actual_threshold_metrics": pgd_threshold_support,
+    }
+    scientific_support["passed"] = bool(
+        evaluated_raw_examples >= minimum_support["evaluated_raw_examples"]
+        and pgd_flip_candidates
+        and all(
+            result["passed"] for result in pgd_threshold_support.values()
+        )
+    )
+    result = {
+        "schema_version": "linkradius.failure_boundary_analysis.v1",
+        "frozen_attack_config_hash": frozen["content_hash"],
+        "probe_seeds": list(frozen_probe_seeds),
+        "probe_seed_metric_strategy": "per_seed",
+        "probe_seed_bootstrap_strategy": (
+            "raw_id_cluster_bootstrap_of_equal_seed_mean"
+        ),
+        "eligible_raw_sample_count": len(assembly["eligible_raw_sample_ids"]),
+        "evaluated_raw_sample_count": evaluated_raw_examples,
+        "any_seed_evaluated_raw_sample_count": len(
+            assembly["evaluated_raw_sample_ids"]
+        ),
+        "excluded_raw_sample_count": len(assembly["excluded_raw_sample_ids"]),
+        "probe_exclusion_rows": len(probe_exclusions),
+        "prediction_units": len(units),
+        "edge_predictors": len(predictors),
+        "threshold_rows": len(threshold_eval),
+        "threshold_exclusion_rows": len(threshold_exclusions),
+        "flip_metric_rows": len(flip_metrics),
+        "threshold_metric_rows": len(threshold_metrics),
+        "paired_bootstrap_rows": len(paired_intervals),
+        "scientific_support": scientific_support,
+        "scientific_status": (
+            "estimable" if scientific_support["passed"] else "underpowered"
+        ),
+    }
+    atomic_write_json(
+        task_dir / "analysis_result.json", result, overwrite=args.overwrite
+    )
+    artifacts = [
+        "manifest.json",
+        "command.txt",
+        "analysis_result.json",
+        "prediction_units.csv",
+        "edge_predictors.csv",
+        "probe_exclusions.csv",
+        "threshold_prediction_rows.csv",
+        "threshold_exclusions.csv",
+        "flip_prediction_metrics.csv",
+        "threshold_prediction_metrics.csv",
+        "calibration_bins.csv",
+        "paired_bootstrap_intervals.csv",
+    ]
+    publish_completion(
+        task_dir,
+        config_hash=str(task["config_key"]),
+        source_hash_value=current_source,
+        artifact_paths=artifacts,
+        extra={"array_index": int(task["array_index"])},
+        overwrite=args.overwrite,
+    )
+
+
+def _attack_validate_stage(
+    args: argparse.Namespace,
+    task_dir: Path,
+    task: Mapping[str, Any],
+    repo_root: Path,
+) -> None:
+    current_source = _cached_source_hash(args, repo_root)
+    frozen = _authenticated_frozen_attack_config(
+        args, task, current_source_hash=current_source
+    )
+    grid_reports = [
+        _verify_source_stage_grid(
+            args, task, repo_root, stage=stage, partition="test"
+        )
+        for stage in ("clean", "test_probe", "test")
+    ]
+    _, execution, execution_hash = _authenticated_execution_manifest(
+        args, "test", task, repo_root
+    )
+    root = (
+        _phase_root(args)
+        / str(task["dataset"])
+        / f"R{int(task['R'])}"
+        / "test"
+    )
+    clean_rows = [
+        row
+        for row in _completed_rows(
+            root / "clean",
+            "clean_baseline.jsonl",
+            expected_source_hash=current_source,
+        )
+        if row.get("record_type") == "sample"
+    ]
+    coverage = _clean_execution_coverage(clean_rows, execution)
+    if not coverage["passed"]:
+        raise ContractError(f"held-out clean execution coverage failed: {coverage}")
+    if _common_system_identity(
+        clean_rows, where="held-out clean validation"
+    ) != frozen.get("system_identity"):
+        raise ContractError(
+            "held-out clean validation differs from the frozen system identity"
+        )
+    split, split_hash = _authenticated_split_manifest(args, task, repo_root)
+    partition_sets = {
+        name: {
+            str(value["raw_sample_id"] if isinstance(value, Mapping) else value)
+            for value in split["partitions"][name]
+        }
+        for name in ("attack_train", "validation", "test")
+    }
+    disjoint = not (
+        partition_sets["attack_train"] & partition_sets["validation"]
+        or partition_sets["attack_train"] & partition_sets["test"]
+        or partition_sets["validation"] & partition_sets["test"]
+    )
+    if not disjoint:
+        raise ContractError("split partitions overlap at final attack validation")
+    _, threshold_paths = _authenticated_canonical_task_artifacts(
+        args,
+        task,
+        repo_root,
+        stage="thresholds",
+        filenames=("failure_thresholds.csv", "threshold_summary.json"),
+    )
+    _, analysis_paths = _authenticated_canonical_task_artifacts(
+        args,
+        task,
+        repo_root,
+        stage="analyze",
+        filenames=(
+            "analysis_result.json",
+            "prediction_units.csv",
+            "edge_predictors.csv",
+            "probe_exclusions.csv",
+            "threshold_prediction_rows.csv",
+            "threshold_exclusions.csv",
+            "flip_prediction_metrics.csv",
+            "threshold_prediction_metrics.csv",
+            "calibration_bins.csv",
+            "paired_bootstrap_intervals.csv",
+        ),
+    )
+    threshold_summary = load_json(threshold_paths["threshold_summary.json"])
+    analysis_result = load_json(analysis_paths["analysis_result.json"])
+    artifacts_exist = all(
+        path.is_file() for path in (*threshold_paths.values(), *analysis_paths.values())
+    )
+    essential_analysis_names = (
+        "analysis_result.json",
+        "prediction_units.csv",
+        "edge_predictors.csv",
+        "threshold_prediction_rows.csv",
+        "flip_prediction_metrics.csv",
+        "threshold_prediction_metrics.csv",
+        "calibration_bins.csv",
+    )
+    essential_artifacts_nonempty = all(
+        analysis_paths[name].stat().st_size > 0
+        for name in essential_analysis_names
+    )
+    checks = [
+        {
+            "name": "frozen_attack_protocol_identity",
+            "passed": frozen.get("source_hash") == current_source
+            and frozen.get("split_manifest_hash") == split_hash
+            and frozen.get("test_execution_manifest_hash") == execution_hash,
+        },
+        {"name": "split_partitions_disjoint", "passed": disjoint},
+        coverage,
+        *[
+            {
+                "name": f"exact_grid:{report['stage']}",
+                **{key: value for key, value in report.items() if key != "stage"},
+            }
+            for report in grid_reports
+        ],
+        {
+            "name": "threshold_artifacts_complete",
+            "passed": int(threshold_summary.get("threshold_rows", 0)) > 0,
+            "threshold_rows": threshold_summary.get("threshold_rows", 0),
+        },
+        {
+            "name": "analysis_artifacts_complete",
+            "passed": artifacts_exist
+            and essential_artifacts_nonempty
+            and int(analysis_result.get("prediction_units", 0)) > 0
+            and int(analysis_result.get("edge_predictors", 0)) > 0
+            and int(analysis_result.get("flip_metric_rows", 0)) > 0
+            and int(analysis_result.get("threshold_metric_rows", 0)) > 0,
+            "prediction_units": analysis_result.get("prediction_units", 0),
+            "edge_predictors": analysis_result.get("edge_predictors", 0),
+        },
+        {
+            "name": "primary_failure_boundary_metrics_estimable",
+            "passed": analysis_result.get("scientific_status") == "estimable"
+            and isinstance(analysis_result.get("scientific_support"), Mapping)
+            and analysis_result["scientific_support"].get("passed") is True,
+            "scientific_status": analysis_result.get("scientific_status"),
+            "support": analysis_result.get("scientific_support"),
+        },
+    ]
+    attack_freeze_gate = require_passed_gate(
+        args.attack_freeze_gate, gate_type="attack_freeze_gate"
+    )
+    gate = make_gate(
+        gate_type="attack_validation_gate",
+        checks=checks,
+        config_hash=str(task["config_key"]),
+        source_hash=current_source,
+        prerequisite_hashes={
+            "attack_freeze_gate_hash": attack_freeze_gate["gate_content_hash"],
+            "frozen_attack_config_hash": frozen["content_hash"],
+            "split_manifest_hash": split_hash,
+            "test_execution_manifest_hash": execution_hash,
+        },
+    )
+    gate_path = Path(args.attack_validation_gate)
+    atomic_write_json(gate_path, gate, overwrite=args.overwrite)
+    if not gate["passed"]:
+        raise ContractError("held-out attack validation gate failed")
+    _record_global_pointer_completion(
+        args,
+        task_dir,
+        task,
+        repo_root,
+        pointer_name="attack_validation_result.json",
+        pointer={
+            "passed": True,
+            "attack_validation_gate": str(gate_path.resolve()),
+            "gate_content_hash": gate["gate_content_hash"],
+        },
+    )
+
+
 def execute_task(args: argparse.Namespace, task: Mapping[str, Any], task_dir: Path, repo_root: Path) -> None:
     stage = str(task["stage"])
     if stage == "split":
@@ -5268,6 +8231,16 @@ def execute_task(args: argparse.Namespace, task: Mapping[str, Any], task_dir: Pa
         _replay_stage(args, task_dir, task, repo_root)
     elif stage == "attack" and args.workflow == "smoke":
         _attack_stage(args, task_dir, task, repo_root)
+    elif stage in {"val", "test"} and args.workflow == "attacks":
+        _attack_stage(args, task_dir, task, repo_root)
+    elif stage == "freeze_attack" and args.workflow == "attacks":
+        _freeze_attack_stage(args, task_dir, task, repo_root)
+    elif stage == "thresholds" and args.workflow == "attacks":
+        _attack_threshold_stage(args, task_dir, task, repo_root)
+    elif stage == "analyze" and args.workflow == "attacks":
+        _attack_analyze_stage(args, task_dir, task, repo_root)
+    elif stage == "validate" and args.workflow == "attacks":
+        _attack_validate_stage(args, task_dir, task, repo_root)
     elif stage == "validate" and args.workflow == "engineering":
         _engineering_validate_stage(args, task_dir, task, repo_root)
     elif stage == "validate" and args.workflow == "smoke":
@@ -5286,10 +8259,10 @@ def execute_task(args: argparse.Namespace, task: Mapping[str, Any], task_dir: Pa
         _aggregate_verify_stage(args, task_dir, task, repo_root)
     elif stage in {"causal", "linkradius", "attacks", "metrics", "system_curves"} and args.workflow == "aggregate":
         _aggregate_cpu_stage(args, task_dir, task, repo_root)
-    elif args.workflow in {"attacks", "expansion"}:
+    elif args.workflow == "expansion":
         raise ContractError(
-            "unsupported_pending_gate: attack construction/validation and expansion model execution "
-            "are disabled in this implementation pass; no result was written"
+            "unsupported_pending_gate: expansion model execution is disabled; "
+            "no result was written"
         )
     else:
         raise ContractError(
@@ -5526,6 +8499,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     args.reuse_complete = bool(args.reuse_complete)
     args.retain_all_partition_rows = bool(args.retain_all_partition_rows)
     args.dataset_runtime = args.datasets.split()[0]
+    if args.workflow == "attacks":
+        attack_datasets = str(args.datasets).split()
+        attack_rounds = [int(value) for value in str(args.rounds).split()]
+        attack_seeds = [int(value) for value in str(args.seeds).split()]
+        if (
+            attack_datasets != ["gpqa"]
+            or attack_rounds != [2]
+            or len(attack_seeds) != 1
+        ):
+            raise ContractError(
+                "failure-boundary v1 requires exactly DATASETS=gpqa, "
+                "ROUNDS=2, and one seed"
+            )
+        if str(args.execution_manifest_path).strip():
+            raise ContractError(
+                "attacks workflow rejects the unqualified EXECUTION_MANIFEST "
+                "override; use the canonical per-partition manifests"
+            )
+        if int(args.batches_per_shard) != 1:
+            raise ContractError(
+                "failure-boundary v1 requires BATCHES_PER_SHARD=1"
+            )
     if args.workflow == "pilot" and "test" in args.partitions.split():
         raise ContractError("Phase-3 pilot stages categorically reject the test partition")
     rounds = [int(value) for value in args.rounds.split()]
@@ -5546,7 +8541,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.stage == "grid"
             else GRID_ALIAS[args.stage]
         )
-        if args.workflow == "attacks" and grid_stage in {"test_probe", "test"}:
+        if args.workflow == "attacks" and grid_stage in {
+            "clean",
+            "test_probe",
+            "test",
+        }:
             enforce_prerequisites(args, grid_stage)
         if args.grid_format == "count":
             print(len(tasks))
@@ -5571,7 +8570,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ContractError(f"repository root validation failed: {repo_root}")
     task_dir.mkdir(parents=True, exist_ok=True)
     if (task_dir / ".complete.json").exists():
-        if args.reuse_complete and compatible_complete(
+        if not args.overwrite and args.reuse_complete and compatible_complete(
             task_dir,
             expected_config_hash=task["config_key"],
             expected_source_hash=_cached_source_hash(args, repo_root),

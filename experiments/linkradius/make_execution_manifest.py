@@ -96,7 +96,12 @@ def build_execution_manifest(
         if not sample_id:
             raise ContractError(f"empty sample_id for raw ID {raw_id}")
         is_eligible = bool((row or {}).get("analysis_eligible", False))
-        dual_correct = None if row is None else bool(row.get("dual_correct", False))
+        dual_value = None if row is None else row.get("dual_correct")
+        # A post-freeze held-out cohort is allowed to be executable before its
+        # outcomes are observed.  ``null`` is materially different from
+        # ``false``: clean capture will later authenticate the cohort without
+        # pretending that correctness was known at freeze time.
+        dual_correct = None if dual_value is None else bool(dual_value)
         reason = str((row or {}).get("exclusion_reason", "")).strip()
         if row is None:
             reason = "not_screened"

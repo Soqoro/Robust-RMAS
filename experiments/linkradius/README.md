@@ -1,11 +1,11 @@
 # LinkRadius experiments
 
 This package implements the staged, auditable LinkRadius pipeline for the
-released `sequential_light` baseline: Qwen3-1.7B planner,
-Llama-3.2-1B critic, Qwen2.5-Math-1.5B solver, and learned `p2c`, `c2s`, and
-`s2p` outer adapters. The GPQA release settings are seed 42, batch size 16,
-latent length 32, source split `train`, deterministic generation, and
-`choice_old_prompt=2`.
+released `sequential_light` baseline and explicitly configured stronger-model
+follow-ups such as `sequential_scaled`. The GPQA release baseline uses seed 42,
+batch size 16, latent length 32, source split `train`, deterministic generation,
+and `choice_old_prompt=2`; every deviation is recorded in task identity and may
+not be mixed with the baseline.
 
 The reference relay is always the clean post-consumer-cast tensor, stored in
 float32. Live transport dtypes are preserved. Probe derivatives use realized
@@ -108,6 +108,11 @@ configuration. A probe task contains both signs for all nested directions, so
 the scheduler never splits an antithetic pair. Outputs are written beside a
 temporary file and atomically renamed. Reuse occurs only when `.complete.json`
 validates the config hash, source hash, artifact hashes, and row counts.
+`OVERWRITE=1` takes precedence over reuse and executes the task again. GPU-task
+identity also binds the Python executable and the installed inference-backend
+package versions. Frozen probe/attack protocols additionally bind the exact
+resolved model, adapter, scorer, and prompt identities, so changing conda
+environments or a mutable Hugging Face snapshot cannot silently mix results.
 
 ## Phase 1: engineering
 
@@ -224,9 +229,11 @@ batches, keeps their filler rows and boundaries, and marks 10--20 rows eligible
 
 ```bash
 LR_STAGE=split bash experiments/linkradius/run_linkradius_smoke.sh
-LR_STAGE=screen sbatch --array=0-1 experiments/linkradius/run_linkradius_smoke.sh
+SMOKE_SCREEN_MAX="$(GRID_TARGET_STAGE=screen LR_STAGE=grid bash experiments/linkradius/run_linkradius_smoke.sh | awk -F '\t' '$1=="max_array_index" {print $2}')"
+LR_STAGE=screen sbatch --array="0-${SMOKE_SCREEN_MAX}" experiments/linkradius/run_linkradius_smoke.sh
 LR_STAGE=freeze_execution bash experiments/linkradius/run_linkradius_smoke.sh
-LR_STAGE=clean sbatch --array=0-1 experiments/linkradius/run_linkradius_smoke.sh
+SMOKE_CLEAN_MAX="$(GRID_TARGET_STAGE=clean LR_STAGE=grid bash experiments/linkradius/run_linkradius_smoke.sh | awk -F '\t' '$1=="max_array_index" {print $2}')"
+LR_STAGE=clean sbatch --array="0-${SMOKE_CLEAN_MAX}" experiments/linkradius/run_linkradius_smoke.sh
 LR_STAGE=causal_grid bash experiments/linkradius/run_linkradius_smoke.sh
 SMOKE_CAUSAL_MAX="$(LR_STAGE=causal_grid bash experiments/linkradius/run_linkradius_smoke.sh | awk -F '\t' '$1=="max_array_index" {print $2}')"
 LR_STAGE=causal sbatch --array="0-${SMOKE_CAUSAL_MAX}" experiments/linkradius/run_linkradius_smoke.sh
@@ -243,6 +250,11 @@ LR_STAGE=estimate bash experiments/linkradius/run_linkradius_smoke.sh
 LR_STAGE=aggregate bash experiments/linkradius/run_linkradius_smoke.sh
 LR_STAGE=validate bash experiments/linkradius/run_linkradius_smoke.sh
 ```
+
+For the four-GPU scaled run with `BATCH_SIZE=1`, export
+`NUM_BATCHES=40 MAX_ELIGIBLE=16`; the screen and clean arrays are then `0-39`.
+Keep `%1` and request all four GPUs for each element. Do not let
+`MAX_ELIGIBLE=16` leak into Phase 3.
 
 The causal/probe smoke grid contains only `p2c@0,c2s@0,s2p@0`. Terminal
 `c2s@1` appears separately for autograd gradient/PGD reference jobs. Unsupported
@@ -286,11 +298,13 @@ LR_STAGE=split bash experiments/linkradius/run_linkradius_pilot.sh
 
 # Print, submit, and wait for each GPU array.
 LR_STAGE=screen_clean_grid bash experiments/linkradius/run_linkradius_pilot.sh
-LR_STAGE=screen_clean sbatch --array=0-7 experiments/linkradius/run_linkradius_pilot.sh
+PILOT_SCREEN_MAX="$(LR_STAGE=screen_clean_grid bash experiments/linkradius/run_linkradius_pilot.sh | awk -F '\t' '$1=="max_array_index" {print $2}')"
+LR_STAGE=screen_clean sbatch --array="0-${PILOT_SCREEN_MAX}" experiments/linkradius/run_linkradius_pilot.sh
 LR_STAGE=freeze_execution sbatch --array=0-1 experiments/linkradius/run_linkradius_pilot.sh
 
 LR_STAGE=clean_grid bash experiments/linkradius/run_linkradius_pilot.sh
-LR_STAGE=clean sbatch --array=0-7 experiments/linkradius/run_linkradius_pilot.sh
+PILOT_CLEAN_MAX="$(LR_STAGE=clean_grid bash experiments/linkradius/run_linkradius_pilot.sh | awk -F '\t' '$1=="max_array_index" {print $2}')"
+LR_STAGE=clean sbatch --array="0-${PILOT_CLEAN_MAX}" experiments/linkradius/run_linkradius_pilot.sh
 LR_STAGE=causal_grid bash experiments/linkradius/run_linkradius_pilot.sh
 PILOT_CAUSAL_MAX="$(LR_STAGE=causal_grid bash experiments/linkradius/run_linkradius_pilot.sh | awk -F '\t' '$1=="max_array_index" {print $2}')"
 LR_STAGE=causal sbatch --array="0-${PILOT_CAUSAL_MAX}" experiments/linkradius/run_linkradius_pilot.sh
@@ -307,10 +321,18 @@ LR_STAGE=validate_probe bash experiments/linkradius/run_linkradius_pilot.sh
 LR_STAGE=aggregate bash experiments/linkradius/run_linkradius_pilot.sh
 ```
 
+For `BATCH_SIZE=1`, first unset `NUM_BATCHES MAX_ELIGIBLE`, then export
+`PARTITIONS="attack_train validation"` and
+`BATCH_COUNTS="attack_train=79 validation=40"` for every Phase-3 command.
+The screen/clean grids then contain 119 tasks (`0-118`) and execution freeze
+contains two (`0-1`). Export at least three fixed direction seeds, for example
+`PROBE_SEEDS="101 202 303"`, before starting the fresh workflow; Phase 4 will
+reject a Phase-3 probe freeze with fewer than three seeds.
+
 Mechanical dependencies can use parsable job IDs:
 
 ```bash
-screen_job=$(LR_STAGE=screen_clean sbatch --parsable --array=0-7 \
+screen_job=$(LR_STAGE=screen_clean sbatch --parsable --array="0-${PILOT_SCREEN_MAX}" \
   experiments/linkradius/run_linkradius_pilot.sh)
 LR_STAGE=freeze_execution sbatch --dependency="afterok:${screen_job}" --array=0-1 \
   experiments/linkradius/run_linkradius_pilot.sh
@@ -326,11 +348,133 @@ tree.
 
 ## Phase 4, aggregation, and expansion
 
-`run_linkradius_attacks.sh` exposes all required grids and enforces
-`probe_gate.json`, `frozen_config.json`, and (for test stages)
-`attack_freeze_gate.json` plus the exact frozen-attack hash. Model-backed Phase-4
-construction remains deliberately `unsupported_pending_gate` in this pass; it
-does not emit empty/fabricated science.
+Phase 4 is the minimal held-out RQ2 experiment: does the validation-frozen
+LinkRadius predict the real per-example failure boundary? It evaluates the
+three early R2 edges (`p2c@0`, `c2s@0`, `s2p@0`) against per-example white-box
+PGD and a stable random direction drawn from a seed domain independent of the
+probe directions. Every attack task sweeps the complete frozen budget grid
+under one model load. PGD optimizes all three wrong labels and keeps the
+candidate with the smallest full pairwise margin. Random perturbations are fit
+to the post-consumer-cast budget, and primary analyses use the realized norm.
+
+The lifecycle is strictly ordered:
+
+```text
+split -> freeze_execution -> val -> freeze_attack -> clean -> test_probe
+      -> test -> thresholds -> analyze -> validate
+```
+
+`freeze_execution` fixes every raw test ID before observing an outcome. `val`
+uses only the already frozen validation trajectories. `freeze_attack` verifies
+the exact validation cube and requires the smallest and largest PGD budgets to
+straddle at least one boundary on the same raw-example/edge curve. It requires
+and freezes at least three Phase-3 probe seeds together with the attack/runtime
+settings, and refuses to run if any test clean/probe/attack artifact exists,
+including an unfinished job's manifest or pending log. Only then may any test
+outcome be opened. Fresh test dual-correctness is recomputed from primitive
+clean results; frozen grid cells without a fresh dual-correct row publish an
+authenticated exclusion completion without loading the models.
+
+For the four-GPU `sequential_scaled`, batch-size-one configuration, keep the
+same logical role map used in Phases 1--3 and submit one array element at a time:
+
+```bash
+unset GPU_LIST PARTITIONS BATCH_COUNTS EXECUTION_MANIFEST TRAJECTORY SCREENING_JSONL
+unset NUM_BATCHES MAX_ELIGIBLE
+mkdir -p logs
+SBATCH_GPU=(-p PA100q -w node02 --nodes=1 --ntasks=1 --gres=gpu:4)
+export ATTACK_FAMILIES="pgd_autograd random_independent"
+export ATTACK_EPSILONS="3e-4 1e-3 3e-3 1e-2 3e-2 1e-1"
+export PGD_STEPS=20
+export RANDOM_ATTACK_SEED_OFFSET=1000000
+
+OVERWRITE=1 LR_STAGE=split \
+  bash experiments/linkradius/run_linkradius_attacks.sh
+OVERWRITE=1 LR_STAGE=freeze_execution \
+  bash experiments/linkradius/run_linkradius_attacks.sh
+
+LR_STAGE=val_grid bash experiments/linkradius/run_linkradius_attacks.sh
+VAL_MAX="$(LR_STAGE=val_grid bash experiments/linkradius/run_linkradius_attacks.sh |
+  awk -F '\t' '$1=="max_array_index" {print $2}')"
+OVERWRITE=1 LR_STAGE=val \
+  sbatch "${SBATCH_GPU[@]}" --array="0-${VAL_MAX}%1" \
+    experiments/linkradius/run_linkradius_attacks.sh
+
+# Wait for and verify every validation task before freezing.
+OVERWRITE=1 LR_STAGE=freeze_attack \
+  bash experiments/linkradius/run_linkradius_attacks.sh
+
+# The launcher authenticates frozen_attack_config.json and hydrates its exact
+# one h, all frozen probe seeds, K, plus the attack grid for every post-freeze
+# command.
+
+LR_STAGE=clean_grid bash experiments/linkradius/run_linkradius_attacks.sh
+CLEAN_MAX="$(LR_STAGE=clean_grid bash experiments/linkradius/run_linkradius_attacks.sh |
+  awk -F '\t' '$1=="max_array_index" {print $2}')"
+OVERWRITE=1 LR_STAGE=clean \
+  sbatch "${SBATCH_GPU[@]}" --array="0-${CLEAN_MAX}%1" \
+    experiments/linkradius/run_linkradius_attacks.sh
+
+# Wait for and audit every clean completion before submitting test probes.
+LR_STAGE=test_probe_grid bash experiments/linkradius/run_linkradius_attacks.sh
+TEST_PROBE_MAX="$(LR_STAGE=test_probe_grid bash experiments/linkradius/run_linkradius_attacks.sh |
+  awk -F '\t' '$1=="max_array_index" {print $2}')"
+OVERWRITE=1 LR_STAGE=test_probe \
+  sbatch "${SBATCH_GPU[@]}" --array="0-${TEST_PROBE_MAX}%1" \
+    experiments/linkradius/run_linkradius_attacks.sh
+
+# Wait for and audit every test-probe completion before submitting attacks.
+LR_STAGE=test_grid bash experiments/linkradius/run_linkradius_attacks.sh
+TEST_MAX="$(LR_STAGE=test_grid bash experiments/linkradius/run_linkradius_attacks.sh |
+  awk -F '\t' '$1=="max_array_index" {print $2}')"
+OVERWRITE=1 LR_STAGE=test \
+  sbatch "${SBATCH_GPU[@]}" --array="0-${TEST_MAX}%1" \
+    experiments/linkradius/run_linkradius_attacks.sh
+
+# Wait for and audit every held-out attack completion before CPU analysis.
+
+OVERWRITE=1 LR_STAGE=thresholds bash experiments/linkradius/run_linkradius_attacks.sh
+OVERWRITE=1 LR_STAGE=analyze bash experiments/linkradius/run_linkradius_attacks.sh
+OVERWRITE=1 LR_STAGE=validate bash experiments/linkradius/run_linkradius_attacks.sh
+```
+
+Each wait comment is a mandatory synchronization point. Require the printed
+grid's exact completion set before moving on. With GPQA's 79 held-out rows and batch size 1, the expected upper
+bounds are usually 78 for clean, 710 for three-seed/one-radius test probes, and
+473 for two attack families; always trust the printed authenticated grid.
+
+Phase-4 analysis writes interval-censored thresholds, per-budget AUROC/AUPRC,
+crossed-threshold Spearman correlation, interval concordance, complete-edge
+within-example site ranking, overall and per-edge calibration bins, transparent
+probe/threshold exclusions, and paired raw-ID cluster-bootstrap contrasts against clean
+margin alone and susceptibility alone. Primary files are
+`failure_thresholds.csv`, `prediction_units.csv`, `edge_predictors.csv`,
+`probe_exclusions.csv`, `threshold_exclusions.csv`, `flip_prediction_metrics.csv`,
+`threshold_prediction_metrics.csv`, `calibration_bins.csv`, and
+`paired_bootstrap_intervals.csv` under their authenticated task directories.
+Actual post-cast norm is the primary threshold coordinate; the complete
+requested-grid threshold analysis is emitted as a labeled sensitivity check.
+Point metrics and calibration are reported separately for every frozen probe
+seed, on the raw/edge cohort with a complete accepted prefix for every frozen
+seed. Paired intervals resample raw examples as clusters and average the
+seed-specific contrast within each bootstrap replicate; probe-seed realizations
+are therefore never counted as independent examples.
+The final gate separately requires all three probe-seed realizations to have
+finite, minimally supported PGD AUROC/AUPRC, threshold Spearman, censored
+concordance, and site-ranking results, plus paired intervals against both
+component baselines for every required metric. If those are not estimable, the
+artifacts remain auditable but the run is labeled `underpowered` and the gate
+does not pass.
+
+GPQA provides only 79 raw held-out rows before fresh dual-correct filtering, so
+this configuration cannot guarantee the proposal's 64--128 clean-correct test
+target. Treat it as a minimal, potentially underpowered RQ2 pilot and report the
+eligible denominator, censoring, and exclusion counts; it is not by itself a
+definitive theorem test.
+
+This is deliberately the minimal RQ2 pilot, not the RQ3 transfer experiment:
+universal, DiffMean, and PCA banks remain future work and must not be inferred
+from the PGD/random-null result.
 
 `run_linkradius_expansion.sh` requires compatible passed `pilot_gate.json` and
 `attack_validation_gate.json`. Its R=2/R=4/all-round grids omit terminal `s2p`,

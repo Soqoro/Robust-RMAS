@@ -8,9 +8,45 @@ except ModuleNotFoundError:
 from RecursiveMAS.inference_utils.linkradius_runtime import (
     ForcedChoiceBatch,
     LinkRadiusRuntime,
+    PGDTargetResult,
     RelayEmission,
     RuntimeConfig,
+    _strongest_pgd_target_label,
 )
+
+
+class PGDSelectionTests(unittest.TestCase):
+    def test_selects_candidate_by_global_minimum_margin(self):
+        common = {
+            "initial_margin": 1.0,
+            "improved": True,
+            "requested_delta_norm": 1.0,
+            "realized_delta_norm": 1.0,
+            "budget": 1.0,
+            "budget_respected": True,
+            "adversarial_receiver": None,
+        }
+        # The B-targeted run has a worse B margin than the C-targeted run's C
+        # margin, but the C-targeted run inadvertently makes D much worse.  The
+        # edge-level objective must select the latter candidate.
+        targeted_b = PGDTargetResult(
+            target_label="B",
+            final_margin=-2.0,
+            scores=[0.0, 2.0, 1.0, 1.0],
+            **common,
+        )
+        targeted_c = PGDTargetResult(
+            target_label="C",
+            final_margin=-1.0,
+            scores=[0.0, 0.5, 1.0, 4.0],
+            **common,
+        )
+        self.assertEqual(
+            _strongest_pgd_target_label(
+                [targeted_b, targeted_c], gold_label="A"
+            ),
+            "C",
+        )
 
 
 @unittest.skipIf(torch is None, "PyTorch is not installed")

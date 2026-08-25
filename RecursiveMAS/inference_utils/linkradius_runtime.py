@@ -829,6 +829,23 @@ class PGDResult:
     sample_id: Optional[str] = None
 
 
+def _strongest_pgd_target_label(
+    target_results: Sequence[PGDTargetResult],
+    *,
+    gold_label: str,
+) -> Optional[str]:
+    """Select the candidate with the lowest margin over every wrong label."""
+
+    if not target_results:
+        return None
+    return min(
+        target_results,
+        key=lambda item: min(
+            choice_margins(item.scores, gold_label, CHOICE_LABELS).values()
+        ),
+    ).target_label
+
+
 @dataclass
 class AntitheticProbeResult:
     edge: Any
@@ -3519,7 +3536,9 @@ class LinkRadiusRuntime:
                     adversarial_receiver=adversarial.detach().float().cpu(),
                 )
             )
-        strongest = min(target_results, key=lambda item: item.final_margin).target_label if target_results else None
+        strongest = _strongest_pgd_target_label(
+            target_results, gold_label=gold
+        )
         return PGDResult(
             edge=parsed,
             epsilon=float(epsilon),

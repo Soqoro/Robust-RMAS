@@ -10,6 +10,8 @@ except ImportError:  # pragma: no cover - lightweight CPU Python
 
 from RecursiveMAS.inference_utils.linkradius import (
     PerturbationSubspace,
+    postcast_budget_fitted_delta,
+    realized_delta_diagnostics,
     sample_stable_lifted_direction,
     sample_stable_unit_direction,
 )
@@ -72,6 +74,28 @@ class ProbeDirectionTests(unittest.TestCase):
         lifted = sample_stable_lifted_direction(1, "x", "c2s@1", subspace, 2, 3)
         self.assertAlmostEqual(float(torch.linalg.vector_norm(lifted)), 1.0, places=6)
         self.assertTrue(torch.equal(-lifted, lifted * -1))
+
+    def test_directional_attack_is_fitted_to_postcast_budget(self) -> None:
+        reference = torch.linspace(-3.0, 3.0, 128, dtype=torch.float32).reshape(
+            8, 16
+        )
+        direction = torch.randn_like(reference)
+        budget = 3e-3
+        delta = postcast_budget_fitted_delta(
+            reference,
+            direction,
+            relative_budget=budget,
+            consumer_dtype="bfloat16",
+        )
+        diagnostics = realized_delta_diagnostics(
+            reference,
+            delta,
+            consumer_dtype="bfloat16",
+            lifted_unit_direction=direction,
+        )
+        self.assertFalse(diagnostics.collapsed)
+        self.assertGreater(diagnostics.realized_relative_norm, 0.0)
+        self.assertLessEqual(diagnostics.realized_relative_norm, budget + 1e-6)
 
 
 if __name__ == "__main__":

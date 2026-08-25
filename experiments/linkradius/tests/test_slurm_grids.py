@@ -206,6 +206,24 @@ class SlurmGridTests(unittest.TestCase):
         )
         self.assertNotEqual(pgd_2, pgd_7)
 
+    def test_gpu_task_key_binds_runtime_environment(self) -> None:
+        args = build_parser().parse_args(
+            ["--workflow", "engineering", "--stage", "clean"]
+        )
+        with mock.patch.object(
+            runner,
+            "_runtime_environment_identity",
+            return_value={"python_version": "3.10.0", "torch": "2.9.0"},
+        ):
+            first = build_grid(_build_grid_config(args))[0].config_key
+        with mock.patch.object(
+            runner,
+            "_runtime_environment_identity",
+            return_value={"python_version": "3.11.0", "torch": "2.9.0"},
+        ):
+            second = build_grid(_build_grid_config(args))[0].config_key
+        self.assertNotEqual(first, second)
+
     def test_prefreeze_grid_identity_ignores_later_execution_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             arguments = [
@@ -656,7 +674,7 @@ class SlurmGridTests(unittest.TestCase):
             ("run_linkradius_engineering.sh", "grid", 0, "total_tasks\t2"),
             ("run_linkradius_smoke.sh", "probe_grid", 0, "total_tasks\t12"),
             ("run_linkradius_pilot.sh", "probe_calibration_grid", 0, "total_tasks\t60"),
-            ("run_linkradius_attacks.sh", "train_grid", 0, "total_tasks\t20"),
+            ("run_linkradius_attacks.sh", "val_grid", 0, "total_tasks\t6"),
             ("run_linkradius_expansion.sh", "grid", 0, "total_tasks\t5"),
             ("run_linkradius_aggregate.sh", "invalid_stage", 2, "unsupported LR_STAGE"),
         )
