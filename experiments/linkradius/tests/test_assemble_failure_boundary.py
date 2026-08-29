@@ -21,20 +21,31 @@ PROVENANCE = {
 }
 
 
-def _clean(raw_id: str, *, dual_correct: bool = True) -> dict:
+def _clean(
+    raw_id: str,
+    *,
+    generated_correct: bool = True,
+    scorer_correct: bool = True,
+) -> dict:
     gold = "A"
     return {
         "record_type": "sample",
         "raw_sample_id": raw_id,
         "analysis_eligible": True,
         "gold": gold,
-        "strict_generated_choice": gold if dual_correct else "B",
+        "strict_generated_choice": gold if generated_correct else "B",
         "strict_generated_valid": True,
         "answer_invalid": False,
         "answer_conflict": False,
-        "scorer_prediction": gold,
+        "scorer_prediction": gold if scorer_correct else "B",
         "scorer_numerically_valid": True,
         "score_tie": False,
+        "option_scores": {
+            "A": 6.0 if scorer_correct else 1.0,
+            "B": 1.0 if scorer_correct else 6.0,
+            "C": 0.0,
+            "D": -1.0,
+        },
         "margins": {"B": 2.0, "C": 4.0, "D": 6.0},
         **PROVENANCE,
     }
@@ -129,6 +140,20 @@ class AssembleFailureBoundaryTests(unittest.TestCase):
         for row in result["prediction_units"]:
             self.assertEqual(row["clean_margin"], row["minimum_clean_margin"])
             self.assertEqual(row["susceptibility"], row["maximum_susceptibility"])
+            self.assertAlmostEqual(
+                row["linkradius_score"],
+                row["requested_epsilon"] / row["edge_radius"],
+            )
+            self.assertEqual(
+                row["linkradius_score"], row["linkradius_requested_score"]
+            )
+            self.assertAlmostEqual(
+                row["linkradius_realized_score"],
+                row["realized_epsilon"] / row["edge_radius"],
+            )
+            self.assertNotEqual(
+                row["linkradius_score"], row["linkradius_realized_score"]
+            )
 
     def test_attack_cube_rejects_missing_and_duplicate_coordinates(self) -> None:
         attacks = _attacks("raw-1")
@@ -150,19 +175,100 @@ class AssembleFailureBoundaryTests(unittest.TestCase):
                 with self.assertRaisesRegex(ContractError, "provenance mismatch"):
                     _assemble(_clean("raw-1"), pairs, _attacks("raw-1"))
 
-    def test_filters_clean_rows_that_are_not_freshly_dual_correct(self) -> None:
-        clean = [_clean("good"), _clean("bad", dual_correct=False)]
+    def test_generation_is_diagnostic_not_an_inclusion_requirement(self) -> None:
+        generation_wrong = _clean("generation-wrong", generated_correct=False)
+        generation_wrong.update(
+            {
+                "strict_generated_valid": False,
+                "answer_invalid": True,
+                "answer_conflict": True,
+            }
+        )
         result = _assemble(
-            clean,
-            _pairs("good") + _pairs("bad"),
-            _attacks("good") + _attacks("bad"),
+            generation_wrong,
+            _pairs("generation-wrong"),
+            _attacks("generation-wrong"),
+        )
+
+        self.assertEqual(result["eligible_raw_sample_ids"], ["generation-wrong"])
+        self.assertEqual(result["excluded_raw_sample_ids"], [])
+        self.assertEqual(
+            {row["raw_sample_id"] for row in result["prediction_units"]},
+            {"generation-wrong"},
+        )
+
+    def test_dual_correct_policy_excludes_generation_wrong_rows(self) -> None:
+        generation_wrong = _clean("generation-wrong", generated_correct=False)
+        good = _clean("good")
+        result = assemble_failure_boundary(
+            [generation_wrong, good],
+            [*_pairs("generation-wrong"), *_pairs("good")],
+            [*_attacks("generation-wrong"), *_attacks("good")],
+            frozen_edges=("p2c@0",),
+            frozen_budgets=(0.1, 0.2),
+            frozen_families=("pgd_autograd", "random_independent"),
+            requested_K=2,
+            selected_h=0.001,
+            probe_seeds=(101, 202, 303),
+            clean_correct_policy="dual_correct",
         )
 
         self.assertEqual(result["eligible_raw_sample_ids"], ["good"])
-        self.assertEqual(result["excluded_raw_sample_ids"], ["bad"])
+        self.assertEqual(
+            result["frozen_configuration"]["clean_correct_policy"],
+            "dual_correct",
+        )
+
+    def test_filters_rows_without_valid_unique_correct_forced_margins(self) -> None:
+        bad_rows = {
+            "analysis-ineligible": {"analysis_eligible": False},
+            "scorer-wrong": {"scorer_prediction": "B"},
+            "scorer-nonfinite": {"scorer_numerically_valid": False},
+            "score-tie": {"score_tie": True},
+            "margins-missing": {"margins": None},
+            "margin-zero": {"margins": {"B": 0.0, "C": 4.0, "D": 6.0}},
+            "margin-negative": {"margins": {"B": -0.1, "C": 4.0, "D": 6.0}},
+            "margin-nonfinite": {
+                "margins": {"B": float("inf"), "C": 4.0, "D": 6.0}
+            },
+        }
+        clean = [_clean("good")]
+        pairs = _pairs("good")
+        attacks = _attacks("good")
+        for raw_id, changes in bad_rows.items():
+            row = _clean(raw_id)
+            row.update(changes)
+            clean.append(row)
+            pairs.extend(_pairs(raw_id))
+            attacks.extend(_attacks(raw_id))
+
+        result = _assemble(clean, pairs, attacks)
+
+        self.assertEqual(result["eligible_raw_sample_ids"], ["good"])
+        self.assertEqual(
+            result["excluded_raw_sample_ids"], sorted(bad_rows)
+        )
         self.assertEqual(
             {row["raw_sample_id"] for row in result["prediction_units"]}, {"good"}
         )
+
+    def test_recomputes_forced_margin_status_when_cached_flags_are_missing(self) -> None:
+        row = _clean("derived")
+        row["scorer_numerically_valid"] = None
+        row["score_tie"] = None
+        result = _assemble(row, _pairs("derived"), _attacks("derived"))
+
+        self.assertEqual(result["eligible_raw_sample_ids"], ["derived"])
+
+    def test_requires_at_least_one_scorer_margin_clean_row(self) -> None:
+        with self.assertRaisesRegex(
+            ContractError, "no eligible forced_margin clean-correct examples"
+        ):
+            _assemble(
+                _clean("bad", scorer_correct=False),
+                _pairs("bad"),
+                _attacks("bad"),
+            )
 
     def test_zero_margin_is_a_failure_boundary_crossing(self) -> None:
         result = _assemble(_clean("raw-1"), _pairs("raw-1"), _attacks("raw-1"))
@@ -188,8 +294,33 @@ class AssembleFailureBoundaryTests(unittest.TestCase):
         self.assertEqual(result["counts"]["probe_exclusions"], 1)
         self.assertEqual(
             result["probe_exclusions"][0]["reason"],
-            "incomplete_accepted_primary_probe_prefix",
+            "insufficient_accepted_probe_directions",
         )
+
+    def test_empirical_minimum_k_eff_retains_a_reported_partial_estimate(self) -> None:
+        pairs = _pairs("raw-1")
+        pairs[1]["accepted"] = False
+        pairs[1]["central_differences"] = {"B": None, "C": None, "D": None}
+        result = assemble_failure_boundary(
+            [_clean("raw-1")],
+            pairs,
+            _attacks("raw-1"),
+            frozen_edges=("p2c@0",),
+            frozen_budgets=(0.1, 0.2),
+            frozen_families=("pgd_autograd", "random_independent"),
+            requested_K=2,
+            minimum_K_eff=1,
+            selected_h=0.001,
+            probe_seeds=(101, 202, 303),
+        )
+
+        self.assertEqual(result["counts"]["edge_predictors"], 3)
+        partial = [
+            row for row in result["edge_predictors"] if row["K_eff"] == 1
+        ]
+        self.assertEqual(len(partial), 1)
+        self.assertEqual(partial[0]["estimate_kind"], "accepted_direction_subset")
+        self.assertFalse(partial[0]["primary_available"])
 
     def test_requires_three_unique_frozen_probe_seeds(self) -> None:
         with self.assertRaisesRegex(ContractError, "at least three unique"):

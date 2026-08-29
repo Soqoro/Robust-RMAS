@@ -125,6 +125,35 @@ class ProvenanceTests(unittest.TestCase):
             checkpoint.write_text("changed editor copy", encoding="utf-8")
             self.assertEqual(source_hash(root), expected)
 
+    def test_source_hash_ignores_docs_and_slurm_placement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "RecursiveMAS" / "runtime.py"
+            shell = root / "experiments" / "linkradius" / "run.sh"
+            readme = root / "experiments" / "linkradius" / "README.md"
+            runtime.parent.mkdir(parents=True)
+            shell.parent.mkdir(parents=True)
+            runtime.write_text("runtime", encoding="utf-8")
+            shell.write_text(
+                "#!/bin/bash\n#SBATCH -p queue_a\n#SBATCH -w node01\nrun --x 1\n",
+                encoding="utf-8",
+            )
+            readme.write_text("first draft", encoding="utf-8")
+            expected = source_hash(root)
+
+            shell.write_text(
+                "#!/bin/bash\n#SBATCH -p queue_b\n#SBATCH -w node99\nrun --x 1\n",
+                encoding="utf-8",
+            )
+            readme.write_text("rewritten documentation", encoding="utf-8")
+            self.assertEqual(source_hash(root), expected)
+
+            shell.write_text(
+                "#!/bin/bash\n#SBATCH -p queue_b\n#SBATCH -w node99\nrun --x 2\n",
+                encoding="utf-8",
+            )
+            self.assertNotEqual(source_hash(root), expected)
+
 
 if __name__ == "__main__":
     unittest.main()

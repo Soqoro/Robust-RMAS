@@ -119,9 +119,13 @@ class ScreeningNonfiniteTests(unittest.TestCase):
         canonical_json_bytes(rows)
 
         annotated, summary = annotate_screening_rows(rows)
+        self.assertFalse(annotated[0]["forced_margin_correct"])
         self.assertFalse(annotated[0]["dual_correct"])
+        self.assertFalse(annotated[0]["clean_correct"])
         self.assertFalse(annotated[0]["analysis_eligible"])
         self.assertEqual(annotated[0]["exclusion_reason"], "scorer_nonfinite")
+        self.assertEqual(summary["clean_correct_policy"], "forced_margin")
+        self.assertEqual(summary["forced_margin_correct_count"], 0)
         self.assertEqual(summary["exclusion_counts"], {"scorer_nonfinite": 1})
 
     def test_authenticated_clean_capture_still_rejects_nonfinite_scores(self):

@@ -144,7 +144,13 @@ def json_content_hash(path: str | os.PathLike[str], *, domain: str = "linkradius
 
 
 def source_hash(repo_root: str | os.PathLike[str]) -> str:
-    """Hash all result-affecting LinkRadius and RecursiveMAS source files."""
+    """Hash result-affecting LinkRadius and RecursiveMAS source files.
+
+    Documentation and Slurm placement directives are deliberately excluded:
+    changing prose, queue, node, log path, or GPU reservation does not change
+    the computation. Runtime topology and software identities are recorded in
+    manifests separately.
+    """
 
     root = Path(repo_root).resolve()
     candidates: list[Path] = []
@@ -160,7 +166,7 @@ def source_hash(repo_root: str | os.PathLike[str]) -> str:
                 or any(part.startswith(".") for part in relative_path.parts)
             ):
                 continue
-            if path.suffix not in {".py", ".sh", ".json", ".txt", ".md"}:
+            if path.suffix not in {".py", ".sh", ".json", ".txt"}:
                 continue
             candidates.append(path)
     digest = hashlib.sha256(b"linkradius:source_tree:v1\0")
@@ -169,6 +175,12 @@ def source_hash(repo_root: str | os.PathLike[str]) -> str:
         digest.update(len(relative).to_bytes(8, "big"))
         digest.update(relative)
         data = path.read_bytes()
+        if path.suffix == ".sh":
+            data = b"".join(
+                line
+                for line in data.splitlines(keepends=True)
+                if not line.lstrip().startswith(b"#SBATCH")
+            )
         digest.update(len(data).to_bytes(8, "big"))
         digest.update(data)
     return digest.hexdigest()

@@ -15,7 +15,7 @@ from experiments.linkradius.run_linkradius import _build_grid_config, build_pars
 from experiments.linkradius.io_utils import atomic_write_json
 from experiments.linkradius.make_execution_manifest import build_execution_manifest
 from experiments.linkradius.make_split_manifest import build_split_manifest
-from experiments.linkradius.schemas import ContractError
+from experiments.linkradius.schemas import EARLY_R2_EDGES, ContractError
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -43,6 +43,152 @@ class SlurmGridTests(unittest.TestCase):
         tasks = build_grid(GridConfig(workflow="smoke", stage="probe", num_batches=1))
         self.assertEqual({task.edge_id for task in tasks}, {"p2c@0", "c2s@0", "s2p@0"})
         self.assertNotIn("s2p@1", {task.edge_id for task in tasks})
+
+    def test_empirical_pilot_gpu_stages_only_use_three_early_r2_edges(self) -> None:
+        cases = (
+            GridConfig(
+                workflow="pilot",
+                stage="causal",
+                partitions=("validation",),
+                num_batches=1,
+                interventions=("identity", "mismatch", "zero"),
+            ),
+            GridConfig(
+                workflow="pilot",
+                stage="probe_calibration",
+                partitions=("validation",),
+                num_batches=1,
+                probe_radii=(1e-3,),
+                probe_seeds=(101,),
+            ),
+            GridConfig(
+                workflow="pilot",
+                stage="gradient",
+                partitions=("validation",),
+                num_batches=1,
+                gradient_reference_batches=1,
+            ),
+        )
+        for config in cases:
+            with self.subTest(stage=config.stage):
+                tasks = build_grid(config)
+                self.assertTrue(tasks)
+                self.assertEqual(
+                    {task.edge_id for task in tasks}, set(EARLY_R2_EDGES)
+                )
+                self.assertTrue(all(task.R == 2 for task in tasks))
+
+        with self.assertRaisesRegex(ContractError, "frozen at R=2"):
+            build_grid(
+                GridConfig(
+                    workflow="pilot",
+                    stage="causal",
+                    rounds=(4,),
+                    partitions=("validation",),
+                    num_batches=1,
+                )
+            )
+
+    def test_pilot_gradient_reference_is_validation_only_deterministic_prefix(self) -> None:
+        config = GridConfig(
+            workflow="pilot",
+            stage="gradient",
+            partitions=("attack_train", "validation"),
+            batch_counts={"attack_train": 5, "validation": 4},
+            gradient_reference_batches=2,
+        )
+        first = build_grid(config)
+        second = build_grid(config)
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 2 * len(EARLY_R2_EDGES))
+        self.assertEqual({task.partition for task in first}, {"validation"})
+        self.assertEqual(
+            [(task.execution_batch_id, task.edge_id) for task in first],
+            [
+                (batch_id, edge_id)
+                for batch_id in (0, 1)
+                for edge_id in EARLY_R2_EDGES
+            ],
+        )
+
+        split = build_split_manifest(
+            [
+                {"raw_sample_id": f"eligible-prefix-{index}", "raw_index": index}
+                for index in range(30)
+            ]
+        )
+        validation_ids = [
+            row["raw_sample_id"] for row in split["partitions"]["validation"]
+        ]
+        screening = [
+            {
+                "raw_sample_id": raw_id,
+                "sample_id": raw_id,
+                "analysis_eligible": index in {1, 3, 5},
+                "clean_correct_policy": "forced_margin",
+                "clean_correct": index in {1, 3, 5},
+                "forced_margin_correct": index in {1, 3, 5},
+                "exclusion_reason": "" if index in {1, 3, 5} else "not_selected",
+            }
+            for index, raw_id in enumerate(validation_ids)
+        ]
+        manifest = build_execution_manifest(
+            split_manifest=split,
+            partition="validation",
+            screening_rows=screening,
+            batch_size=1,
+            screening_config_hash="a" * 64,
+            clean_correct_policy="forced_margin",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = Path(directory) / "execution_manifest.json"
+            atomic_write_json(manifest_path, manifest)
+            eligible_prefix = build_grid(
+                GridConfig(
+                    workflow="pilot",
+                    stage="gradient",
+                    partitions=("attack_train", "validation"),
+                    execution_manifests={"validation": str(manifest_path)},
+                    gradient_reference_batches=2,
+                )
+            )
+        self.assertEqual(
+            sorted({task.execution_batch_id for task in eligible_prefix}), [1, 3]
+        )
+        self.assertEqual(len(eligible_prefix), 2 * len(EARLY_R2_EDGES))
+
+        disabled = build_grid(
+            GridConfig(
+                workflow="pilot",
+                stage="gradient",
+                partitions=("validation",),
+                num_batches=4,
+                gradient_reference_batches=0,
+            )
+        )
+        self.assertEqual(disabled, ())
+
+        with self.assertRaisesRegex(ContractError, "requires the validation partition"):
+            build_grid(
+                GridConfig(
+                    workflow="pilot",
+                    stage="gradient",
+                    partitions=("attack_train",),
+                    num_batches=4,
+                    gradient_reference_batches=2,
+                )
+            )
+        with self.assertRaisesRegex(ContractError, "must be non-negative"):
+            build_grid(
+                GridConfig(
+                    workflow="pilot",
+                    stage="gradient",
+                    partitions=("validation",),
+                    num_batches=4,
+                    gradient_reference_batches=-1,
+                )
+            )
 
     def test_clean_capture_rejects_missing_execution_manifest_before_loading_data(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -669,11 +815,88 @@ class SlurmGridTests(unittest.TestCase):
         self.assertIn("total_tasks\t12", completed.stdout)
         self.assertNotIn("s2p@1", completed.stdout)
 
+    def test_empirical_launchers_pass_feasible_default_protocol(self) -> None:
+        launcher_expectations = {
+            "run_linkradius_pilot.sh": {
+                "--gradient-reference-batches": "2",
+                "--partitions": "validation",
+                "--batch-count": "validation=40",
+            },
+            "run_linkradius_attacks.sh": {
+                "--gradient-reference-batches": "0",
+            },
+        }
+        shared_expectations = {
+            "--K": "8",
+            "--interventions": "identity mismatch zero",
+            "--clean-stability-policy": "empirical",
+            "--clean-correct-policy": "forced_margin",
+            "--validation-tier": "empirical",
+            "--include-generation": "0",
+        }
+        default_variables = (
+            "K",
+            "GRADIENT_REFERENCE_BATCHES",
+            "INTERVENTIONS",
+            "CLEAN_STABILITY_POLICY",
+            "CLEAN_CORRECT_POLICY",
+            "VALIDATION_TIER",
+            "INCLUDE_GENERATION",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_root = Path(directory)
+            fake_python = temporary_root / "print-arguments"
+            fake_python.write_text(
+                '#!/bin/sh\nprintf "%s\\n" "$@"\n', encoding="utf-8"
+            )
+            fake_python.chmod(0o755)
+
+            for name, specific_expectations in launcher_expectations.items():
+                with self.subTest(launcher=name):
+                    env = dict(os.environ)
+                    for variable in default_variables:
+                        env.pop(variable, None)
+                    env.pop("SLURM_JOB_ID", None)
+                    env.update(
+                        {
+                            "PYTHON_BIN": str(fake_python),
+                            "LR_STAGE": "grid",
+                            "OUT_ROOT": str(temporary_root / name),
+                        }
+                    )
+                    completed = subprocess.run(
+                        [
+                            "bash",
+                            str(
+                                REPO_ROOT
+                                / "experiments"
+                                / "linkradius"
+                                / name
+                            ),
+                        ],
+                        cwd=REPO_ROOT,
+                        env=env,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(
+                        completed.returncode, 0, completed.stdout + completed.stderr
+                    )
+                    arguments = completed.stdout.splitlines()
+                    for flag, expected in {
+                        **shared_expectations,
+                        **specific_expectations,
+                    }.items():
+                        position = arguments.index(flag)
+                        self.assertEqual(arguments[position + 1], expected)
+
     def test_slurm_spool_copies_resolve_common_from_submit_directory(self) -> None:
         cases = (
             ("run_linkradius_engineering.sh", "grid", 0, "total_tasks\t2"),
             ("run_linkradius_smoke.sh", "probe_grid", 0, "total_tasks\t12"),
-            ("run_linkradius_pilot.sh", "probe_calibration_grid", 0, "total_tasks\t60"),
+            ("run_linkradius_pilot.sh", "probe_calibration_grid", 0, "total_tasks\t18"),
             ("run_linkradius_attacks.sh", "val_grid", 0, "total_tasks\t6"),
             ("run_linkradius_expansion.sh", "grid", 0, "total_tasks\t5"),
             ("run_linkradius_aggregate.sh", "invalid_stage", 2, "unsupported LR_STAGE"),

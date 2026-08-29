@@ -10,7 +10,31 @@ from typing import Any, Mapping, Sequence
 
 from .io_utils import atomic_write_json, content_hash, load_json, load_jsonl, ordered_hash
 from .make_split_manifest import verify_split_manifest
-from .schemas import EXECUTION_MANIFEST_VERSION, ContractError, validate_execution_manifest
+from .schemas import (
+    CLEAN_CORRECT_POLICIES,
+    DEFAULT_CLEAN_CORRECT_POLICY,
+    EXECUTION_MANIFEST_VERSION,
+    ContractError,
+    validate_execution_manifest,
+)
+
+
+def _choice(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().upper()
+    return normalized if normalized in {"A", "B", "C", "D"} else None
+
+
+def _optional_bool(
+    row: Mapping[str, Any] | None, field: str
+) -> bool | None:
+    if row is None or field not in row or row[field] is None:
+        return None
+    value = row[field]
+    if not isinstance(value, bool):
+        raise ContractError(f"screening {field} must be a boolean or null")
+    return value
 
 
 def execution_manifest_hash(manifest: Mapping[str, Any]) -> str:
@@ -58,8 +82,14 @@ def build_execution_manifest(
     screening_config_hash: str,
     screening_run_hash: str = "",
     retain_all_partition_rows: bool = True,
+    clean_correct_policy: str = DEFAULT_CLEAN_CORRECT_POLICY,
 ) -> dict[str, Any]:
     split_hash = verify_split_manifest(split_manifest)
+    if clean_correct_policy not in CLEAN_CORRECT_POLICIES:
+        raise ContractError(
+            "clean_correct_policy must be one of "
+            f"{CLEAN_CORRECT_POLICIES!r}, got: {clean_correct_policy!r}"
+        )
     if batch_size <= 0 or batches_per_shard <= 0:
         raise ContractError("batch_size and batches_per_shard must be positive")
     partition_rows = _partition_rows(split_manifest, partition)
@@ -85,7 +115,11 @@ def build_execution_manifest(
 
     ordered_sample_ids: list[str] = []
     eligibility: list[bool] = []
+    clean_correct_values: list[bool | None] = []
+    forced_margin_correct_values: list[bool | None] = []
     dual_correct_values: list[bool | None] = []
+    generated_choices: list[str | None] = []
+    scorer_predictions: list[str | None] = []
     reasons: list[str] = []
     raw_indices: list[int | None] = []
     partition_by_id = {str(row["raw_sample_id"]): row for row in partition_rows}
@@ -96,22 +130,56 @@ def build_execution_manifest(
         if not sample_id:
             raise ContractError(f"empty sample_id for raw ID {raw_id}")
         is_eligible = bool((row or {}).get("analysis_eligible", False))
-        dual_value = None if row is None else row.get("dual_correct")
+        declared_policy = None if row is None else row.get("clean_correct_policy")
+        if declared_policy is not None and declared_policy != clean_correct_policy:
+            raise ContractError(
+                f"screening row {raw_id} uses clean-correct policy "
+                f"{declared_policy!r}, expected {clean_correct_policy!r}"
+            )
+        dual_correct = _optional_bool(row, "dual_correct")
+        forced_margin_correct = _optional_bool(row, "forced_margin_correct")
+        clean_correct = _optional_bool(row, "clean_correct")
         # A post-freeze held-out cohort is allowed to be executable before its
         # outcomes are observed.  ``null`` is materially different from
         # ``false``: clean capture will later authenticate the cohort without
         # pretending that correctness was known at freeze time.
-        dual_correct = None if dual_value is None else bool(dual_value)
+        if clean_correct is None:
+            if clean_correct_policy == "dual_correct":
+                clean_correct = dual_correct
+            elif forced_margin_correct is not None:
+                clean_correct = forced_margin_correct
+            elif dual_correct is not None:
+                # Backward compatibility for callers passing a pre-policy,
+                # already-annotated screening row.  New screening artifacts
+                # always carry explicit forced-margin and selected statuses.
+                clean_correct = is_eligible
+        if forced_margin_correct is None and clean_correct_policy == "forced_margin":
+            forced_margin_correct = clean_correct
         reason = str((row or {}).get("exclusion_reason", "")).strip()
         if row is None:
             reason = "not_screened"
         elif not is_eligible and not reason:
-            reason = "not_dual_correct"
+            reason = "not_clean_correct"
         if is_eligible:
             reason = ""
         ordered_sample_ids.append(sample_id)
         eligibility.append(is_eligible)
+        clean_correct_values.append(clean_correct)
+        forced_margin_correct_values.append(forced_margin_correct)
         dual_correct_values.append(dual_correct)
+        generated_choices.append(
+            _choice(
+                None
+                if row is None
+                else row.get(
+                    "strict_generated_choice",
+                    row.get("generated_choice_strict"),
+                )
+            )
+        )
+        scorer_predictions.append(
+            _choice(None if row is None else row.get("scorer_prediction"))
+        )
         reasons.append(reason)
         raw_index = (row or {}).get("raw_index", partition_row.get("raw_index"))
         raw_indices.append(None if raw_index is None else int(raw_index))
@@ -129,7 +197,12 @@ def build_execution_manifest(
         "padding_policy": padding_policy,
         "array_shards": _array_shards(len(boundaries), int(batches_per_shard)),
         "analysis_eligible": eligibility,
+        "clean_correct_policy": clean_correct_policy,
+        "screening_clean_correct": clean_correct_values,
+        "screening_forced_margin_correct": forced_margin_correct_values,
         "screening_dual_correct": dual_correct_values,
+        "screening_generated_choices": generated_choices,
+        "screening_scorer_predictions": scorer_predictions,
         "exclusion_reasons": reasons,
         "screening_config_hash": screening_config_hash,
         "screening_run_hash": screening_run_hash,
@@ -185,6 +258,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--batches-per-shard", type=int, default=1)
     parser.add_argument("--screening-config-hash", required=True)
     parser.add_argument("--screening-run-hash", default="")
+    parser.add_argument(
+        "--clean-correct-policy",
+        choices=CLEAN_CORRECT_POLICIES,
+        default=DEFAULT_CLEAN_CORRECT_POLICY,
+    )
     parser.add_argument("--selected-only", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
@@ -198,6 +276,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         screening_config_hash=args.screening_config_hash,
         screening_run_hash=args.screening_run_hash,
         retain_all_partition_rows=not args.selected_only,
+        clean_correct_policy=args.clean_correct_policy,
     )
     output = Path(args.output)
     if output.exists() and not args.overwrite:

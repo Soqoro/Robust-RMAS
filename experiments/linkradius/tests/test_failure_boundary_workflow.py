@@ -204,6 +204,12 @@ class FailureBoundaryExecutionFreezeTests(unittest.TestCase):
         ])
         self.assertEqual(manifest["analysis_eligible"], [True] * len(test_rows))
         self.assertEqual(manifest["screening_dual_correct"], [None] * len(test_rows))
+        self.assertEqual(
+            manifest["screening_generated_choices"], [None] * len(test_rows)
+        )
+        self.assertEqual(
+            manifest["screening_scorer_predictions"], [None] * len(test_rows)
+        )
         self.assertEqual(manifest["retained_filler_rows"], 0)
 
     def test_heldout_freeze_rejects_any_completed_test_outcome_first(self) -> None:

@@ -10,12 +10,91 @@ not be mixed with the baseline.
 The reference relay is always the clean post-consumer-cast tensor, stored in
 float32. Live transport dtypes are preserved. Probe derivatives use realized
 signed separation after the consumer cast, and the primary K-direction
-estimate exists only when every direction in `0..K-1` passes the frozen pair
-checks. All learned banks use `attack_train`; probe/scorer/edge choices use
+estimate uses every accepted direction in `0..K-1`. Certification requires all
+K; the empirical tier freezes a minimum `K_eff` before test access (6 of 8 at
+the recommended settings) and reports every rejection and retained `K_eff`.
+All learned banks use `attack_train`; probe/scorer/edge choices use
 `validation`; Phase 3 refuses test outcomes.
 
 The exact sequential edge set is `p2c@r,c2s@r` for `0 <= r < R` plus `s2p@r`
 for `0 <= r < R-1`. Thus R=2 has exactly five edges and never `s2p@1`.
+
+## Empirical core for the paper
+
+The paper's load-bearing experiment is a held-out prediction test, not a
+bitwise-equivalence or certification claim:
+
+> Does a LinkRadius estimate frozen on validation data predict the first
+> empirical failure boundary of a clean-correct example/site better than clean
+> margin or susceptibility alone?
+
+Use `CLEAN_CORRECT_POLICY=forced_margin` for this experiment. A row is in the
+primary cohort when the forced-choice scorer is finite and every gold-versus-
+wrong option margin is strictly positive. Free-text generation is a secondary
+diagnostic; it must not decide cohort membership. `dual_correct` remains
+available for the stricter release-engineering workflow and as a sensitivity
+analysis, but it is not the proposal's primary endpoint.
+
+The recommended empirical-core settings are:
+
+```bash
+export VALIDATION_TIER=empirical
+export CLEAN_CORRECT_POLICY=forced_margin
+export CLEAN_STABILITY_POLICY=empirical
+export INCLUDE_GENERATION=0
+export ROUNDS=2
+export K=8
+export GRADIENT_REFERENCE_BATCHES=2
+export INTERVENTIONS="identity mismatch zero"
+export PROBE_SEEDS="101 202 303"
+export ATTACK_FAMILIES="pgd_autograd random_independent"
+```
+
+At R=2, calibration and held-out analysis focus on the three early relay sites
+`p2c@0`, `c2s@0`, and `s2p@0`. The `K=8` finite-difference estimate is the
+main feasible pilot estimator; increase to K=16 only in a fresh confirmatory
+root if validation shows a material stability gain without excessive probe
+attrition. Exact autograd is a nonblocking reference check on two fixed
+validation batches, not a requirement for every example/site. For the causal
+audit, identity replay, label-matched mismatch, and zero ablation are the
+minimum useful set; moment-matched noise is optional follow-up evidence.
+Radius/seed/K stability thresholds are likewise reported rather than used to
+suppress a valid negative pilot in empirical mode; certification keeps them
+blocking. A noisy estimator may therefore yield a valid but negative RQ1/RQ2
+result, which must be presented as such.
+
+The held-out RQ2 test compares deterministic per-example white-box PGD with an
+independently seeded random-direction attack across the complete frozen budget
+grid. Report achieved post-consumer-cast norm, interval/right censoring, and
+the full dose-response curve. Compare LinkRadius with clean margin and
+susceptibility on the same rows, using raw-example clustered uncertainty.
+Within a fixed requested-budget AUROC/AUPRC cell, rank by requested
+epsilon/LinkRadius (equivalently inverse radius); never multiply only the
+LinkRadius predictor by each attack's achieved norm. Achieved norms remain the
+primary coordinate for threshold and calibration analyses.
+
+Do not choose the model from earlier generation-gated yields. Start a fresh
+`sequential_light` forced-margin pilot census because the proposal names that
+system and the earlier low yield mixed scorer correctness with free-generation
+format/correctness. Choose `sequential_scaled` only after that census if
+`sequential_light` has too few finite forced-margin-positive rows or cannot
+produce a usable causal signal. If the stronger system is used, state the
+actual model/checkpoints in the paper and keep its output root separate.
+
+For this empirical workflow, exact legacy text/tensor equality, identical
+physical GPU ordinals, and strict screening-to-rerun identity are diagnostics,
+not scientific prerequisites. A node or physical-GPU change is acceptable when
+the code, environment, model artifacts, logical role placement, and frozen
+protocol match. Keep the safeguards that matter for inference: split raw IDs
+before filtering, tune only on validation, freeze before reading test outcomes,
+authenticate artifacts and provenance, use the same subspace/norm definition,
+and report every exclusion and censored threshold.
+
+GPQA Diamond has only 79 raw held-out rows in the current split, before clean
+filtering. The first run is therefore an explicitly underpowered pilot if its
+eligible cohort is small. A transparent denominator, effect estimate, and
+uncertainty interval are useful empirical evidence; do not manufacture the
+proposal's aspirational sample size or silently relax the frozen test design.
 
 ## Before running
 
@@ -36,7 +115,9 @@ Important environment variables are `PYTHON_BIN`, `LINKRADIUS_REPO_ROOT`, `STYLE
 `DATASETS`, `ROUNDS`, `SEEDS`, `BATCH_SIZE`, `LATENT_LENGTH`, `OUT_ROOT`,
 `GPU_LIST`, `PLANNER_DEVICE`, `CRITIC_DEVICE`, `SOLVER_DEVICE`,
 `TERMINAL_SOLVER_DEVICE`, `RELAY_TRANSFER_MODE`, `AUTOGRAD_MEMORY_MODE`,
-`PROBE_RADII`, `PROBE_SEEDS`, `K`, and `SUBSPACE`.
+`VALIDATION_TIER`, `CLEAN_CORRECT_POLICY`, `CLEAN_STABILITY_POLICY`,
+`INCLUDE_GENERATION`, `INTERVENTIONS`, `PROBE_RADII`, `PROBE_SEEDS`, `K`,
+`GRADIENT_REFERENCE_BATCHES`, and `SUBSPACE`.
 `GPU_LIST` is a whitespace-separated
 physical-device list for round-robin, one-GPU-per-array-task execution. If it
 is empty, scheduler-provided `CUDA_VISIBLE_DEVICES` is preserved; inside a
@@ -114,7 +195,15 @@ package versions. Frozen probe/attack protocols additionally bind the exact
 resolved model, adapter, scorer, and prompt identities, so changing conda
 environments or a mutable Hugging Face snapshot cannot silently mix results.
 
-## Phase 1: engineering
+## Phase 1: optional certification engineering
+
+Engineering equivalence always uses `CLEAN_STABILITY_POLICY=strict`. The
+runner rejects empirical mode here because release equivalence is an exact
+technical validation rather than a statistical robustness result.
+It is useful when claiming release-runner equivalence, but it is not a
+prerequisite for the paper's empirical-core workflow under
+`VALIDATION_TIER=empirical`. Do not restart this phase merely because a clean
+rerun moved by floating-point amounts while its forced scorer remains valid.
 
 The default discovery grid examines twenty validation candidates one at a time
 and freezes the first dual-correct row. The array bounds below are the exact
@@ -223,9 +312,30 @@ finite differences.
 
 ## Phase 2: smoke
 
-Smoke requires the passed engineering gate. It screens fixed validation
-batches, keeps their filler rows and boundaries, and marks 10--20 rows eligible
-(default 16).
+Under `VALIDATION_TIER=certification`, smoke requires the passed engineering
+gate. Under `VALIDATION_TIER=empirical`, it is an optional feasibility audit:
+it screens fixed validation batches, keeps their filler rows and boundaries,
+and targets 10--20 eligible rows (default 16) without making release
+equivalence a paper prerequisite.
+
+For the proposal's empirical failure-boundary analysis, use the selected
+forced-margin endpoint and empirical stability policy consistently through all
+later phases:
+
+```bash
+export VALIDATION_TIER=empirical
+export CLEAN_CORRECT_POLICY=forced_margin
+export CLEAN_STABILITY_POLICY=empirical
+export INCLUDE_GENERATION=0
+```
+
+Empirical mode records screening-to-clean scorer and selected-endpoint changes
+in an authenticated `clean_stability.json`; generation, when captured, remains
+diagnostic. It never promotes a frozen-ineligible row after outcomes are
+observed. Downstream cells with no effective row publish authenticated
+metadata-only exclusions, so the frozen array remains complete. Report the
+frozen and effective denominators and any clean-repeat instability. This mode
+supports held-out risk-ranking evidence, not exact tensor-level certification.
 
 ```bash
 LR_STAGE=split bash experiments/linkradius/run_linkradius_smoke.sh
@@ -288,9 +398,14 @@ sbatch --gres=gpu:1 --array="0-${MAX_INDEX}%4" \
 
 ## Phase 3: validation-only pilot calibration
 
-Phase 3 requires both prior gates and categorically rejects `test` in
-`PARTITIONS`. Its default batch counts match GPQA Diamond's 79/40
-attack-train/validation split at batch size 16.
+Phase 3 categorically rejects `test` in `PARTITIONS`. Certification mode
+requires the earlier engineering and smoke gates. Empirical mode may begin
+here from a fresh raw split after the model census; it still requires its own
+authenticated execution freeze, causal audit, probe freeze, and validation
+gate before Phase 4. The empirical-core default is the complete 40-row GPQA
+validation partition at batch size 1. `attack_train` is unnecessary for the
+first PGD-plus-random experiment because it learns no universal direction bank;
+add it only in a separate universal-attack follow-up.
 
 ```bash
 # CPU split; identical to the already frozen canonical split.
@@ -321,13 +436,30 @@ LR_STAGE=validate_probe bash experiments/linkradius/run_linkradius_pilot.sh
 LR_STAGE=aggregate bash experiments/linkradius/run_linkradius_pilot.sh
 ```
 
-For `BATCH_SIZE=1`, first unset `NUM_BATCHES MAX_ELIGIBLE`, then export
-`PARTITIONS="attack_train validation"` and
-`BATCH_COUNTS="attack_train=79 validation=40"` for every Phase-3 command.
-The screen/clean grids then contain 119 tasks (`0-118`) and execution freeze
-contains two (`0-1`). Export at least three fixed direction seeds, for example
+For the empirical-core `BATCH_SIZE=1` defaults, Phase 3 uses
+`PARTITIONS="validation"` and `BATCH_COUNTS="validation=40"` for every command.
+The screen/clean grids then contain 40 tasks (`0-39`) and execution freeze has
+one task (`0`). Export at least three fixed direction seeds, for example
 `PROBE_SEEDS="101 202 303"`, before starting the fresh workflow; Phase 4 will
 reject a Phase-3 probe freeze with fewer than three seeds.
+
+For the empirical core, keep `K=8`, restrict calibration to the three early
+R2 sites, and set `GRADIENT_REFERENCE_BATCHES=2`. The gradient jobs then check
+the finite-difference estimator against exact autograd only on a small, fixed
+validation subset. The causal grid should minimally include
+`INTERVENTIONS="identity mismatch zero"`: identity is the replay control,
+label-matched mismatch tests message specificity, and zero is the destructive
+control. Add moment-matched noise only after this minimum audit is interpretable.
+A negative audit is retained as a result: the held-out boundary analysis may
+still be reported as predictive association, but must not be described as a
+causal useful-link result unless a preregistered positive control succeeds.
+
+The empirical held-out freeze requires at least 75% of the requested directions
+(and at least four) after post-cast quality checks. Thus K=8 freezes
+`minimum_K_eff=6`. This replaces the old all-or-nothing sanitization that could
+discard a whole example/site/seed because one direction collapsed. The output
+records `K_eff`, the rejected direction IDs, and probe-seed attrition; do not
+silently treat partial estimates as complete-K certification results.
 
 Mechanical dependencies can use parsable job IDs:
 
@@ -371,9 +503,12 @@ straddle at least one boundary on the same raw-example/edge curve. It requires
 and freezes at least three Phase-3 probe seeds together with the attack/runtime
 settings, and refuses to run if any test clean/probe/attack artifact exists,
 including an unfinished job's manifest or pending log. Only then may any test
-outcome be opened. Fresh test dual-correctness is recomputed from primitive
-clean results; frozen grid cells without a fresh dual-correct row publish an
+outcome be opened. With `CLEAN_CORRECT_POLICY=forced_margin`, test eligibility
+is recomputed from finite forced-choice margins; free generation cannot exclude
+a row. Frozen grid cells without an effective selected row publish an
 authenticated exclusion completion without loading the models.
+Screening-to-clean scorer changes remain repeatability diagnostics; they are
+not subtracted from attack effects or promoted to a hidden scientific gate.
 
 For the four-GPU `sequential_scaled`, batch-size-one configuration, keep the
 same logical role map used in Phases 1--3 and submit one array element at a time:
@@ -383,6 +518,10 @@ unset GPU_LIST PARTITIONS BATCH_COUNTS EXECUTION_MANIFEST TRAJECTORY SCREENING_J
 unset NUM_BATCHES MAX_ELIGIBLE
 mkdir -p logs
 SBATCH_GPU=(-p PA100q -w node02 --nodes=1 --ntasks=1 --gres=gpu:4)
+export VALIDATION_TIER=empirical
+export CLEAN_CORRECT_POLICY=forced_margin
+export CLEAN_STABILITY_POLICY=empirical
+export INCLUDE_GENERATION=0
 export ATTACK_FAMILIES="pgd_autograd random_independent"
 export ATTACK_EPSILONS="3e-4 1e-3 3e-3 1e-2 3e-2 1e-1"
 export PGD_STEPS=20
@@ -466,7 +605,7 @@ component baselines for every required metric. If those are not estimable, the
 artifacts remain auditable but the run is labeled `underpowered` and the gate
 does not pass.
 
-GPQA provides only 79 raw held-out rows before fresh dual-correct filtering, so
+GPQA provides only 79 raw held-out rows before forced-margin filtering, so
 this configuration cannot guarantee the proposal's 64--128 clean-correct test
 target. Treat it as a minimal, potentially underpowered RQ2 pilot and report the
 eligible denominator, censoring, and exclusion counts; it is not by itself a

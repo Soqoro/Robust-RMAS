@@ -12,8 +12,14 @@ AGGREGATE_PHASE="${AGGREGATE_PHASE:-smoke}"
 DATASETS="${DATASETS:-gpqa}"
 ROUNDS="${ROUNDS:-2}"
 SEEDS="${SEEDS:-42}"
+CLEAN_CORRECT_POLICY="${CLEAN_CORRECT_POLICY:-forced_margin}"
+CLEAN_STABILITY_POLICY="${CLEAN_STABILITY_POLICY:-empirical}"
+VALIDATION_TIER="${VALIDATION_TIER:-empirical}"
 case "$AGGREGATE_PHASE" in
   engineering)
+    CLEAN_CORRECT_POLICY="dual_correct"
+    CLEAN_STABILITY_POLICY="strict"
+    VALIDATION_TIER="certification"
     BATCH_SIZE="${BATCH_SIZE:-1}"
     NUM_BATCHES="${NUM_BATCHES:-1}"
     PROBE_SEEDS="${PROBE_SEEDS:-101}"
@@ -23,20 +29,27 @@ case "$AGGREGATE_PHASE" in
     NUM_BATCHES="${NUM_BATCHES:-2}"
     MAX_ELIGIBLE="${MAX_ELIGIBLE:-16}"
     PROBE_SEEDS="${PROBE_SEEDS:-101 202}"
+    INCLUDE_GENERATION="${INCLUDE_GENERATION:-0}"
     ;;
   pilot)
-    BATCH_SIZE="${BATCH_SIZE:-16}"
-    NUM_BATCHES="${NUM_BATCHES:-5}"
-    BATCH_COUNTS="${BATCH_COUNTS:-attack_train=5 validation=3}"
-    K="${K:-32}"
+    BATCH_SIZE="${BATCH_SIZE:-1}"
+    PARTITIONS="${PARTITIONS:-validation}"
+    NUM_BATCHES="${NUM_BATCHES:-40}"
+    BATCH_COUNTS="${BATCH_COUNTS:-validation=40}"
+    K="${K:-8}"
+    GRADIENT_REFERENCE_BATCHES="${GRADIENT_REFERENCE_BATCHES:-2}"
     PROBE_SEEDS="${PROBE_SEEDS:-101 202 303}"
+    INTERVENTIONS="${INTERVENTIONS:-identity mismatch zero}"
+    INCLUDE_GENERATION="${INCLUDE_GENERATION:-0}"
     ;;
   attacks)
-    BATCH_SIZE="${BATCH_SIZE:-16}"
+    BATCH_SIZE="${BATCH_SIZE:-1}"
     NUM_BATCHES="${NUM_BATCHES:-1}"
     BATCH_COUNTS="${BATCH_COUNTS:-test=5}"
-    K="${K:-32}"
-    ATTACK_FAMILIES="${ATTACK_FAMILIES:-universal_margin diffmean pca pgd_autograd random_independent}"
+    K="${K:-8}"
+    ATTACK_FAMILIES="${ATTACK_FAMILIES:-pgd_autograd random_independent}"
+    INTERVENTIONS="${INTERVENTIONS:-identity mismatch zero}"
+    INCLUDE_GENERATION="${INCLUDE_GENERATION:-0}"
     ;;
 esac
 

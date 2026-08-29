@@ -31,11 +31,17 @@ SOLVER_DEVICE="${SOLVER_DEVICE:-}"
 TERMINAL_SOLVER_DEVICE="${TERMINAL_SOLVER_DEVICE:-}"
 RELAY_TRANSFER_MODE="${RELAY_TRANSFER_MODE:-cpu_staged}"
 AUTOGRAD_MEMORY_MODE="${AUTOGRAD_MEMORY_MODE:-none}"
+CLEAN_STABILITY_POLICY="${CLEAN_STABILITY_POLICY:-strict}"
+CLEAN_CORRECT_POLICY="${CLEAN_CORRECT_POLICY:-dual_correct}"
+VALIDATION_TIER="${VALIDATION_TIER:-certification}"
+INCLUDE_GENERATION="${INCLUDE_GENERATION:-1}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 PROBE_RADII="${PROBE_RADII:-1e-3 3e-3}"
 PROBE_SEEDS="${PROBE_SEEDS:-101 202}"
 K="${K:-8}"
+GRADIENT_REFERENCE_BATCHES="${GRADIENT_REFERENCE_BATCHES:-0}"
 SUBSPACE="${SUBSPACE:-full_tensor}"
+INTERVENTIONS="${INTERVENTIONS:-identity mismatch zero moment_noise}"
 NUM_BATCHES="${NUM_BATCHES:-1}"
 DISCOVERY_BATCHES="${DISCOVERY_BATCHES:-20}"
 PARTITIONS="${PARTITIONS:-}"
@@ -116,6 +122,27 @@ lr_validate_autograd_memory_mode() {
   case "$AUTOGRAD_MEMORY_MODE" in
     none|checkpoint) ;;
     *) lr_die "AUTOGRAD_MEMORY_MODE must be none or checkpoint, got: $AUTOGRAD_MEMORY_MODE" ;;
+  esac
+}
+
+lr_validate_clean_stability_policy() {
+  case "$CLEAN_STABILITY_POLICY" in
+    strict|empirical) ;;
+    *) lr_die "CLEAN_STABILITY_POLICY must be strict or empirical, got: $CLEAN_STABILITY_POLICY" ;;
+  esac
+}
+
+lr_validate_clean_correct_policy() {
+  case "$CLEAN_CORRECT_POLICY" in
+    forced_margin|dual_correct) ;;
+    *) lr_die "CLEAN_CORRECT_POLICY must be forced_margin or dual_correct, got: $CLEAN_CORRECT_POLICY" ;;
+  esac
+}
+
+lr_validate_validation_tier() {
+  case "$VALIDATION_TIER" in
+    empirical|certification) ;;
+    *) lr_die "VALIDATION_TIER must be empirical or certification, got: $VALIDATION_TIER" ;;
   esac
 }
 
@@ -201,7 +228,9 @@ lr_build_command() {
     --probe-radii "$PROBE_RADII"
     --probe-seeds "$PROBE_SEEDS"
     --K "$K"
+    --gradient-reference-batches "$GRADIENT_REFERENCE_BATCHES"
     --subspace "$SUBSPACE"
+    --interventions "$INTERVENTIONS"
     --attack-families "$ATTACK_FAMILIES"
     --attack-epsilons "$ATTACK_EPSILONS"
     --pgd-steps "$PGD_STEPS"
@@ -216,6 +245,10 @@ lr_build_command() {
     --terminal-solver-device "$TERMINAL_SOLVER_DEVICE"
     --relay-transfer-mode "$RELAY_TRANSFER_MODE"
     --autograd-memory-mode "$AUTOGRAD_MEMORY_MODE"
+    --clean-stability-policy "$CLEAN_STABILITY_POLICY"
+    --clean-correct-policy "$CLEAN_CORRECT_POLICY"
+    --validation-tier "$VALIDATION_TIER"
+    --include-generation "$INCLUDE_GENERATION"
     --engineering-gate "$ENGINEERING_GATE"
     --smoke-gate "$SMOKE_GATE"
     --probe-gate "$PROBE_GATE"
@@ -268,6 +301,10 @@ lr_run_entrypoint() {
   lr_validate_bool "OVERWRITE" "$OVERWRITE" || return
   lr_validate_relay_transfer_mode || return
   lr_validate_autograd_memory_mode || return
+  lr_validate_clean_stability_policy || return
+  lr_validate_clean_correct_policy || return
+  lr_validate_validation_tier || return
+  lr_validate_bool "INCLUDE_GENERATION" "$INCLUDE_GENERATION" || return
   lr_validate_gpu_configuration || return
 
   lr_build_command "$workflow" "$stage" "$task_id"

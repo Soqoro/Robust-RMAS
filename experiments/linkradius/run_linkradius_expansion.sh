@@ -15,6 +15,9 @@ ROUNDS="${ROUNDS:-1 2 3 4 5}"
 SEEDS="${SEEDS:-42}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 LATENT_LENGTH="${LATENT_LENGTH:-32}"
+CLEAN_CORRECT_POLICY="${CLEAN_CORRECT_POLICY:-forced_margin}"
+CLEAN_STABILITY_POLICY="${CLEAN_STABILITY_POLICY:-strict}"
+VALIDATION_TIER="${VALIDATION_TIER:-empirical}"
 
 lr_entrypoint_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then

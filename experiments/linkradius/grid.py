@@ -210,6 +210,7 @@ class GridConfig:
     batch_size: int = 16
     latent_length: int = 32
     discovery_batches: int = 20
+    gradient_reference_batches: int = 0
     runner_config_hash: str = ""
 
 
@@ -330,6 +331,14 @@ def _edge_tokens_for(config: GridConfig, R: int, stage: str) -> tuple[str, ...]:
             return ("p2c@0",)
         if stage == "gradient":
             return ("c2s@1", "p2c@0")
+    if config.workflow == "pilot" and stage in {
+        "causal",
+        "probe_calibration",
+        "gradient",
+    }:
+        if R != 2:
+            raise ContractError("the empirical pilot edge design is frozen at R=2")
+        return EARLY_R2_EDGES
     if config.workflow == "attacks":
         if R != 2:
             raise ContractError(
@@ -361,6 +370,14 @@ def _task_payloads(config: GridConfig) -> list[dict[str, Any]]:
         )
     stage = GRID_ALIAS.get(requested_stage, requested_stage)
     partitions = config.partitions or _default_partitions(config.workflow, stage)
+    if config.workflow == "pilot" and stage == "gradient":
+        if "validation" not in partitions:
+            raise ContractError(
+                "pilot exact-gradient reference requires the validation partition"
+            )
+        partitions = ("validation",)
+    if int(config.gradient_reference_batches) < 0:
+        raise ContractError("gradient_reference_batches must be non-negative")
     payloads: list[dict[str, Any]] = []
     if config.workflow == "aggregate":
         return [
@@ -495,6 +512,10 @@ def _task_payloads(config: GridConfig) -> list[dict[str, Any]]:
                 )
         elif stage == "gradient":
             eligible_batches = _eligible_batch_ids(config, partition, batches)
+            if config.workflow == "pilot":
+                eligible_batches = eligible_batches[
+                    : int(config.gradient_reference_batches)
+                ]
             for batch_id, edge in itertools.product(eligible_batches, _edge_tokens_for(config, R, stage)):
                 payloads.append(
                     {
@@ -661,6 +682,9 @@ def config_from_namespace(args: argparse.Namespace) -> GridConfig:
         batch_size=getattr(args, "batch_size", 16),
         latent_length=getattr(args, "latent_length", 32),
         discovery_batches=getattr(args, "discovery_batches", 20),
+        gradient_reference_batches=getattr(
+            args, "gradient_reference_batches", 0
+        ),
     )
 
 
@@ -682,6 +706,15 @@ def add_grid_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--attack-families", default="random_independent pgd_autograd")
     parser.add_argument("--attack-epsilons", default="1e-3 3e-3 1e-2")
     parser.add_argument("--discovery-batches", type=int, default=20)
+    parser.add_argument(
+        "--gradient-reference-batches",
+        type=int,
+        default=0,
+        help=(
+            "limit pilot exact-gradient reference to the first N eligible "
+            "execution batches; 0 disables this optional reference"
+        ),
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

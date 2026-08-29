@@ -49,7 +49,7 @@ from .schemas import (
     validate_completion_record,
     validate_intervention_row,
 )
-from .select_clean_correct import annotate_screening_rows
+from .select_clean_correct import annotate_screening_rows, audit_clean_stability
 from .validate_stage import make_gate
 
 
@@ -294,6 +294,14 @@ def _producer_namespace(
     producer = argparse.Namespace(**vars(args))
     producer.workflow = workflow
     producer.stage = "grid"
+    if workflow == "engineering":
+        # Engineering establishes exact release equivalence and therefore
+        # always retains the certification-oriented strict policy, even when
+        # a downstream empirical workflow opts into monotone demotion.
+        producer.clean_stability_policy = "strict"
+        producer.clean_correct_policy = "dual_correct"
+        producer.validation_tier = "certification"
+        producer.include_generation = 1
     producer._current_source_hash = getattr(args, "_current_source_hash", None)
     return producer
 
@@ -429,6 +437,16 @@ def _task_manifest(args: argparse.Namespace, task: Mapping[str, Any], repo_root:
         "autograd_memory_mode": str(
             getattr(args, "autograd_memory_mode", "none")
         ),
+        "clean_stability_policy": str(
+            getattr(args, "clean_stability_policy", "strict")
+        ),
+        "clean_correct_policy": str(
+            getattr(args, "clean_correct_policy", "dual_correct")
+        ),
+        "validation_tier": str(
+            getattr(args, "validation_tier", "certification")
+        ),
+        "include_generation": bool(getattr(args, "include_generation", 1)),
         # Scheduler placement is diagnostic rather than scientific identity:
         # logical role devices are hashed above, while physical allocation may
         # change safely between otherwise identical jobs.
@@ -542,10 +560,21 @@ UPSTREAM_COMPLETION_STAGES: Mapping[tuple[str, str], tuple[str, ...]] = {
     ("pilot", "causal"): ("clean",),
     ("pilot", "probe_calibration"): ("clean",),
     ("pilot", "gradient"): ("clean",),
-    ("pilot", "freeze_probe"): ("causal", "probe_calibration"),
+    ("pilot", "freeze_probe"): (
+        "clean",
+        "causal",
+        "probe_calibration",
+        "gradient",
+    ),
     ("pilot", "validate_probe"): ("clean", "causal", "probe_calibration", "gradient", "freeze_probe"),
     ("pilot", "validate"): ("clean", "causal", "probe_calibration", "gradient", "freeze_probe"),
-    ("pilot", "aggregate"): ("causal", "probe_calibration", "freeze_probe", "validate_probe"),
+    ("pilot", "aggregate"): (
+        "clean",
+        "causal",
+        "probe_calibration",
+        "freeze_probe",
+        "validate_probe",
+    ),
     ("attacks", "freeze_attack"): ("freeze_execution", "val"),
     ("attacks", "clean"): ("freeze_attack",),
     ("attacks", "test_probe"): ("clean",),
@@ -668,6 +697,16 @@ def _runner_config_digest(
         "upstream_completions": _upstream_completion_fingerprint(
             args, workflow=workflow, stage=stage
         ),
+        "clean_stability_policy": str(
+            getattr(args, "clean_stability_policy", "strict")
+        ),
+        "clean_correct_policy": str(
+            getattr(args, "clean_correct_policy", "dual_correct")
+        ),
+        "validation_tier": str(
+            getattr(args, "validation_tier", "certification")
+        ),
+        "include_generation": bool(getattr(args, "include_generation", 1)),
     }
     if stage != "split" and workflow in {"engineering", "smoke", "pilot", "attacks"}:
         payload["split_manifest"] = _configured_artifact_identity(args.split_manifest)
@@ -708,6 +747,7 @@ def _runner_config_digest(
         }
     if stage == "gradient":
         payload["gradient_validation"] = {
+            "gradient_reference_batches": int(args.gradient_reference_batches),
             "pgd_steps": int(args.pgd_steps),
             "finite_difference_radii": [float(value) for value in args.finite_difference_radii],
             "autograd_fd_relative_tolerance": float(args.autograd_fd_relative_tolerance),
@@ -797,6 +837,7 @@ def _runner_config_digest(
     if workflow == "pilot" and stage in {"freeze_probe", "validate_probe", "validate"}:
         payload["probe_validation"] = {
             "K": int(args.K),
+            "gradient_reference_batches": int(args.gradient_reference_batches),
             "subspace": args.subspace,
             "minimum_scorer_agreement": float(args.minimum_scorer_agreement),
             "minimum_probe_acceptance": float(args.minimum_probe_acceptance),
@@ -1256,6 +1297,10 @@ def _assert_frozen_attack_arguments(
         "batch_size": int(args.batch_size),
         "latent_length": int(args.latent_length),
         "subspace": str(args.subspace),
+        "clean_stability_policy": str(args.clean_stability_policy),
+        "clean_correct_policy": str(args.clean_correct_policy),
+        "validation_tier": str(args.validation_tier),
+        "include_generation": int(args.include_generation),
         "runtime": {
             "role_devices": _resolved_role_devices(args),
             "relay_transfer_mode": str(args.relay_transfer_mode),
@@ -1274,6 +1319,16 @@ def _assert_frozen_attack_arguments(
         "batch_size": int(frozen["batch_size"]),
         "latent_length": int(frozen["latent_length"]),
         "subspace": str(frozen["subspace"]),
+        "clean_stability_policy": str(
+            frozen.get("clean_stability_policy", "strict")
+        ),
+        "clean_correct_policy": str(
+            frozen.get("clean_correct_policy", "dual_correct")
+        ),
+        "validation_tier": str(
+            frozen.get("validation_tier", "certification")
+        ),
+        "include_generation": int(frozen.get("include_generation", 1)),
         "runtime": dict(frozen["runtime"]),
     }
     if shared != expected_shared:
@@ -1365,32 +1420,47 @@ def enforce_prerequisites(
         )
         return gate
 
+    certification = str(args.validation_tier) == "certification"
+
     if args.workflow == "smoke" and stage not in {"split"}:
-        current_gate(
-            args.engineering_gate,
-            "engineering_gate",
-            required_hashes={"split_manifest_hash": current_split_hash},
-        )
+        if certification:
+            current_gate(
+                args.engineering_gate,
+                "engineering_gate",
+                required_hashes={"split_manifest_hash": current_split_hash},
+            )
     elif args.workflow == "pilot" and stage not in {"split"}:
-        engineering = current_gate(
-            args.engineering_gate,
-            "engineering_gate",
-            required_hashes={"split_manifest_hash": current_split_hash},
-        )
-        smoke = current_gate(
-            args.smoke_gate,
-            "smoke_gate",
-            required_hashes={"engineering_gate_hash": engineering["gate_content_hash"], "split_manifest_hash": current_split_hash},
-        )
+        engineering = None
+        smoke = None
+        if certification:
+            engineering = current_gate(
+                args.engineering_gate,
+                "engineering_gate",
+                required_hashes={"split_manifest_hash": current_split_hash},
+            )
+            smoke = current_gate(
+                args.smoke_gate,
+                "smoke_gate",
+                required_hashes={
+                    "engineering_gate_hash": engineering["gate_content_hash"],
+                    "split_manifest_hash": current_split_hash,
+                },
+            )
         if stage == "aggregate":
+            required_probe_hashes = {
+                "split_manifest_hash": current_split_hash,
+            }
+            if engineering is not None and smoke is not None:
+                required_probe_hashes.update(
+                    {
+                        "engineering_gate_hash": engineering["gate_content_hash"],
+                        "smoke_gate_hash": smoke["gate_content_hash"],
+                    }
+                )
             probe = current_gate(
                 args.probe_gate,
                 "probe_gate",
-                required_hashes={
-                    "engineering_gate_hash": engineering["gate_content_hash"],
-                    "smoke_gate_hash": smoke["gate_content_hash"],
-                    "split_manifest_hash": current_split_hash,
-                },
+                required_hashes=required_probe_hashes,
             )
             frozen_probe = _authenticated_frozen_probe_config(
                 args, task, current_source_hash=current_source_hash
@@ -1398,24 +1468,34 @@ def enforce_prerequisites(
             if probe.get("frozen_config_hash") != frozen_probe.get("content_hash"):
                 raise ContractError("pilot aggregate probe gate/config hashes differ")
     elif args.workflow == "attacks":
-        engineering = current_gate(
-            args.engineering_gate,
-            "engineering_gate",
-            required_hashes={"split_manifest_hash": current_split_hash},
-        )
-        smoke = current_gate(
-            args.smoke_gate,
-            "smoke_gate",
-            required_hashes={"engineering_gate_hash": engineering["gate_content_hash"], "split_manifest_hash": current_split_hash},
-        )
+        engineering = None
+        smoke = None
+        if certification:
+            engineering = current_gate(
+                args.engineering_gate,
+                "engineering_gate",
+                required_hashes={"split_manifest_hash": current_split_hash},
+            )
+            smoke = current_gate(
+                args.smoke_gate,
+                "smoke_gate",
+                required_hashes={
+                    "engineering_gate_hash": engineering["gate_content_hash"],
+                    "split_manifest_hash": current_split_hash,
+                },
+            )
+        required_probe_hashes = {"split_manifest_hash": current_split_hash}
+        if engineering is not None and smoke is not None:
+            required_probe_hashes.update(
+                {
+                    "engineering_gate_hash": engineering["gate_content_hash"],
+                    "smoke_gate_hash": smoke["gate_content_hash"],
+                }
+            )
         probe_gate = current_gate(
             args.probe_gate,
             "probe_gate",
-            required_hashes={
-                "engineering_gate_hash": engineering["gate_content_hash"],
-                "smoke_gate_hash": smoke["gate_content_hash"],
-                "split_manifest_hash": current_split_hash,
-            },
+            required_hashes=required_probe_hashes,
         )
         frozen_probe = _authenticated_frozen_probe_config(
             args, task, current_source_hash=current_source_hash
@@ -2457,7 +2537,7 @@ def _capture_stage(args: argparse.Namespace, task_dir: Path, task: Mapping[str, 
             ordered_batch_ids=[int(task["execution_batch_id"] or 0)],
             batch_boundaries=[(0, len(records))],
             analysis_eligibility_mask=eligibility,
-            include_generation=True,
+            include_generation=bool(args.include_generation),
             provenance={
                 "split_manifest_hash": verify_split_manifest(load_json(args.split_manifest)),
                 "global_ordered_cohort_hash": execution.get("ordered_cohort_hash") if execution else None,
@@ -2476,6 +2556,7 @@ def _capture_stage(args: argparse.Namespace, task_dir: Path, task: Mapping[str, 
                     "deterministic": 1,
                     "max_new_tokens": 4000,
                     "answer_retry": True,
+                    "include_generation": bool(args.include_generation),
                     "seed": int(args.seed),
                     "batch_size": int(args.batch_size),
                     "latent_length": int(args.latent_length),
@@ -2485,21 +2566,84 @@ def _capture_stage(args: argparse.Namespace, task_dir: Path, task: Mapping[str, 
     finally:
         runtime.unload()
     rows = _trajectory_rows(trajectory, task=task, args=args, repo_root=repo_root)
+    clean_stability_report: dict[str, Any] | None = None
     if task["stage"] == "clean" and execution is not None and frozen_slice is not None:
-        fresh_annotated, _ = annotate_screening_rows(rows)
-        frozen_dual = list(execution["screening_dual_correct"])[frozen_slice]
-        changed = [
-            rows[index]["raw_sample_id"]
-            for index, (expected, fresh) in enumerate(
-                zip(frozen_dual, (row["dual_correct"] for row in fresh_annotated))
+        batch_raw_ids = list(execution["ordered_raw_sample_ids"])[frozen_slice]
+        batch_dual = list(execution["screening_dual_correct"])[frozen_slice]
+        batch_clean_correct = list(
+            execution.get(
+                "screening_clean_correct",
+                execution["screening_dual_correct"],
             )
-            if expected is not None and bool(expected) != bool(fresh)
+        )[frozen_slice]
+        batch_eligibility = list(execution["analysis_eligible"])[frozen_slice]
+        batch_reasons = list(execution["exclusion_reasons"])[frozen_slice]
+        generated_values = execution.get("screening_generated_choices")
+        scorer_values = execution.get("screening_scorer_predictions")
+        audit_rows, stability_summary = audit_clean_stability(
+            rows,
+            raw_sample_ids=batch_raw_ids,
+            screening_dual_correct=batch_dual,
+            screening_clean_correct=batch_clean_correct,
+            clean_correct_policy=str(args.clean_correct_policy),
+            screening_analysis_eligible=batch_eligibility,
+            screening_exclusion_reasons=batch_reasons,
+            screening_generated_choices=(
+                list(generated_values)[frozen_slice]
+                if generated_values is not None
+                else None
+            ),
+            screening_scorer_predictions=(
+                list(scorer_values)[frozen_slice]
+                if scorer_values is not None
+                else None
+            ),
+            policy=str(args.clean_stability_policy),
+        )
+        trajectory.analysis_eligibility_mask = [
+            bool(row["effective_analysis_eligible"]) for row in audit_rows
         ]
-        if changed:
-            raise ContractError(
-                "fresh clean dual-correct status differs from screening under the frozen execution "
-                f"settings: {', '.join(changed)}"
+        trajectory.provenance["execution_exclusion_reasons"] = [
+            str(row["effective_exclusion_reason"]) for row in audit_rows
+        ]
+        trajectory.provenance.update(
+            {
+                "clean_stability_policy": str(args.clean_stability_policy),
+                "clean_correct_policy": str(args.clean_correct_policy),
+                "screening_analysis_eligibility_mask": [
+                    bool(value) for value in batch_eligibility
+                ],
+                "screening_dual_correct": list(batch_dual),
+                "screening_clean_correct": list(batch_clean_correct),
+                "fresh_clean_correct": [
+                    bool(row["fresh_clean_correct"]) for row in audit_rows
+                ],
+                "fresh_dual_correct": [
+                    bool(row["fresh_dual_correct"]) for row in audit_rows
+                ],
+                "clean_stability_summary": dict(stability_summary),
+            }
+        )
+        rows = _trajectory_rows(
+            trajectory, task=task, args=args, repo_root=repo_root
+        )
+        audit_by_id = {
+            str(row["raw_sample_id"]): row for row in audit_rows
+        }
+        for row in rows:
+            audit = audit_by_id[str(row["raw_sample_id"])]
+            row.update(
+                {
+                    key: value
+                    for key, value in audit.items()
+                    if key not in {"schema_version", "raw_sample_id"}
+                }
             )
+        clean_stability_report = {
+            "schema_version": "linkradius.clean_stability_report.v1",
+            "summary": stability_summary,
+            "rows": audit_rows,
+        }
     if args.workflow == "attacks" and task["stage"] == "clean":
         frozen_attack = _authenticated_frozen_attack_config(
             args,
@@ -2515,7 +2659,9 @@ def _capture_stage(args: argparse.Namespace, task_dir: Path, task: Mapping[str, 
                 "scorer/prompt identity than the frozen attack protocol"
             )
     if task["stage"] in {"discover", "screen", "screen_clean"}:
-        annotated, summary = annotate_screening_rows(rows)
+        annotated, summary = annotate_screening_rows(
+            rows, clean_correct_policy=str(args.clean_correct_policy)
+        )
         artifact_name = "screening_rows.jsonl"
         atomic_write_jsonl(
             task_dir / artifact_name,
@@ -2532,6 +2678,13 @@ def _capture_stage(args: argparse.Namespace, task_dir: Path, task: Mapping[str, 
         )
         _atomic_torch_save(task_dir / "clean_trajectory.pt", trajectory)
         artifacts = ["manifest.json", "command.txt", artifact_name, "clean_trajectory.pt"]
+        if clean_stability_report is not None:
+            atomic_write_json(
+                task_dir / "clean_stability.json",
+                clean_stability_report,
+                overwrite=args.overwrite,
+            )
+            artifacts.append("clean_stability.json")
     publish_completion(
         task_dir,
         config_hash=str(task["config_key"]),
@@ -2693,22 +2846,23 @@ def _autograd_sample_index(trajectory: Any) -> int:
     raise ContractError("autograd stage has no analysis-eligible row in this execution batch")
 
 
-def _fresh_dual_correct_trajectory_indices(trajectory: Any) -> list[int]:
-    """Recompute the predeclared analysis cohort from frozen clean outcomes."""
+def _fresh_clean_correct_trajectory_indices(
+    trajectory: Any,
+    *,
+    clean_correct_policy: str,
+) -> list[int]:
+    """Recompute the selected clean endpoint from the frozen clean capture."""
+
+    if clean_correct_policy not in {"forced_margin", "dual_correct"}:
+        raise ContractError(
+            f"unsupported clean-correct policy: {clean_correct_policy}"
+        )
 
     selected: list[int] = []
     for index, gold in enumerate(trajectory.gold_labels):
-        generation = (
-            trajectory.clean_generation_audit[index]
-            if index < len(trajectory.clean_generation_audit)
-            else {}
-        )
         margins = trajectory.clean_margins[index]
-        if (
+        forced_margin_correct = (
             bool(trajectory.analysis_eligibility_mask[index])
-            and generation.get("strict_choice") == gold
-            and not bool(generation.get("answer_invalid", True))
-            and not bool(generation.get("answer_conflict", False))
             and trajectory.clean_scoring.predictions[index] == gold
             and not bool(trajectory.clean_scoring.score_ties[index])
             and isinstance(margins, Mapping)
@@ -2717,9 +2871,32 @@ def _fresh_dual_correct_trajectory_indices(trajectory: Any) -> list[int]:
                 math.isfinite(float(value)) and float(value) > 0.0
                 for value in margins.values()
             )
-        ):
+        )
+        if not forced_margin_correct:
+            continue
+        if clean_correct_policy == "dual_correct":
+            generation = (
+                trajectory.clean_generation_audit[index]
+                if index < len(trajectory.clean_generation_audit)
+                else {}
+            )
+            if (
+                generation.get("strict_choice") != gold
+                or bool(generation.get("answer_invalid", True))
+                or bool(generation.get("answer_conflict", False))
+            ):
+                continue
+        if forced_margin_correct:
             selected.append(index)
     return selected
+
+
+def _fresh_dual_correct_trajectory_indices(trajectory: Any) -> list[int]:
+    """Compatibility wrapper for the legacy engineering endpoint."""
+
+    return _fresh_clean_correct_trajectory_indices(
+        trajectory, clean_correct_policy="dual_correct"
+    )
 
 
 def _publish_outcome_excluded_task(
@@ -2729,8 +2906,9 @@ def _publish_outcome_excluded_task(
     repo_root: Path,
     *,
     artifact_name: str,
+    skip_reason: str = "no_fresh_clean_correct_row",
 ) -> None:
-    """Complete a frozen grid cell that has no fresh dual-correct test row."""
+    """Complete a frozen grid cell that has no fresh clean-correct test row."""
 
     rows = [
         {
@@ -2738,7 +2916,7 @@ def _publish_outcome_excluded_task(
             "array_index": task["array_index"],
             "config_key": task["config_key"],
             "row_count": 0,
-            "skip_reason": "no_fresh_dual_correct_row",
+            "skip_reason": skip_reason,
         }
     ]
     atomic_write_jsonl(task_dir / artifact_name, rows, overwrite=args.overwrite)
@@ -2771,12 +2949,46 @@ def _replay_stage(args: argparse.Namespace, task_dir: Path, task: Mapping[str, A
     if trajectory.execution_manifest_hash != authenticated_execution_hash:
         raise ContractError("trajectory and execution manifest hashes differ")
     edge = str(task["edge_id"])
+    trajectory_eligibility = getattr(
+        trajectory, "analysis_eligibility_mask", [True]
+    )
+    analysis_indices = [
+        index
+        for index, eligible in enumerate(trajectory_eligibility)
+        if bool(eligible)
+    ]
+    if (
+        not analysis_indices
+        and str(getattr(args, "clean_stability_policy", "strict")) == "empirical"
+        and args.workflow in {"smoke", "pilot"}
+    ):
+        artifact_name = {
+            "replay": "replay_runs.jsonl",
+            "causal": "causal_runs.jsonl",
+            "probe": "probe_runs.jsonl",
+            "probe_calibration": "probe_runs.jsonl",
+            "gradient": "gradient_runs.jsonl",
+        }.get(str(task["stage"]))
+        if artifact_name is None:
+            raise ContractError(
+                f"cannot publish an empirical clean-exclusion record for {task['stage']}"
+            )
+        _publish_outcome_excluded_task(
+            args,
+            task_dir,
+            task,
+            repo_root,
+            artifact_name=artifact_name,
+            skip_reason="no_effective_analysis_eligible_row",
+        )
+        return
     selected_probe_indices: list[int] | None = None
     if task["stage"] in {"probe", "probe_calibration", "test_probe"}:
-        selected_probe_indices = list(range(len(trajectory.raw_sample_ids)))
+        selected_probe_indices = analysis_indices
         if args.workflow == "attacks" and task["stage"] == "test_probe":
-            selected_probe_indices = _fresh_dual_correct_trajectory_indices(
-                trajectory
+            selected_probe_indices = _fresh_clean_correct_trajectory_indices(
+                trajectory,
+                clean_correct_policy=str(args.clean_correct_policy),
             )
             if not selected_probe_indices:
                 _publish_outcome_excluded_task(
@@ -3164,7 +3376,10 @@ def _attack_stage(args: argparse.Namespace, task_dir: Path, task: Mapping[str, A
     ):
         raise ContractError("attack budgets must be unique, positive, finite, and increasing")
     eligible_indices = (
-        _fresh_dual_correct_trajectory_indices(trajectory)
+        _fresh_clean_correct_trajectory_indices(
+            trajectory,
+            clean_correct_policy=str(args.clean_correct_policy),
+        )
         if args.workflow == "attacks"
         else [
             index
@@ -3625,6 +3840,9 @@ def _freeze_heldout_execution(
                 "sample_id": raw_id,
                 "raw_index": row.get("raw_index"),
                 "analysis_eligible": True,
+                "clean_correct_policy": str(args.clean_correct_policy),
+                "clean_correct": None,
+                "forced_margin_correct": None,
                 "dual_correct": None,
                 "exclusion_reason": "",
             }
@@ -3635,6 +3853,7 @@ def _freeze_heldout_execution(
         "split_manifest_hash": split_hash,
         "batch_size": int(args.batch_size),
         "selection": "all_raw_test_rows_before_outcomes",
+        "clean_correct_policy": str(args.clean_correct_policy),
         "outcomes_observed": False,
     }
     manifest = build_execution_manifest(
@@ -3651,6 +3870,7 @@ def _freeze_heldout_execution(
             domain="linkradius:heldout_raw_cohort:v1",
         ),
         retain_all_partition_rows=True,
+        clean_correct_policy=str(args.clean_correct_policy),
     )
     output = (
         Path(args.execution_output)
@@ -3788,10 +4008,16 @@ def _freeze_execution(args: argparse.Namespace, task_dir: Path, task: Mapping[st
     max_eligible = 1 if args.workflow == "engineering" else (args.max_eligible or None)
     if args.workflow == "smoke" and (max_eligible is None or not 10 <= max_eligible <= 20):
         raise ContractError("smoke freeze_execution requires --max-eligible in the frozen range 10..20")
-    annotated, summary = annotate_screening_rows(rows, max_eligible=max_eligible)
-    if args.workflow == "smoke" and not 10 <= int(summary["dual_correct_count"]) <= 20:
+    annotated, summary = annotate_screening_rows(
+        rows,
+        max_eligible=max_eligible,
+        clean_correct_policy=str(args.clean_correct_policy),
+    )
+    if args.workflow == "smoke" and not 10 <= int(summary["clean_correct_count"]) <= 20:
         raise ContractError(
-            f"smoke requires 10..20 dual-correct rows; screening produced {summary['dual_correct_count']}"
+            "smoke requires 10..20 clean-correct rows under the selected "
+            f"{args.clean_correct_policy} policy; screening produced "
+            f"{summary['clean_correct_count']}"
         )
     manifest_rows = annotated
     if args.workflow == "engineering":
@@ -3826,6 +4052,7 @@ def _freeze_execution(args: argparse.Namespace, task_dir: Path, task: Mapping[st
         screening_config_hash=content_hash(summary, domain="linkradius:screening_config:v1"),
         screening_run_hash=summary["ordered_raw_id_hash"],
         retain_all_partition_rows=args.workflow == "pilot" and args.retain_all_partition_rows,
+        clean_correct_policy=str(args.clean_correct_policy),
     )
     output = (
         Path(args.execution_output)
@@ -4011,6 +4238,10 @@ def _freeze_attack_stage(
         "batch_size": int(args.batch_size),
         "latent_length": int(args.latent_length),
         "subspace": str(args.subspace),
+        "clean_stability_policy": str(args.clean_stability_policy),
+        "clean_correct_policy": str(args.clean_correct_policy),
+        "validation_tier": str(args.validation_tier),
+        "include_generation": int(args.include_generation),
         "runtime": {
             "role_devices": _resolved_role_devices(args),
             "relay_transfer_mode": str(args.relay_transfer_mode),
@@ -4028,9 +4259,9 @@ def _freeze_attack_stage(
             "frozen Phase-3 probe protocol is incompatible with the "
             "failure-boundary attack configuration"
         )
-    if not set(EARLY_R2_EDGES).issubset(set(frozen_probe.get("grid_edges", []))):
+    if tuple(frozen_probe.get("grid_edges", [])) != tuple(EARLY_R2_EDGES):
         raise ContractError(
-            "frozen Phase-3 probe grid does not cover every early R=2 edge"
+            "frozen Phase-3 probe grid must contain exactly the three early R=2 edges"
         )
     validation_system_identity = _common_system_identity(
         all_rows, where="validation attack evidence"
@@ -4043,12 +4274,17 @@ def _freeze_attack_stage(
     attack_cast_thresholds = frozen_probe["acceptance_thresholds"]
     eligible_ids = {
         str(raw_id)
-        for raw_id, eligible in zip(
-            validation_execution["ordered_raw_sample_ids"],
-            validation_execution["analysis_eligible"],
+        for raw_id in frozen_probe.get(
+            "effective_validation_raw_sample_ids", []
         )
-        if bool(eligible)
     }
+    frozen_validation_ids = {
+        str(value) for value in validation_execution["ordered_raw_sample_ids"]
+    }
+    if not eligible_ids or not eligible_ids.issubset(frozen_validation_ids):
+        raise ContractError(
+            "frozen probe configuration has no valid effective validation cohort"
+        )
     edges = list(EARLY_R2_EDGES)
     expected = {
         (raw_id, edge, family, epsilon)
@@ -4222,6 +4458,10 @@ def _freeze_attack_stage(
         "latent_length": int(args.latent_length),
         "edges": edges,
         "subspace": str(args.subspace),
+        "clean_stability_policy": str(args.clean_stability_policy),
+        "clean_correct_policy": str(args.clean_correct_policy),
+        "validation_tier": str(args.validation_tier),
+        "include_generation": int(args.include_generation),
         "runtime": {
             "role_devices": _resolved_role_devices(args),
             "relay_transfer_mode": str(args.relay_transfer_mode),
@@ -4249,6 +4489,18 @@ def _freeze_attack_stage(
         "probe": {
             "h": float(frozen_probe["selected_h"]),
             "K": int(frozen_probe["K"]),
+            # Post-cast quality rejection is a numerical diagnostic, not a
+            # reason to discard a whole empirical unit.  Freeze a transparent
+            # 75%-of-K floor (at least four directions) before test access.
+            # Certification retains the exact complete-K rule.
+            "minimum_K_eff": (
+                int(frozen_probe["K"])
+                if str(args.validation_tier) == "certification"
+                else min(
+                    int(frozen_probe["K"]),
+                    max(4, math.ceil(0.75 * int(frozen_probe["K"]))),
+                )
+            ),
             "seeds": probe_seeds,
             "primary_seed": primary_probe_seed,
             "acceptance_thresholds": frozen_probe["acceptance_thresholds"],
@@ -4267,6 +4519,27 @@ def _freeze_attack_stage(
             "nonincreasing_realized_curves": len(
                 nonincreasing_realized_curves
             ),
+        },
+        "clean_repeatability": {
+            "source_partition": "validation",
+            "comparison": "screening_to_frozen_clean_capture",
+            "policy": str(args.clean_stability_policy),
+            "clean_correct_policy": str(args.clean_correct_policy),
+            "clean_correct_status_flip_rate": frozen_probe.get(
+                "clean_stability_coverage", {}
+            ).get("clean_correct_status_flip_rate"),
+            "dual_correct_status_flip_rate": frozen_probe.get(
+                "clean_stability_coverage", {}
+            ).get("dual_correct_status_flip_rate"),
+            "generated_choice_flip_rate": frozen_probe.get(
+                "clean_stability_coverage", {}
+            ).get("generated_choice_flip_rate"),
+            "scorer_prediction_flip_rate": frozen_probe.get(
+                "clean_stability_coverage", {}
+            ).get("scorer_prediction_flip_rate"),
+            "comparable_rows": frozen_probe.get(
+                "clean_stability_coverage", {}
+            ).get("scorer_prediction_comparable_rows"),
         },
         "system_identity": validation_system_identity,
         "test_outcomes_accessed_before_freeze": False,
@@ -4294,11 +4567,25 @@ def _freeze_attack_stage(
     else:
         atomic_write_json(output, config, overwrite=True)
 
-    engineering = require_passed_gate(
-        args.engineering_gate, gate_type="engineering_gate"
-    )
-    smoke = require_passed_gate(args.smoke_gate, gate_type="smoke_gate")
     probe_gate = require_passed_gate(args.probe_gate, gate_type="probe_gate")
+    prerequisite_hashes = {
+        "probe_gate_hash": probe_gate["gate_content_hash"],
+        "frozen_attack_config_hash": config["content_hash"],
+        "split_manifest_hash": split_hash,
+        "validation_execution_manifest_hash": validation_execution_hash,
+        "test_execution_manifest_hash": test_execution_hash,
+    }
+    if str(args.validation_tier) == "certification":
+        engineering = require_passed_gate(
+            args.engineering_gate, gate_type="engineering_gate"
+        )
+        smoke = require_passed_gate(args.smoke_gate, gate_type="smoke_gate")
+        prerequisite_hashes.update(
+            {
+                "engineering_gate_hash": engineering["gate_content_hash"],
+                "smoke_gate_hash": smoke["gate_content_hash"],
+            }
+        )
     checks = [
         {"name": "no_test_outcomes_before_freeze", "passed": True},
         {"name": "validation_attack_grid_complete", "passed": True, **grid_report},
@@ -4327,15 +4614,7 @@ def _freeze_attack_stage(
         checks=checks,
         config_hash=str(task["config_key"]),
         source_hash=current_source,
-        prerequisite_hashes={
-            "engineering_gate_hash": engineering["gate_content_hash"],
-            "smoke_gate_hash": smoke["gate_content_hash"],
-            "probe_gate_hash": probe_gate["gate_content_hash"],
-            "frozen_attack_config_hash": config["content_hash"],
-            "split_manifest_hash": split_hash,
-            "validation_execution_manifest_hash": validation_execution_hash,
-            "test_execution_manifest_hash": test_execution_hash,
-        },
+        prerequisite_hashes=prerequisite_hashes,
     )
     gate_path = Path(args.attack_freeze_gate)
     atomic_write_json(gate_path, gate, overwrite=args.overwrite)
@@ -4460,6 +4739,7 @@ def _verify_source_stage_grid(
     *,
     stage: str,
     partition: str,
+    allow_empty: bool = False,
 ) -> dict[str, Any]:
     """Verify the exact current grid for one dataset/R/partition/stage."""
 
@@ -4473,6 +4753,18 @@ def _verify_source_stage_grid(
         and candidate.partition == partition
     ]
     if not expected:
+        if allow_empty:
+            return {
+                "stage": stage,
+                "partition": partition,
+                "passed": True,
+                "expected_count": 0,
+                "compatible_count": 0,
+                "missing_array_indices": [],
+                "stale_array_indices": [],
+                "unexpected_array_indices": [],
+                "disabled": True,
+            }
         raise ContractError(f"the canonical {stage} grid has no {partition} tasks")
     stage_root = (
         _phase_root(args)
@@ -4965,11 +5257,21 @@ def _validate_pgd_target_evidence(
 def _clean_execution_coverage(
     clean_rows: Sequence[Mapping[str, Any]],
     execution_manifest: Mapping[str, Any],
+    *,
+    clean_stability_policy: str = "strict",
 ) -> dict[str, Any]:
     """Bind one fresh clean row, its order, and eligibility to every frozen row."""
 
+    if clean_stability_policy not in {"strict", "empirical"}:
+        raise ContractError(
+            f"unsupported clean stability policy: {clean_stability_policy}"
+        )
+
     expected_ids = [str(value) for value in execution_manifest["ordered_raw_sample_ids"]]
     expected_eligibility = [bool(value) for value in execution_manifest["analysis_eligible"]]
+    clean_correct_policy = str(
+        execution_manifest.get("clean_correct_policy", "dual_correct")
+    )
     boundaries = execution_manifest["batch_boundaries"]
     observed_by_id: dict[str, Mapping[str, Any]] = {}
     observed_by_batch: dict[int, list[str]] = {}
@@ -4996,8 +5298,33 @@ def _clean_execution_coverage(
         row = observed_by_id.get(raw_id)
         if row is None:
             continue
-        if bool(row.get("analysis_eligible", False)) != expected_eligibility[index]:
-            violations.append(f"{raw_id}:eligibility")
+        observed_eligible = bool(row.get("analysis_eligible", False))
+        frozen_eligible = expected_eligibility[index]
+        if clean_stability_policy == "strict":
+            if observed_eligible != frozen_eligible:
+                violations.append(f"{raw_id}:eligibility")
+        elif observed_eligible and not frozen_eligible:
+            violations.append(f"{raw_id}:post_outcome_promotion")
+        elif frozen_eligible and not observed_eligible:
+            if (
+                row.get("clean_stability_policy") != "empirical"
+                or row.get("screening_analysis_eligible") is not True
+                or row.get(
+                    "fresh_clean_correct", row.get("fresh_dual_correct")
+                )
+                is not False
+                or row.get("clean_status_changed") is not True
+                or row.get("analysis_demoted") is not True
+                or row.get("exclusion_reason")
+                != (
+                    "clean_replay_not_forced_margin_correct"
+                    if clean_correct_policy == "forced_margin"
+                    else "clean_replay_not_dual_correct"
+                )
+            ):
+                violations.append(f"{raw_id}:invalid_empirical_demotion")
+        elif bool(row.get("analysis_demoted", False)):
+            violations.append(f"{raw_id}:spurious_empirical_demotion")
         if row.get("ordered_cohort_hash") != execution_manifest.get("ordered_cohort_hash"):
             violations.append(f"{raw_id}:ordered_cohort_hash")
         if row.get("batch_boundary_hash") != execution_manifest.get("batch_boundary_hash"):
@@ -5007,15 +5334,125 @@ def _clean_execution_coverage(
         expected_batch = expected_ids[int(boundary["start"]):int(boundary["stop"])]
         if observed_by_batch.get(batch_id, []) != expected_batch:
             violations.append(f"batch_order:{batch_id}")
+    effective_eligible = sum(
+        bool(row.get("analysis_eligible", False)) for row in observed_by_id.values()
+    )
+    demoted = sum(
+        bool(row.get("analysis_demoted", False)) for row in observed_by_id.values()
+    )
+    status_comparable = sum(
+        row.get(
+            "screening_clean_correct", row.get("screening_dual_correct")
+        )
+        is not None
+        for row in observed_by_id.values()
+    )
+    status_flips = sum(
+        bool(row.get("clean_status_changed", False))
+        for row in observed_by_id.values()
+        if row.get(
+            "screening_clean_correct", row.get("screening_dual_correct")
+        )
+        is not None
+    )
+    dual_status_comparable = sum(
+        row.get("screening_dual_correct") is not None
+        for row in observed_by_id.values()
+    )
+    dual_status_flips = sum(
+        bool(
+            row.get(
+                "dual_correct_status_changed",
+                row.get("clean_status_changed", False),
+            )
+        )
+        for row in observed_by_id.values()
+        if row.get("screening_dual_correct") is not None
+    )
+    generated_comparable = sum(
+        bool(row.get("generated_choice_comparable", False))
+        for row in observed_by_id.values()
+    )
+    generated_flips = sum(
+        bool(row.get("generated_choice_changed", False))
+        for row in observed_by_id.values()
+        if bool(row.get("generated_choice_comparable", False))
+    )
+    scorer_comparable = sum(
+        bool(row.get("scorer_prediction_comparable", False))
+        for row in observed_by_id.values()
+    )
+    scorer_flips = sum(
+        bool(row.get("scorer_prediction_changed", False))
+        for row in observed_by_id.values()
+        if bool(row.get("scorer_prediction_comparable", False))
+    )
     return {
         "name": "fresh_clean_execution_coverage",
         "passed": bool(expected_ids) and not violations,
+        "clean_stability_policy": clean_stability_policy,
+        "clean_correct_policy": clean_correct_policy,
         "observed_rows": len(clean_rows),
         "expected_rows": len(expected_ids),
-        "eligible_rows": sum(expected_eligibility),
+        "frozen_eligible_rows": sum(expected_eligibility),
+        "eligible_rows": effective_eligible,
+        "demoted_rows": demoted,
+        "promoted_rows": sum(
+            bool(row.get("analysis_eligible", False))
+            and not expected_eligibility[index]
+            for index, raw_id in enumerate(expected_ids)
+            if (row := observed_by_id.get(raw_id)) is not None
+        ),
+        "clean_correct_status_comparable_rows": status_comparable,
+        "clean_correct_status_flip_rows": status_flips,
+        "clean_correct_status_flip_rate": (
+            status_flips / status_comparable if status_comparable else None
+        ),
+        "dual_correct_status_comparable_rows": dual_status_comparable,
+        "dual_correct_status_flip_rows": dual_status_flips,
+        "dual_correct_status_flip_rate": (
+            dual_status_flips / dual_status_comparable
+            if dual_status_comparable
+            else None
+        ),
+        "generated_choice_comparable_rows": generated_comparable,
+        "generated_choice_flip_rows": generated_flips,
+        "generated_choice_flip_rate": (
+            generated_flips / generated_comparable
+            if generated_comparable
+            else None
+        ),
+        "scorer_prediction_comparable_rows": scorer_comparable,
+        "scorer_prediction_flip_rows": scorer_flips,
+        "scorer_prediction_flip_rate": (
+            scorer_flips / scorer_comparable if scorer_comparable else None
+        ),
         "violation_count": len(violations),
         "violation_examples": sorted(set(violations))[:20],
     }
+
+
+def _effective_clean_raw_ids(
+    clean_rows: Sequence[Mapping[str, Any]],
+    execution_manifest: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Return effective eligible IDs in frozen order without permitting additions."""
+
+    observed = {
+        str(row.get("raw_sample_id") or ""): bool(
+            row.get("analysis_eligible", False)
+        )
+        for row in clean_rows
+        if str(row.get("raw_sample_id") or "")
+    }
+    return tuple(
+        str(raw_id)
+        for raw_id, frozen_eligible in zip(
+            execution_manifest["ordered_raw_sample_ids"],
+            execution_manifest["analysis_eligible"],
+        )
+        if bool(frozen_eligible) and observed.get(str(raw_id), False)
+    )
 
 
 def _all_clean_scorer_agreement(
@@ -5366,15 +5803,12 @@ def _smoke_validate_stage(
             "version": "linkradius_probe_thresholds_v1",
         },
     )
-    smoke_probe_acceptance = sum(bool(row["accepted"]) for row in smoke_pairs) / len(smoke_pairs)
-    eligible_raw_ids = tuple(
-        str(raw_id)
-        for raw_id, eligible in zip(
-            execution_manifest["ordered_raw_sample_ids"],
-            execution_manifest["analysis_eligible"],
-        )
-        if bool(eligible)
+    smoke_probe_acceptance = (
+        sum(bool(row["accepted"]) for row in smoke_pairs) / len(smoke_pairs)
+        if smoke_pairs
+        else 0.0
     )
+    eligible_raw_ids = _effective_clean_raw_ids(clean, execution_manifest)
     expected_probe_configurations = {
         (raw_id, edge, float(h), int(seed), direction)
         for raw_id in eligible_raw_ids
@@ -5422,13 +5856,15 @@ def _smoke_validate_stage(
     )
 
     eligible_batch_representatives: dict[int, str] = {}
+    effective_id_set = set(eligible_raw_ids)
     for boundary in execution_manifest["batch_boundaries"]:
         start, stop = int(boundary["start"]), int(boundary["stop"])
         for offset in range(start, stop):
-            if bool(execution_manifest["analysis_eligible"][offset]):
-                eligible_batch_representatives[int(boundary["execution_batch_id"])] = str(
-                    execution_manifest["ordered_raw_sample_ids"][offset]
-                )
+            raw_id = str(execution_manifest["ordered_raw_sample_ids"][offset])
+            if raw_id in effective_id_set:
+                eligible_batch_representatives[
+                    int(boundary["execution_batch_id"])
+                ] = raw_id
                 break
     expected_gradient_units = {
         (raw_id, "c2s@1") for raw_id in eligible_batch_representatives.values()
@@ -5464,12 +5900,8 @@ def _smoke_validate_stage(
     ) as handle:
         estimate_rows = list(csv.DictReader(handle))
     expected_primary_units = {
-        (str(raw_id), edge)
-        for raw_id, eligible in zip(
-            execution_manifest["ordered_raw_sample_ids"],
-            execution_manifest["analysis_eligible"],
-        )
-        if bool(eligible)
+        (raw_id, edge)
+        for raw_id in eligible_raw_ids
         for edge in early
     }
     primary_units = {
@@ -5479,10 +5911,39 @@ def _smoke_validate_stage(
         and int(row.get("requested_K", -1)) == int(args.K)
     }
     expected_causal_modes = set(args.interventions.split())
-    clean_coverage = _clean_execution_coverage(clean, execution_manifest)
+    clean_coverage = _clean_execution_coverage(
+        clean,
+        execution_manifest,
+        clean_stability_policy=str(args.clean_stability_policy),
+    )
+    effective_cohort_size = sum(
+        bool(row.get("analysis_eligible")) for row in clean
+    )
+    frozen_cohort_size = sum(
+        bool(value) for value in execution_manifest["analysis_eligible"]
+    )
+    cohort_size_passed = (
+        10 <= effective_cohort_size <= 20
+        if args.clean_stability_policy == "strict"
+        else 10 <= frozen_cohort_size <= 20
+        and 0 < effective_cohort_size <= frozen_cohort_size
+    )
+    certification_tier = str(args.validation_tier) == "certification"
+    generation_agreement_meets_threshold = (
+        scorer_agreement["total_clean_rows"] > 0
+        and scorer_agreement["agreement_all_rows"]
+        >= args.minimum_scorer_agreement
+    )
     checks = [
         clean_coverage,
-        {"name": "dual_correct_cohort_size", "passed": 10 <= sum(bool(row.get("analysis_eligible")) for row in clean) <= 20},
+        {
+            "name": "clean_correct_cohort_size",
+            "passed": cohort_size_passed,
+            "frozen": frozen_cohort_size,
+            "effective": effective_cohort_size,
+            "policy": args.clean_stability_policy,
+            "clean_correct_policy": args.clean_correct_policy,
+        },
         {"name": "early_causal_grid", "passed": bool(complete_causal) and {row.get("edge_id") for row in complete_causal} == early and {row.get("intervention_mode") for row in complete_causal} == expected_causal_modes},
         {"name": "early_probe_grid", "passed": {row.get("edge_id") for row in probes if row.get("record_type") == "sample"} == early},
         {"name": "eligible_probe_configuration_coverage", "passed": actual_probe_configurations == expected_probe_configurations and len(smoke_pairs) == len(expected_probe_configurations), "observed": len(smoke_pairs), "expected": len(expected_probe_configurations)},
@@ -5492,25 +5953,40 @@ def _smoke_validate_stage(
         {"name": "terminal_relaxed_autograd_cast_survival", "passed": bool(cast_surviving_gradients) and len(cast_surviving_gradients) == len(terminal_gradients), "successful": len(cast_surviving_gradients), "total": len(terminal_gradients)},
         {"name": "independent_random_attack_grid", "passed": actual_random_units == expected_random_units and random_unit_count == len(expected_random_units), "observed": random_unit_count, "expected": len(expected_random_units)},
         {"name": "autograd_pgd_success", "passed": actual_pgd_units == expected_pgd_units and len(pgd_rows) == len(expected_pgd_units) and not unsupported_pgd and len(valid_pgd) == len(pgd_rows), "successful": len(valid_pgd), "total": len(pgd_rows), "expected": len(expected_pgd_units), "unsupported": len(unsupported_pgd)},
-        {"name": "scorer_generated_agreement", "passed": scorer_agreement["total_clean_rows"] > 0 and scorer_agreement["agreement_all_rows"] >= args.minimum_scorer_agreement, **scorer_agreement, "minimum_all_row_agreement": args.minimum_scorer_agreement},
+        {
+            "name": "scorer_generated_agreement",
+            "passed": (
+                generation_agreement_meets_threshold
+                if certification_tier
+                else True
+            ),
+            "blocking": certification_tier,
+            "meets_diagnostic_threshold": generation_agreement_meets_threshold,
+            **scorer_agreement,
+            "minimum_all_row_agreement": args.minimum_scorer_agreement,
+        },
         *[
             {"name": f"exact_grid:{report['stage']}", **{key: value for key, value in report.items() if key not in {"stage"}}}
             for report in grid_checks
         ],
         *provenance_checks,
     ]
+    prerequisite_hashes = {
+        "split_manifest_hash": split_hash,
+        "execution_manifest_hash": execution_hash,
+        "ordered_cohort_hash": execution_manifest["ordered_cohort_hash"],
+        "batch_boundary_hash": execution_manifest["batch_boundary_hash"],
+    }
+    if certification_tier:
+        prerequisite_hashes["engineering_gate_hash"] = require_passed_gate(
+            args.engineering_gate, gate_type="engineering_gate"
+        )["gate_content_hash"]
     gate = make_gate(
         gate_type="smoke_gate",
         checks=checks,
         config_hash=str(task["config_key"]),
         source_hash=current_source_hash,
-        prerequisite_hashes={
-            "engineering_gate_hash": require_passed_gate(args.engineering_gate, gate_type="engineering_gate")["gate_content_hash"],
-            "split_manifest_hash": split_hash,
-            "execution_manifest_hash": execution_hash,
-            "ordered_cohort_hash": execution_manifest["ordered_cohort_hash"],
-            "batch_boundary_hash": execution_manifest["batch_boundary_hash"],
-        },
+        prerequisite_hashes=prerequisite_hashes,
     )
     gate_path = Path(args.smoke_gate)
     atomic_write_json(gate_path, gate, overwrite=args.overwrite)
@@ -5574,8 +6050,28 @@ def _freeze_probe_stage(
         repo_root,
         stage="gradient",
         partition="validation",
+        allow_empty=(
+            str(args.validation_tier) == "empirical"
+            and int(args.gradient_reference_batches) == 0
+        ),
+    )
+    clean_grid = _verify_source_stage_grid(
+        args,
+        task,
+        repo_root,
+        stage="clean",
+        partition="validation",
     )
     expected_source = _cached_source_hash(args, repo_root)
+    clean_rows = [
+        row
+        for row in _completed_rows(
+            root / "validation" / "clean",
+            "clean_baseline.jsonl",
+            expected_source_hash=expected_source,
+        )
+        if row.get("record_type") == "sample"
+    ]
     probe_rows = _completed_rows(root / "validation" / "probe_calibration", "probe_runs.jsonl", expected_source_hash=expected_source)
     causal_rows = [
         row
@@ -5593,18 +6089,23 @@ def _freeze_probe_stage(
     _, execution_manifest, execution_hash = _authenticated_execution_manifest(
         args, "validation", task, repo_root
     )
-    eligible_raw_ids = tuple(
-        str(raw_id)
-        for raw_id, eligible in zip(
-            execution_manifest["ordered_raw_sample_ids"],
-            execution_manifest["analysis_eligible"],
+    clean_coverage = _clean_execution_coverage(
+        clean_rows,
+        execution_manifest,
+        clean_stability_policy=str(args.clean_stability_policy),
+    )
+    if not clean_coverage["passed"]:
+        raise ContractError(
+            f"freeze_probe clean execution coverage failed: {clean_coverage}"
         )
-        if bool(eligible)
-    )
-    expected_edges = tuple(
-        f"{site}@{round_idx}"
-        for site, round_idx in canonical_edge_pairs(int(task["R"]))
-    )
+    eligible_raw_ids = _effective_clean_raw_ids(clean_rows, execution_manifest)
+    if not eligible_raw_ids:
+        raise ContractError(
+            "freeze_probe has no effective clean-eligible validation rows"
+        )
+    if int(task["R"]) != 2:
+        raise ContractError("the empirical probe pilot is frozen at R=2")
+    expected_edges = tuple(EARLY_R2_EDGES)
     expected_probe_configurations = tuple(
         (edge, float(h), int(seed), direction)
         for edge in expected_edges
@@ -5672,6 +6173,24 @@ def _freeze_probe_stage(
         [*probe_rows, *causal_rows, *gradient_rows],
         where="Phase-3 validation evidence",
     )
+    gradient_reference_units = sorted(
+        {
+            (str(row["raw_sample_id"]), str(row["edge_id"]))
+            for row in gradient_rows
+            if row.get("record_type") == "gradient"
+        }
+    )
+    gradient_reference = {
+        "selection": "frozen_execution_order_prefix",
+        "maximum_execution_batches": int(args.gradient_reference_batches),
+        "units": [
+            {"raw_sample_id": raw_id, "edge_id": edge_id}
+            for raw_id, edge_id in gradient_reference_units
+        ],
+    }
+    gradient_reference["content_hash"] = content_hash(
+        gradient_reference, domain="linkradius:gradient_reference_subset:v1"
+    )
     config = {
         "schema_version": "linkradius.frozen_probe_config.v1",
         "dataset": task["dataset"],
@@ -5704,6 +6223,7 @@ def _freeze_probe_stage(
         "acceptance_thresholds": calibration["acceptance_thresholds"],
         "probe_calibration": calibration,
         "probe_autograd_agreement": autograd_agreement,
+        "gradient_reference": gradient_reference,
         "causally_useful_edge_rule": causal_rule,
         "causal_positive_control_required": not bool(
             causal_rule.get("useful_edges")
@@ -5729,6 +6249,12 @@ def _freeze_probe_stage(
         "validation_execution_manifest_hash": execution_hash,
         "validation_ordered_cohort_hash": execution_manifest["ordered_cohort_hash"],
         "validation_batch_boundary_hash": execution_manifest["batch_boundary_hash"],
+        "clean_stability_policy": str(args.clean_stability_policy),
+        "clean_correct_policy": str(args.clean_correct_policy),
+        "validation_tier": str(args.validation_tier),
+        "include_generation": int(args.include_generation),
+        "clean_stability_coverage": clean_coverage,
+        "effective_validation_raw_sample_ids": list(eligible_raw_ids),
         "validation_probe_evidence_hash": _probe_evidence_hash(probe_rows),
         "validation_causal_evidence_hash": content_hash(
             sorted(causal_rows, key=lambda row: str(row.get("run_id"))),
@@ -5737,6 +6263,7 @@ def _freeze_probe_stage(
         "probe_grid_verification": probe_grid,
         "causal_grid_verification": causal_grid,
         "gradient_grid_verification": gradient_grid,
+        "clean_grid_verification": clean_grid,
         "validation_probe_provenance": provenance,
         "validation_causal_provenance": causal_provenance,
     }
@@ -5784,6 +6311,11 @@ def _validate_probe_stage(
             repo_root,
             stage=stage,
             partition="validation",
+            allow_empty=(
+                stage == "gradient"
+                and str(args.validation_tier) == "empirical"
+                and int(args.gradient_reference_batches) == 0
+            ),
         )
         for stage in ("clean", "causal", "probe_calibration", "gradient")
     ]
@@ -5799,14 +6331,12 @@ def _validate_probe_stage(
     _, execution_manifest, execution_hash = _authenticated_execution_manifest(
         args, "validation", task, repo_root
     )
-    eligible_raw_ids = tuple(
-        str(raw_id)
-        for raw_id, eligible in zip(
-            execution_manifest["ordered_raw_sample_ids"],
-            execution_manifest["analysis_eligible"],
-        )
-        if bool(eligible)
+    clean_coverage = _clean_execution_coverage(
+        clean,
+        execution_manifest,
+        clean_stability_policy=str(args.clean_stability_policy),
     )
+    eligible_raw_ids = _effective_clean_raw_ids(clean, execution_manifest)
     expected_probe_configurations = tuple(
         (str(edge), float(h), int(seed), direction)
         for edge in frozen["grid_edges"]
@@ -5864,6 +6394,22 @@ def _validate_probe_stage(
         if gradient_rows
         else 0.0
     )
+    gradient_reference = {
+        "selection": "frozen_execution_order_prefix",
+        "maximum_execution_batches": int(args.gradient_reference_batches),
+        "units": [
+            {"raw_sample_id": raw_id, "edge_id": edge_id}
+            for raw_id, edge_id in sorted(
+                {
+                    (str(row["raw_sample_id"]), str(row["edge_id"]))
+                    for row in gradient_rows
+                }
+            )
+        ],
+    }
+    gradient_reference["content_hash"] = content_hash(
+        gradient_reference, domain="linkradius:gradient_reference_subset:v1"
+    )
     criteria = frozen["stability_criteria"]
     gate_criteria = frozen["gate_criteria"]
     frozen_causal_rule = frozen["causally_useful_edge_rule"]
@@ -5886,6 +6432,46 @@ def _validate_probe_stage(
         selected_h=float(frozen["selected_h"]),
         selected_K=int(frozen["K"]),
     )
+    certification_tier = str(args.validation_tier) == "certification"
+    generation_agreement_meets_threshold = (
+        scorer_agreement["total_clean_rows"] > 0
+        and scorer_agreement["agreement_all_rows"]
+        >= float(gate_criteria["minimum_scorer_agreement"])
+    )
+    autograd_reference_meets_threshold = (
+        bool(finite_difference_rows)
+        and autograd_agreement
+        >= float(gate_criteria["minimum_autograd_agreement"])
+    )
+    probe_autograd_meets_threshold = (
+        probe_autograd.get("content_hash")
+        == frozen.get("probe_autograd_agreement", {}).get("content_hash")
+        and int(probe_autograd.get("comparison_count", 0))
+        >= int(criteria["minimum_comparisons_per_dimension"])
+        and float(probe_autograd.get("usable_finite_difference_coverage", 0.0))
+        >= float(gate_criteria["minimum_autograd_agreement"])
+        and float(probe_autograd.get("matched_gradient_coverage", 0.0))
+        >= float(gate_criteria["minimum_autograd_agreement"])
+        and probe_autograd.get("median_relative_error") is not None
+        and float(probe_autograd["median_relative_error"])
+        <= float(criteria["maximum_probe_autograd_relative_error"])
+    )
+    autograd_attempted = bool(gradient_rows)
+    raw_stability_checks = stability_checks(
+        calibration["stability"],
+        minimum_rank_correlation=float(criteria["minimum_rank_correlation"]),
+        minimum_binding_agreement=float(criteria["minimum_binding_agreement"]),
+        minimum_comparisons=int(criteria["minimum_comparisons_per_dimension"]),
+    )
+    stability_gate_checks = [
+        {
+            **check,
+            "passed": bool(check["passed"]) if certification_tier else True,
+            "blocking": certification_tier,
+            "meets_diagnostic_threshold": bool(check["passed"]),
+        }
+        for check in raw_stability_checks
+    ]
     checks = [
         {"name": "frozen_config_hash", "passed": True, "hash": expected_hash},
         {"name": "no_test_access", "passed": True},
@@ -5896,13 +6482,36 @@ def _validate_probe_stage(
             and frozen.get("validation_ordered_cohort_hash")
             == execution_manifest.get("ordered_cohort_hash")
             and frozen.get("validation_batch_boundary_hash")
-            == execution_manifest.get("batch_boundary_hash"),
+            == execution_manifest.get("batch_boundary_hash")
+            and frozen.get("clean_stability_policy")
+            == str(args.clean_stability_policy)
+            and frozen.get("clean_correct_policy")
+            == str(args.clean_correct_policy)
+            and frozen.get("validation_tier") == str(args.validation_tier)
+            and int(frozen.get("include_generation", 1))
+            == int(args.include_generation)
+            and list(frozen.get("effective_validation_raw_sample_ids", []))
+            == list(eligible_raw_ids),
+            "clean_stability_policy": args.clean_stability_policy,
+            "clean_correct_policy": args.clean_correct_policy,
+            "validation_tier": args.validation_tier,
+            "include_generation": int(args.include_generation),
+            "effective_validation_rows": len(eligible_raw_ids),
         },
-        _clean_execution_coverage(clean, execution_manifest),
+        clean_coverage,
         {
             "name": "validation_probe_evidence_identity",
             "passed": frozen.get("validation_probe_evidence_hash")
             == _probe_evidence_hash(probe_rows),
+        },
+        {
+            "name": "gradient_reference_subset_reproduced",
+            "passed": gradient_reference
+            == frozen.get("gradient_reference"),
+            "unit_count": len(gradient_reference["units"]),
+            "maximum_execution_batches": int(
+                args.gradient_reference_batches
+            ),
         },
         {
             "name": "validation_calibration_reproduced",
@@ -5925,30 +6534,58 @@ def _validate_probe_stage(
                 causal_rule.get("useful_edges")
             ),
         },
-        {"name": "scorer_generation_agreement", "passed": scorer_agreement["total_clean_rows"] > 0 and scorer_agreement["agreement_all_rows"] >= float(gate_criteria["minimum_scorer_agreement"]), **scorer_agreement, "minimum_all_row_agreement": float(gate_criteria["minimum_scorer_agreement"])},
+        {
+            "name": "causal_use_identified",
+            # A negative RQ0 result is reportable and does not invalidate a
+            # held-out predictive-association experiment.  It does prevent a
+            # causal interpretation unless the positive control is added.
+            "passed": bool(causal_rule.get("useful_edges"))
+            if certification_tier
+            else True,
+            "blocking": certification_tier,
+            "signal_found": bool(causal_rule.get("useful_edges")),
+            "useful_edges": list(causal_rule.get("useful_edges", [])),
+            "interpretation": (
+                "continue_to_failure_boundary"
+                if causal_rule.get("useful_edges")
+                else "report_negative_causal_audit_and_treat_failure_boundary_"
+                "results_as_predictive_association_unless_positive_control_passes"
+            ),
+        },
+        {
+            "name": "scorer_generation_agreement",
+            "passed": generation_agreement_meets_threshold
+            if certification_tier
+            else True,
+            "blocking": certification_tier,
+            "meets_diagnostic_threshold": generation_agreement_meets_threshold,
+            **scorer_agreement,
+            "minimum_all_row_agreement": float(
+                gate_criteria["minimum_scorer_agreement"]
+            ),
+        },
         identity_check,
         {"name": "probe_acceptance", "passed": bool(pair_rows) and acceptance >= float(gate_criteria["minimum_probe_acceptance"]), "acceptance": acceptance, "n": len(pair_rows)},
         {
             "name": "autograd_reference_agreement",
-            "passed": bool(finite_difference_rows)
-            and autograd_agreement >= float(gate_criteria["minimum_autograd_agreement"]),
+            "passed": autograd_reference_meets_threshold
+            if certification_tier
+            else True,
+            "blocking": certification_tier,
+            "attempted": autograd_attempted,
+            "meets_diagnostic_threshold": autograd_reference_meets_threshold,
             "agreement": autograd_agreement,
             "usable": len(finite_difference_rows),
             "total": len(gradient_rows),
         },
         {
             "name": "probe_susceptibility_autograd_agreement",
-            "passed": probe_autograd.get("content_hash")
-            == frozen.get("probe_autograd_agreement", {}).get("content_hash")
-            and int(probe_autograd.get("comparison_count", 0))
-            >= int(criteria["minimum_comparisons_per_dimension"])
-            and float(probe_autograd.get("usable_finite_difference_coverage", 0.0))
-            >= float(gate_criteria["minimum_autograd_agreement"])
-            and float(probe_autograd.get("matched_gradient_coverage", 0.0))
-            >= float(gate_criteria["minimum_autograd_agreement"])
-            and probe_autograd.get("median_relative_error") is not None
-            and float(probe_autograd["median_relative_error"])
-            <= float(criteria["maximum_probe_autograd_relative_error"]),
+            "passed": probe_autograd_meets_threshold
+            if certification_tier
+            else True,
+            "blocking": certification_tier,
+            "attempted": autograd_attempted,
+            "meets_diagnostic_threshold": probe_autograd_meets_threshold,
             "comparison_count": probe_autograd.get("comparison_count", 0),
             "total_gradient_rows": probe_autograd.get("total_gradient_rows", 0),
             "usable_finite_difference_coverage": probe_autograd.get("usable_finite_difference_coverage", 0.0),
@@ -5961,29 +6598,32 @@ def _validate_probe_stage(
             for report in grid_checks
         ],
         *provenance_checks,
-        *stability_checks(
-            calibration["stability"],
-            minimum_rank_correlation=float(criteria["minimum_rank_correlation"]),
-            minimum_binding_agreement=float(criteria["minimum_binding_agreement"]),
-            minimum_comparisons=int(criteria["minimum_comparisons_per_dimension"]),
-        ),
+        *stability_gate_checks,
     ]
-    engineering = require_passed_gate(args.engineering_gate, gate_type="engineering_gate")
-    smoke = require_passed_gate(args.smoke_gate, gate_type="smoke_gate")
+    prerequisite_hashes = {
+        "frozen_config_hash": expected_hash,
+        "split_manifest_hash": split_hash,
+        "execution_manifest_hash": execution_hash,
+        "ordered_cohort_hash": execution_manifest["ordered_cohort_hash"],
+        "batch_boundary_hash": execution_manifest["batch_boundary_hash"],
+    }
+    if str(args.validation_tier) == "certification":
+        engineering = require_passed_gate(
+            args.engineering_gate, gate_type="engineering_gate"
+        )
+        smoke = require_passed_gate(args.smoke_gate, gate_type="smoke_gate")
+        prerequisite_hashes.update(
+            {
+                "engineering_gate_hash": engineering["gate_content_hash"],
+                "smoke_gate_hash": smoke["gate_content_hash"],
+            }
+        )
     gate = make_gate(
         gate_type="probe_gate",
         checks=checks,
         config_hash=str(task["config_key"]),
         source_hash=current_source_hash,
-        prerequisite_hashes={
-            "engineering_gate_hash": engineering["gate_content_hash"],
-            "smoke_gate_hash": smoke["gate_content_hash"],
-            "frozen_config_hash": expected_hash,
-            "split_manifest_hash": split_hash,
-            "execution_manifest_hash": execution_hash,
-            "ordered_cohort_hash": execution_manifest["ordered_cohort_hash"],
-            "batch_boundary_hash": execution_manifest["batch_boundary_hash"],
-        },
+        prerequisite_hashes=prerequisite_hashes,
     )
     gate_path = Path(args.probe_gate)
     atomic_write_json(gate_path, gate, overwrite=args.overwrite)
@@ -6085,13 +6725,30 @@ def _smoke_estimate_stage(
     execution_path = _execution_manifest_path(args, "validation", task)
     if not execution_path:
         raise ContractError("smoke estimate requires the validation execution manifest")
-    execution = load_json(execution_path)
-    expected_units = {
-        (str(raw_id), edge)
-        for raw_id, eligible in zip(
-            execution["ordered_raw_sample_ids"], execution["analysis_eligible"]
+    _, execution, _ = _authenticated_execution_manifest(
+        args, "validation", task, repo_root
+    )
+    clean_rows = [
+        row
+        for row in _completed_rows(
+            root / "validation" / "clean",
+            "clean_baseline.jsonl",
+            expected_source_hash=_cached_source_hash(args, repo_root),
         )
-        if bool(eligible)
+        if row.get("record_type") == "sample"
+    ]
+    clean_coverage = _clean_execution_coverage(
+        clean_rows,
+        execution,
+        clean_stability_policy=str(args.clean_stability_policy),
+    )
+    if not clean_coverage["passed"]:
+        raise ContractError(
+            f"smoke estimate clean execution coverage failed: {clean_coverage}"
+        )
+    expected_units = {
+        (raw_id, edge)
+        for raw_id in _effective_clean_raw_ids(clean_rows, execution)
         for edge in ("p2c@0", "c2s@0", "s2p@0")
     }
     observed_units = {
@@ -6210,7 +6867,7 @@ def _pilot_aggregate_stage(
     )
     if probe_gate.get("frozen_config_hash") != frozen.get("content_hash"):
         raise ContractError("pilot aggregate probe gate/config hashes differ")
-    for stage in ("causal", "probe_calibration"):
+    for stage in ("clean", "causal", "probe_calibration"):
         _verify_source_stage_grid(
             args,
             task,
@@ -6219,20 +6876,31 @@ def _pilot_aggregate_stage(
             partition="validation",
         )
     root = _phase_root(args) / str(task["dataset"]) / f"R{int(task['R'])}" / "validation"
-    edges = tuple(
-        f"{site}@{round_idx}" for site, round_idx in canonical_edge_pairs(int(task["R"]))
-    )
+    if int(task["R"]) != 2:
+        raise ContractError("the empirical probe pilot is frozen at R=2")
+    edges = tuple(EARLY_R2_EDGES)
     _, execution_manifest, _ = _authenticated_execution_manifest(
         args, "validation", task, repo_root
     )
-    eligible_raw_ids = tuple(
-        str(raw_id)
-        for raw_id, eligible in zip(
-            execution_manifest["ordered_raw_sample_ids"],
-            execution_manifest["analysis_eligible"],
+    clean_rows = [
+        row
+        for row in _completed_rows(
+            root / "clean",
+            "clean_baseline.jsonl",
+            expected_source_hash=_cached_source_hash(args, repo_root),
         )
-        if bool(eligible)
+        if row.get("record_type") == "sample"
+    ]
+    clean_coverage = _clean_execution_coverage(
+        clean_rows,
+        execution_manifest,
+        clean_stability_policy=str(args.clean_stability_policy),
     )
+    if not clean_coverage["passed"]:
+        raise ContractError(
+            f"pilot aggregate clean execution coverage failed: {clean_coverage}"
+        )
+    eligible_raw_ids = _effective_clean_raw_ids(clean_rows, execution_manifest)
     causal = eligible_complete_causal_rows(
         _completed_rows(root / "causal", "causal_runs.jsonl", expected_source_hash=_cached_source_hash(args, repo_root)),
         expected_edges=edges,
@@ -6661,6 +7329,7 @@ def _aggregate_verify_stage(
             batch_size=args.batch_size,
             latent_length=args.latent_length,
             discovery_batches=args.discovery_batches,
+            gradient_reference_batches=args.gradient_reference_batches,
             runner_config_hash=_runner_config_digest(
                 args,
                 workflow=args.aggregate_phase,
@@ -6807,8 +7476,8 @@ def _aggregate_cpu_stage(
             )
         ]
         expected_edges = (
-            ("p2c@0", "c2s@0", "s2p@0")
-            if args.aggregate_phase == "smoke"
+            tuple(EARLY_R2_EDGES)
+            if args.aggregate_phase in {"smoke", "pilot"}
             else tuple(
                 f"{site}@{round_idx}"
                 for site, round_idx in canonical_edge_pairs(int(task["R"]))
@@ -6950,7 +7619,7 @@ def _aggregate_cpu_stage(
             {**provenance, "metric": "scorer_generated_agreement_comparable", "value": agreement["agreement"] if agreement["comparable_rows"] else None, "n": agreement["comparable_rows"]},
             {**provenance, "metric": "scorer_generated_agreement_all_rows", "value": agreement["agreement_all_rows"], "n": agreement["total_clean_rows"]},
             {**provenance, "metric": "scorer_generated_comparable_coverage", "value": agreement["comparable_coverage"], "n": agreement["total_clean_rows"]},
-            {**provenance, "metric": "dual_correct_rows", "value": sum(bool(row.get("analysis_eligible", False)) for row in clean), "n": len(clean)},
+            {**provenance, "metric": "selected_clean_correct_rows", "value": sum(bool(row.get("analysis_eligible", False)) for row in clean), "n": len(clean)},
             {**provenance, "metric": "analysis_excluded_rows", "value": agreement["analysis_ineligible_rows"], "n": len(clean)},
             {**provenance, "metric": "invalid_generation_rows", "value": agreement["invalid_generation_rows"], "n": len(clean)},
             {**provenance, "metric": "scorer_tie_or_invalid_rows", "value": agreement["scorer_tie_or_invalid_rows"], "n": len(clean)},
@@ -7031,8 +7700,10 @@ def _read_csv_rows(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
-def _fresh_dual_correct_ids(
+def _fresh_clean_correct_ids(
     clean_rows: Sequence[Mapping[str, Any]],
+    *,
+    clean_correct_policy: str,
 ) -> set[str]:
     from .select_clean_correct import classify_screening_row
 
@@ -7040,7 +7711,9 @@ def _fresh_dual_correct_ids(
         str(row["raw_sample_id"])
         for row in clean_rows
         if row.get("record_type") == "sample"
-        and classify_screening_row(row)[0]
+        and classify_screening_row(
+            row, clean_correct_policy=clean_correct_policy
+        )[0]
     }
 
 
@@ -7072,10 +7745,13 @@ def _attack_threshold_stage(
         "clean_baseline.jsonl",
         expected_source_hash=_cached_source_hash(args, repo_root),
     )
-    eligible_ids = _fresh_dual_correct_ids(clean_rows)
+    eligible_ids = _fresh_clean_correct_ids(
+        clean_rows, clean_correct_policy=str(args.clean_correct_policy)
+    )
     if not eligible_ids:
         raise ContractError(
-            "held-out test contains no fresh dual-correct rows for boundary analysis"
+            "held-out test contains no fresh clean-correct rows under the "
+            f"{args.clean_correct_policy} policy for boundary analysis"
         )
     attack_rows = [
         row
@@ -7222,6 +7898,10 @@ def _attack_analyze_stage(
         selected_h=float(frozen["probe"]["h"]),
         probe_seeds=[int(value) for value in frozen["probe"]["seeds"]],
         probe_acceptance_thresholds=frozen["probe"]["acceptance_thresholds"],
+        clean_correct_policy=str(frozen["clean_correct_policy"]),
+        minimum_K_eff=int(
+            frozen["probe"].get("minimum_K_eff", frozen["probe"]["K"])
+        ),
     )
     frozen_probe_seeds = tuple(int(value) for value in frozen["probe"]["seeds"])
     units = [dict(row) for row in assembly["prediction_units"]]
@@ -7440,6 +8120,22 @@ def _attack_analyze_stage(
         )
 
     flip_metrics: list[dict[str, Any]] = []
+    clean_repeatability = frozen.get("clean_repeatability", {})
+    raw_noise_floor = (
+        clean_repeatability.get("scorer_prediction_flip_rate")
+        if isinstance(clean_repeatability, Mapping)
+        else None
+    )
+    clean_flip_floor = (
+        None if raw_noise_floor is None else float(raw_noise_floor)
+    )
+    if clean_flip_floor is not None and (
+        not math.isfinite(clean_flip_floor)
+        or not 0.0 <= clean_flip_floor <= 1.0
+    ):
+        raise ContractError(
+            "frozen clean-repeat scorer flip floor must lie in [0,1]"
+        )
     for probe_seed in frozen_probe_seeds:
         seed_units = [
             row for row in units if int(row["probe_seed"]) == probe_seed
@@ -7447,7 +8143,28 @@ def _attack_analyze_stage(
         for metric in family_budget_metrics(
             seed_units, radius_field="metric_edge_radius"
         ):
-            flip_metrics.append({"probe_seed": probe_seed, **metric})
+            flip_rate = (
+                int(metric["positives"]) / int(metric["n"])
+                if int(metric["n"])
+                else math.nan
+            )
+            excess = (
+                None
+                if clean_flip_floor is None
+                else flip_rate - clean_flip_floor
+            )
+            flip_metrics.append(
+                {
+                    "probe_seed": probe_seed,
+                    **metric,
+                    "raw_flip_rate": flip_rate,
+                    "validation_clean_flip_floor": clean_flip_floor,
+                    "excess_flip_rate": excess,
+                    "clipped_excess_flip_rate": (
+                        None if excess is None else max(0.0, excess)
+                    ),
+                }
+            )
     threshold_metrics: list[dict[str, Any]] = []
     frozen_edge_set = {str(value) for value in frozen["edges"]}
 
@@ -7975,6 +8692,13 @@ def _attack_analyze_stage(
     evaluated_raw_examples = len(common_evaluated_raw_ids)
     scientific_support = {
         "minimum_support": minimum_support,
+        "clean_repeatability_floor_available": clean_flip_floor is not None,
+        "clean_repeatability_floor_required": False,
+        "clean_repeatability_comparable_rows": (
+            clean_repeatability.get("comparable_rows")
+            if isinstance(clean_repeatability, Mapping)
+            else None
+        ),
         "evaluated_raw_examples": evaluated_raw_examples,
         "evaluated_raw_examples_per_seed": {
             seed: len(values)
@@ -7998,6 +8722,8 @@ def _attack_analyze_stage(
         "probe_seed_bootstrap_strategy": (
             "raw_id_cluster_bootstrap_of_equal_seed_mean"
         ),
+        "clean_repeatability": clean_repeatability,
+        "validation_clean_flip_floor": clean_flip_floor,
         "eligible_raw_sample_count": len(assembly["eligible_raw_sample_ids"]),
         "evaluated_raw_sample_count": evaluated_raw_examples,
         "any_seed_evaluated_raw_sample_count": len(
@@ -8078,7 +8804,11 @@ def _attack_validate_stage(
         )
         if row.get("record_type") == "sample"
     ]
-    coverage = _clean_execution_coverage(clean_rows, execution)
+    coverage = _clean_execution_coverage(
+        clean_rows,
+        execution,
+        clean_stability_policy=str(args.clean_stability_policy),
+    )
     if not coverage["passed"]:
         raise ContractError(f"held-out clean execution coverage failed: {coverage}")
     if _common_system_identity(
@@ -8303,6 +9033,44 @@ def build_parser() -> argparse.ArgumentParser:
             "non-reentrant activation recomputation"
         ),
     )
+    parser.add_argument(
+        "--clean-stability-policy",
+        choices=("strict", "empirical"),
+        default="strict",
+        help=(
+            "strict rejects clean rerun status changes; empirical records them "
+            "and only demotes unstable frozen-eligible rows"
+        ),
+    )
+    parser.add_argument(
+        "--clean-correct-policy",
+        choices=("forced_margin", "dual_correct"),
+        default="dual_correct",
+        help=(
+            "analysis cohort endpoint: forced_margin follows the theorem and "
+            "requires finite positive forced-choice margins; dual_correct additionally "
+            "requires the free-form generated answer to be correct"
+        ),
+    )
+    parser.add_argument(
+        "--validation-tier",
+        choices=("empirical", "certification"),
+        default="certification",
+        help=(
+            "empirical runs enforce scientific split/probe/attack controls but "
+            "do not require release-equivalence engineering gates"
+        ),
+    )
+    parser.add_argument(
+        "--include-generation",
+        type=int,
+        choices=(0, 1),
+        default=1,
+        help=(
+            "run ordinary free-form generation during clean capture; forced "
+            "option scoring and LinkRadius do not require it"
+        ),
+    )
     parser.add_argument("--trust-remote-code", type=int, choices=(0, 1), default=1)
     parser.add_argument("--round-label-mode", choices=("legacy", "actual"), default="legacy")
     parser.add_argument("--out-root", default="outputs/linkradius")
@@ -8499,6 +9267,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     args.reuse_complete = bool(args.reuse_complete)
     args.retain_all_partition_rows = bool(args.retain_all_partition_rows)
     args.dataset_runtime = args.datasets.split()[0]
+    if args.workflow == "engineering" and (
+        args.clean_correct_policy != "dual_correct"
+        or args.clean_stability_policy != "strict"
+        or args.validation_tier != "certification"
+        or int(args.include_generation) != 1
+    ):
+        raise ContractError(
+            "engineering equivalence requires CLEAN_CORRECT_POLICY=dual_correct, "
+            "CLEAN_STABILITY_POLICY=strict, VALIDATION_TIER=certification, "
+            "and INCLUDE_GENERATION=1"
+        )
+    if (
+        args.clean_stability_policy == "empirical"
+        and args.workflow not in {"smoke", "pilot", "attacks", "aggregate"}
+    ):
+        raise ContractError(
+            "empirical clean stability is restricted to smoke, pilot, and "
+            "failure-boundary workflows; engineering equivalence remains strict"
+        )
     if args.workflow == "attacks":
         attack_datasets = str(args.datasets).split()
         attack_rounds = [int(value) for value in str(args.rounds).split()]

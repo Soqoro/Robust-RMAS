@@ -20,6 +20,8 @@ PARTITIONS = ("attack_train", "validation", "test")
 EARLY_R2_EDGES = ("p2c@0", "c2s@0", "s2p@0")
 CHOICE_LABELS = ("A", "B", "C", "D")
 PORTABLE_SYSTEM_IDENTITY_VERSION = "linkradius_portable_system_identity_v1"
+CLEAN_CORRECT_POLICIES = ("forced_margin", "dual_correct")
+DEFAULT_CLEAN_CORRECT_POLICY = "forced_margin"
 
 _DERIVED_FLOAT_REL_TOL = 1e-12
 _DERIVED_FLOAT_ABS_TOL = 1e-12
@@ -132,9 +134,51 @@ def validate_execution_manifest(manifest: Mapping[str, Any]) -> None:
     sample_ids = list(manifest["ordered_sample_ids"])
     eligible = list(manifest["analysis_eligible"])
     dual_correct = list(manifest["screening_dual_correct"])
+    has_cohort_policy = "clean_correct_policy" in manifest
+    clean_correct_policy = manifest.get("clean_correct_policy", "dual_correct")
+    if clean_correct_policy not in CLEAN_CORRECT_POLICIES:
+        raise ContractError(
+            "clean_correct_policy must be one of "
+            f"{CLEAN_CORRECT_POLICIES!r}, got: {clean_correct_policy!r}"
+        )
+    if has_cohort_policy and "screening_clean_correct" not in manifest:
+        raise ContractError(
+            "execution manifests declaring clean_correct_policy must record "
+            "screening_clean_correct"
+        )
+    if has_cohort_policy and "screening_forced_margin_correct" not in manifest:
+        raise ContractError(
+            "execution manifests declaring clean_correct_policy must record "
+            "screening_forced_margin_correct"
+        )
+    clean_correct = list(
+        manifest.get(
+            "screening_clean_correct",
+            dual_correct if clean_correct_policy == "dual_correct" else [None] * len(raw_ids),
+        )
+    )
+    forced_margin_correct = list(
+        manifest.get("screening_forced_margin_correct", [None] * len(raw_ids))
+    )
+    generated_choices = list(
+        manifest.get("screening_generated_choices", [None] * len(raw_ids))
+    )
+    scorer_predictions = list(
+        manifest.get("screening_scorer_predictions", [None] * len(raw_ids))
+    )
     reasons = list(manifest["exclusion_reasons"])
     n = len(raw_ids)
-    if not (n == len(sample_ids) == len(eligible) == len(dual_correct) == len(reasons)):
+    if not (
+        n
+        == len(sample_ids)
+        == len(eligible)
+        == len(dual_correct)
+        == len(clean_correct)
+        == len(forced_margin_correct)
+        == len(generated_choices)
+        == len(scorer_predictions)
+        == len(reasons)
+    ):
         raise ContractError("execution row arrays must have identical lengths")
     if len(set(raw_ids)) != n or len(set(sample_ids)) != n:
         raise ContractError("execution manifest contains duplicate raw/sample IDs")
@@ -172,15 +216,55 @@ def validate_execution_manifest(manifest: Mapping[str, Any]) -> None:
         assigned.extend(ids)
     if sorted(assigned) != batch_ids or len(assigned) != len(set(assigned)):
         raise ContractError("array shards must assign each whole execution batch exactly once")
-    for is_eligible, reason in zip(eligible, reasons):
+    for is_eligible, is_clean_correct, reason in zip(
+        eligible, clean_correct, reasons
+    ):
         if not isinstance(is_eligible, bool):
             raise ContractError("analysis_eligible entries must be booleans")
+        if is_clean_correct is False and is_eligible:
+            raise ContractError(
+                "a screening-clean-incorrect row cannot be analysis eligible"
+            )
         if is_eligible and str(reason or "").strip():
             raise ContractError("eligible rows cannot have an exclusion reason")
         if not is_eligible and not str(reason or "").strip():
             raise ContractError("ineligible rows require an explicit exclusion reason")
     if any(value is not None and not isinstance(value, bool) for value in dual_correct):
         raise ContractError("screening_dual_correct entries must be booleans or null for unscreened fillers")
+    if any(value is not None and not isinstance(value, bool) for value in clean_correct):
+        raise ContractError(
+            "screening_clean_correct entries must be booleans or null for unscreened fillers"
+        )
+    if any(
+        value is not None and not isinstance(value, bool)
+        for value in forced_margin_correct
+    ):
+        raise ContractError(
+            "screening_forced_margin_correct entries must be booleans or null "
+            "for unscreened fillers"
+        )
+    selected_status = (
+        forced_margin_correct
+        if clean_correct_policy == "forced_margin"
+        else dual_correct
+    )
+    for index, (selected, recorded) in enumerate(
+        zip(selected_status, clean_correct)
+    ):
+        if selected is not None and recorded is not None and selected != recorded:
+            raise ContractError(
+                "screening_clean_correct disagrees with the selected "
+                f"{clean_correct_policy} endpoint at row {index}"
+            )
+    labels = {"A", "B", "C", "D"}
+    if any(value is not None and value not in labels for value in generated_choices):
+        raise ContractError(
+            "screening_generated_choices entries must be A-D or null"
+        )
+    if any(value is not None and value not in labels for value in scorer_predictions):
+        raise ContractError(
+            "screening_scorer_predictions entries must be A-D or null"
+        )
 
 
 INTERVENTION_REQUIRED_FIELDS = (

@@ -21,6 +21,8 @@ DISCOVERY_BATCHES="${DISCOVERY_BATCHES:-20}"
 K="${K:-8}"
 PROBE_RADII="${PROBE_RADII:-1e-3 3e-3}"
 PROBE_SEEDS="${PROBE_SEEDS:-101}"
+CLEAN_CORRECT_POLICY="${CLEAN_CORRECT_POLICY:-dual_correct}"
+VALIDATION_TIER="${VALIDATION_TIER:-certification}"
 
 lr_entrypoint_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then

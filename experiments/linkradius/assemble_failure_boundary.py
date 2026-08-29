@@ -2,9 +2,10 @@
 
 This module is deliberately CPU-only and does not read artifacts from disk.  A
 caller must authenticate completions before passing their rows here.  The
-assembler then enforces the scientific join contract: freshly dual-correct
-clean examples, one LinkRadius realization per frozen edge and probe seed, and
-exactly one attack outcome per frozen family and requested budget.
+assembler then enforces the scientific join contract: clean examples with an
+eligible, uniquely correct forced scorer and positive finite competitor
+margins; one LinkRadius realization per frozen edge and probe seed; and exactly
+one attack outcome per frozen family and requested budget.
 """
 
 from __future__ import annotations
@@ -15,10 +16,11 @@ from typing import Any, Mapping, Sequence
 
 from .estimate_linkradius import estimate_from_pair_rows
 from .probe_validation import reclassify_probe_pairs
-from .schemas import ContractError
+from .schemas import ContractError, DEFAULT_CLEAN_CORRECT_POLICY
+from .select_clean_correct import classify_screening_row
 
 
-ASSEMBLY_VERSION = "linkradius.failure_boundary_assembly.v2"
+ASSEMBLY_VERSION = "linkradius.failure_boundary_assembly.v4"
 
 # Config hashes are task-specific and therefore intentionally absent.  These
 # fields describe identities that must not change between clean, probe, and
@@ -90,36 +92,16 @@ def _require_matching_provenance(
             raise ContractError(f"{where} provenance mismatch for {field}")
 
 
-def _freshly_dual_correct(row: Mapping[str, Any]) -> bool:
-    """Recompute the clean inclusion predicate from primitive outcomes."""
-
-    if not bool(row.get("analysis_eligible", False)):
-        return False
-    gold = str(row.get("gold") or "")
-    generated = str(row.get("strict_generated_choice") or "")
-    scorer = str(row.get("scorer_prediction") or "")
-    return bool(
-        gold
-        and bool(row.get("strict_generated_valid", False))
-        and not bool(row.get("answer_invalid", False))
-        and not bool(row.get("answer_conflict", False))
-        and generated == gold
-        and row.get("scorer_numerically_valid", True) is not False
-        and not bool(row.get("score_tie", False))
-        and scorer == gold
-    )
-
-
 def _clean_margins(row: Mapping[str, Any]) -> dict[str, float]:
     raw = row.get("margins")
     if not isinstance(raw, Mapping) or not raw:
-        raise ContractError("dual-correct clean rows require competitor margins")
+        raise ContractError("scorer-correct clean rows require competitor margins")
     margins = {
         str(label): _finite(value, field=f"clean margins.{label}")
         for label, value in raw.items()
     }
     if any(value <= 0.0 for value in margins.values()):
-        raise ContractError("dual-correct clean margins must be strictly positive")
+        raise ContractError("scorer-correct clean margins must be strictly positive")
     return margins
 
 
@@ -159,13 +141,17 @@ def assemble_failure_boundary(
     selected_h: float,
     probe_seeds: Sequence[int],
     probe_acceptance_thresholds: Mapping[str, Any] | None = None,
+    clean_correct_policy: str = DEFAULT_CLEAN_CORRECT_POLICY,
+    minimum_K_eff: int | None = None,
 ) -> dict[str, Any]:
     """Build seed-specific prediction and predictor rows for held-out RQ2.
 
     Rows with a non-``sample``/``probe_pair`` record type are treated as shard
-    metadata.  Attack/probe rows for known but non-dual-correct clean examples
-    are excluded; an unknown example or an extra frozen-grid coordinate fails
-    closed.
+    metadata.  Attack/probe rows for known examples without an eligible,
+    uniquely correct forced scorer and positive finite competitor margins are
+    excluded; an unknown example or an extra frozen-grid coordinate fails
+    closed.  Free-form generation fields are retained upstream as diagnostics
+    but do not determine this forced-margin analysis cohort.
     """
 
     edges = tuple(str(value).strip() for value in frozen_edges)
@@ -187,6 +173,13 @@ def assemble_failure_boundary(
     ):
         raise ContractError("frozen failure-boundary configuration is invalid")
     K = int(requested_K)
+    min_K_eff = K if minimum_K_eff is None else int(minimum_K_eff)
+    if (
+        isinstance(minimum_K_eff, bool)
+        or min_K_eff < 1
+        or min_K_eff > K
+    ):
+        raise ContractError("minimum_K_eff must lie in [1, requested_K]")
     if any(isinstance(value, bool) for value in probe_seeds):
         raise ContractError("frozen failure-boundary probe seeds are invalid")
     seeds = tuple(int(value) for value in probe_seeds)
@@ -206,11 +199,17 @@ def assemble_failure_boundary(
     if not clean_by_id:
         raise ContractError("failure-boundary assembly requires clean sample rows")
 
-    eligible = {
-        raw_id: row for raw_id, row in clean_by_id.items() if _freshly_dual_correct(row)
-    }
+    eligible = {}
+    for raw_id, row in clean_by_id.items():
+        clean_correct, _ = classify_screening_row(
+            row, clean_correct_policy=clean_correct_policy
+        )
+        if bool(row.get("analysis_eligible", False)) and clean_correct:
+            eligible[raw_id] = row
     if not eligible:
-        raise ContractError("no freshly dual-correct clean examples are available")
+        raise ContractError(
+            f"no eligible {clean_correct_policy} clean-correct examples are available"
+        )
 
     # Every clean row must describe one execution identity, including excluded
     # rows.  This prevents a mixed split from being hidden by cohort filtering.
@@ -337,15 +336,16 @@ def assemble_failure_boundary(
                     )
                 if len(q_values) != 1:
                     raise ContractError("probe q differs within one primary estimate")
-                if accepted_directions != expected_directions:
+                if len(accepted_directions) < min_K_eff:
                     probe_exclusions.append(
                         {
                             "raw_sample_id": raw_id,
                             "raw_id": raw_id,
                             "edge_id": edge,
                             "probe_seed": seed,
-                            "reason": "incomplete_accepted_primary_probe_prefix",
+                            "reason": "insufficient_accepted_probe_directions",
                             "requested_K": K,
+                            "minimum_K_eff": min_K_eff,
                             "K_eff": len(accepted_directions),
                             "rejected_direction_ids": sorted(
                                 expected_directions - accepted_directions
@@ -359,11 +359,6 @@ def assemble_failure_boundary(
                     q=next(iter(q_values)),
                     requested_K=K,
                 )
-                if not estimate["primary_available"]:
-                    raise ContractError(
-                        f"complete accepted prefix did not produce a primary LinkRadius "
-                        f"for {raw_id}/{edge}/seed={seed}"
-                    )
                 minimum_margin = min(float(row["clean_margin"]) for row in estimate["competitors"])
                 maximum_susceptibility = max(
                     float(row["susceptibility"]) for row in estimate["competitors"]
@@ -383,8 +378,16 @@ def assemble_failure_boundary(
                     "q": next(iter(q_values)),
                     "requested_K": K,
                     "K_eff": int(estimate["K_eff"]),
+                    "minimum_K_eff": min_K_eff,
+                    "primary_available": bool(estimate["primary_available"]),
+                    "estimate_kind": (
+                        "complete_K"
+                        if estimate["primary_available"]
+                        else "accepted_direction_subset"
+                    ),
                     "h": h,
                     "probe_seed": seed,
+                    "clean_correct_policy": clean_correct_policy,
                     "subspace_hash": probe_subspace_by_edge[edge],
                     **common_provenance,
                 }
@@ -496,7 +499,19 @@ def assemble_failure_boundary(
                         "realized_epsilon": realized_epsilon,
                         "attack_minimum_margin": minimum_margin,
                         "flipped": minimum_margin <= 0.0,
+                        # Binary ranking is evaluated within one frozen
+                        # requested-budget cell.  Using each attack's achieved
+                        # norm here would leak attack optimization behavior into
+                        # LinkRadius alone and make the component comparison
+                        # unfair.  Achieved norm remains the primary threshold
+                        # coordinate and a separately named diagnostic score.
                         "linkradius_score": _failure_score(
+                            budget, float(predictor["edge_radius"])
+                        ),
+                        "linkradius_requested_score": _failure_score(
+                            budget, float(predictor["edge_radius"])
+                        ),
+                        "linkradius_realized_score": _failure_score(
                             realized_epsilon, float(predictor["edge_radius"])
                         ),
                         "margin_score": -float(predictor["minimum_clean_margin"]),
@@ -528,8 +543,10 @@ def assemble_failure_boundary(
             "budgets": list(budgets),
             "families": list(families),
             "requested_K": K,
+            "minimum_K_eff": min_K_eff,
             "selected_h": h,
             "probe_seeds": list(seeds),
+            "clean_correct_policy": clean_correct_policy,
         },
         "provenance": common_provenance,
     }
