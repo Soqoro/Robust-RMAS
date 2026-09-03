@@ -1,0 +1,2051 @@
+\documentclass[11pt]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage[margin=0.95in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{microtype}
+
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.48em}
+\setlist[itemize]{leftmargin=1.35em,itemsep=0.1em,topsep=0.15em}
+\setlist[enumerate]{leftmargin=1.5em,itemsep=0.1em,topsep=0.15em}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{assumption}[theorem]{Assumption}
+\newtheorem{definition}[theorem]{Definition}
+
+\DeclareMathOperator{\Acc}{Acc}
+\DeclareMathOperator{\AUPRC}{AUPRC}
+\DeclareMathOperator{\AUROC}{AUROC}
+\DeclareMathOperator{\AUV}{AUV}
+\newcommand{\E}{\mathbb E}
+\newcommand{\R}{\mathbb R}
+\newcommand{\cc}{\mathrm{cc}}
+\newcommand{\eps}{\varepsilon}
+\newcommand{\method}{\textsc{LinkRadius}}
+\newcommand{\Vuln}{\mathcal V}
+\newcommand{\sys}{\mathcal S}
+\newcommand{\threat}{\mathcal T}
+\newcommand{\Load}{\mathsf{Load}}
+\newcommand{\NotRun}{\textcolor{gray}{not run}}
+
+\title{When Silent Agents Fail:\\
+From Handoff Radii to System-Level Vulnerability in Latent Multi-Agent Systems}
+\author{Draft Manuscript}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Latent multi-agent systems allow language-model agents to exchange continuous
+representations without exposing a natural-language transcript. This can make
+coordination efficient, but it leaves designers without a calibrated answer to
+two questions: which concrete handoff is closest to changing the final
+decision, and how should those local weaknesses be summarized for an entire
+recursive or non-recursive architecture?
+
+We introduce \method{}, a hierarchical, attack-independent diagnostic. It
+first audits whether each handoff carries example-specific information using
+paired, answer-label-matched mismatched, zero, and moment-matched replacements.
+It then uses antithetic isotropic probes to estimate the scale-normalized
+end-to-end susceptibility of every terminal pairwise margin. Dividing the
+clean margin by this susceptibility gives an empirical handoff radius: the
+relative perturbation budget at which a sufficiently aligned direction is
+locally expected to reach a decision boundary. We aggregate the minimum radius
+over a declared set of admissible links into a budget-indexed system
+vulnerability profile, \(\Vuln_{\sys,\mathcal D,\threat}(\eps)\in[0,1]\). Its
+value is the predicted fraction of clean-correct examples with an allowed
+one-shot failure boundary within budget \(\eps\), rather than an arbitrary
+sigmoid or clipped gain.
+
+We prove that isotropic directional derivatives recover squared end-to-end
+margin susceptibility in expectation, derive a curvature-aware sufficient
+condition for handoff stability, and lift it to one-shot system stability on
+the exact unrolled computation graph. Finite probes do not verify the required
+uniform curvature bound, so experimental profiles are explicitly empirical,
+not certified. In the completed validation pilot, 13 of 40 GPQA examples were
+clean-correct under deterministic forced-option scoring and remained eligible
+on clean recapture. Across these examples, answer-label-matched relay
+replacement reduced accuracy by 38.5 percentage points at both the first
+planner-to-critic and critic-to-solver handoffs, while the first
+solver-to-planner effect was 7.7 points. All 1,872 requested antithetic probe
+pairs passed the frozen cast-quality checks, although a six-unit exact-gradient
+diagnostic did not achieve finite-difference agreement and is not used as a
+certificate.
+
+On an exploratory, fixed execution-order prefix of six validation examples
+(18 example--handoff units), the empirical radius achieved a realized-norm
+crossed-threshold Spearman correlation of 0.750 and interval-censored
+concordance of 0.740 under per-example PGD. The corresponding values were
+0.316 and 0.753 for clean margin alone, and 0.600 and 0.523 for susceptibility
+alone. Thus the preliminary evidence supports useful boundary ordering but not
+uniform superiority to clean margin. Held-out test evaluation, transfer
+attacks, system profiling, and protection experiments remain unobserved and
+are required for confirmatory claims.
+\end{abstract}
+
+\section{Introduction}
+
+Language-model agents increasingly communicate through hidden states, latent
+memories, or key--value cache handoffs instead of fully decoded text
+\cite{du2025interlat,zou2025latentmas,yang2026recursivemas}. These channels can
+reduce token overhead and preserve information that would otherwise be lost
+during textualization. Their opacity, however, changes the robustness problem.
+A corrupted text message can be inspected; a corrupted latent handoff may
+remain invisible until the system emits an incorrect answer.
+
+Recent work has established that latent channels can carry attack-associated
+signals and that edge-level handoff attacks can degrade latent multi-agent
+systems \cite{wang2026outofsight,brito2026latentagents}. This establishes
+possibility, but it does not answer the design questions faced before a
+particular attack has been constructed:
+\begin{quote}
+\emph{Which latent handoff is closest to failure, at what budget, and how much
+of the system's clean-correct behavior is exposed under the same threat model?}
+\end{quote}
+
+Three issues make these questions harder than measuring hidden-state movement.
+First, a receiver may not use the sender's example-specific message at all.
+Recent causal audits show that replacing or zeroing a latent relay can produce
+a large effect even when replacing it with another example's relay produces
+almost none \cite{cheng2026when,zhang2026channels}. Such a link is sensitive
+to message presence but is weak evidence of inter-agent information transfer.
+Second, a large terminal representation change need not cross the relevant
+decision boundary, while a small change can flip an already narrow margin.
+Third, ``system vulnerability'' is not a budget-free scalar. It depends on the
+allowed links, norm, site-selection policy, task distribution, and clean
+denominator. Squashing an uncalibrated propagation gain into \([0,1]\) does not
+resolve this ambiguity.
+
+We propose a three-level diagnosis. Level~0 asks whether a latent handoff carries
+example-specific information by comparing the clean paired relay with a
+mismatched-example relay, a zero relay, and moment-matched random noise. Stage~1
+estimates how much small,
+attack-independent random interventions change the final decision margins and
+combines that susceptibility with the clean margin into a per-example,
+per-handoff empirical radius. Level~2 aggregates the radii under an explicit
+threat model. For a worst-site one-shot adversary, the architecture radius is
+the smallest allowed handoff radius and its empirical cumulative distribution
+is a system-level vulnerability curve.
+
+The core decomposition is
+\begin{equation}
+    \underbrace{m_{x,j}}_{\text{clean margin}}
+    \quad\text{versus}\quad
+    \eps\,
+    \underbrace{\chi_{x,e,j}}_{\text{system susceptibility}}
+    \underbrace{A_{x,e,j}(v)}_{\text{attack alignment}},
+    \label{eq:intro-decomposition}
+\end{equation}
+where $e$ is a concrete latent handoff, $j$ is a competing answer, and $v$ is
+an attack direction. Random probes estimate $\chi$ without using $v$. A held-out
+attack succeeds locally only when it is sufficiently large and sufficiently
+aligned to overcome the available margin. This distinction explains why a
+system can be intrinsically fragile even when a particular structured attack
+has low success, and why random-noise ASR is not itself a sufficient
+susceptibility measure.
+
+At the system level, let \(\mathcal E_{\threat}(\sys,x)\) be the handoffs that
+the declared threat model permits. We define
+\begin{equation}
+    \widehat\rho_{x,\sys,\threat}^{\min}
+    =\min_{e\in\mathcal E_{\threat}(\sys,x)}
+    \widehat\rho_{x,e}^{(1)},
+    \qquad
+    \widehat\Vuln_{\sys,\mathcal D,\threat}^{\mathrm{worst}}(\eps)
+    =
+    \Pr_{x\sim\mathcal D_{\cc}}
+    [\widehat\rho_{x,\sys,\threat}^{\min}\le\eps].
+    \label{eq:intro-system-profile}
+\end{equation}
+A value of \(0.70\) at \(\eps=0.05\), for example, means that 70\% of the
+declared clean-correct population contains at least one allowed link whose
+predicted local boundary is within a 5\% relative perturbation. We also report
+random-site profiles so architectures with more handoffs are not compared only
+through their minimum.
+
+Our intended contributions, together with the current scope of evidence, are:
+\begin{enumerate}
+    \item We introduce a causal-use gate that separates example-specific latent
+    communication from generic dependence on the presence or distribution of a
+    relay.
+    \item We define an attack-independent, scale-normalized susceptibility and
+    empirical first-order radius on the exact unrolled handoff graph of a
+    recursive or non-recursive latent multi-agent system.
+    \item We derive an isotropic random-probe estimator and a curvature-aware
+    margin-stability theorem, while sharply separating empirical prediction
+    from certified robustness.
+    \item We lift handoff radii into interpretable, budget-indexed \([0,1]\)
+    vulnerability profiles with worst-site, random-site, fixed-policy, and
+    causally-useful variants. These profiles support fair comparisons across
+    horizons and architectures without hiding the threat model.
+    \item We test whether local radii predict failure thresholds before using
+    them to compare datasets, collaboration patterns, and prompt regimes. The
+    current validation-only pilot is encouraging but mixed; held-out prediction
+    and actionability remain planned rather than established contributions.
+\end{enumerate}
+
+\section{Problem Setting}
+\label{sec:problem-setting}
+
+\subsection{Latent systems as unrolled handoff graphs}
+
+Let \(\sys\) be a latent multi-agent system with recursion horizon \(R\). We
+represent one deterministic execution as an unrolled directed acyclic graph
+\begin{equation}
+    \mathcal G_{\sys,R}(x)
+    =\bigl(\mathcal V_{\sys,R}(x),\mathcal E_{\sys,R}(x)\bigr),
+\end{equation}
+where a chronological edge \(e\in\mathcal E_{\sys,R}(x)\) transmits a latent
+object \(z_e(x)\). Unrolling makes this representation valid for both acyclic
+collaboration and systems that reuse the same roles over multiple rounds. Two
+messages between the same roles at different rounds are distinct edges.
+
+For each edge, define the downstream intervention map
+\begin{equation}
+    F_{x,e}:z\longmapsto \ell_{x,e}(z)\in\R^C,
+    \label{eq:intervention-map}
+\end{equation}
+which replaces only \(z_e(x)\) by \(z\), recomputes every descendant of that
+edge, and returns terminal option scores. All non-descendants, exogenous inputs,
+model weights, and prompts remain fixed. The clean execution satisfies
+\(F_{x,e}(z_e)=\ell_x\) for every edge, although its derivative with respect to
+\(z_e\) is edge-specific.
+
+The theorem-bearing setting uses deterministic, differentiable option scoring
+and a fixed discrete control-flow trace during the local intervention. This is
+implemented with forced scoring of each answer option rather than differentiating
+through an \(\arg\max\) token. Architectures whose intervention changes a tool
+call or other discrete branch are evaluated as behavioral extensions and are
+not assigned the differentiable guarantee without a separate smooth surrogate.
+
+\begin{definition}[One-shot latent-handoff threat model]
+\label{def:threat-model}
+A threat model
+\(\threat=(\mathcal E_{\threat},\{\mathcal U_e\},\{s_{x,e}\},
+\|\cdot\|_2,\pi)\)
+declares (i) the eligible chronological handoffs,
+(ii) a \(q_e\)-dimensional admissible perturbation subspace
+\(\mathcal U_e\) at each edge, (iii) a positive reference scale \(s_{x,e}\)
+and relative Euclidean/Frobenius norm, and (iv) a site-selection policy \(\pi\).
+By default \(s_{x,e}=\|z_e\|_2\) for a nonzero relay; a predeclared clean
+reference scale is required for a zero relay. An intervention changes one
+eligible handoff once and then allows normal downstream execution. Worst-site
+selection, uniform random-site selection, and a fixed-site policy are reported
+separately.
+\end{definition}
+
+This internal intervention is a diagnostic gray/white-box abstraction of a
+compromised RecursiveLink, latent adapter, cache-sharing transform, or transient
+communication fault. It is not presented as a black-box capability to edit an
+arbitrary hidden state. The attacker cannot change the question, prompts, base
+models, final scorer, or other handoffs.
+
+\subsection{Running recursive serial instantiation}
+
+We study a recursive planner--critic--solver system. At recursion round $r$,
+the system executes the ordered latent handoffs
+\begin{align}
+    p_r &= P_r(x,s_{r-1}), \\
+    c_r &= C_r(x,p_r), \\
+    s_r &= S_r(x,c_r),
+    \label{eq:serial-system}
+\end{align}
+where $x$ denotes fixed exogenous input and $p_r,c_r,s_r$ are the transmitted
+latent tensors. The final decoder maps $s_R$ to option scores
+\begin{equation}
+    \ell(x)=D_x(s_R)\in\R^C.
+\end{equation}
+The solver-to-planner message $s_r$ affects $p_{r+1}$; it does not feed the
+planner in the same round.
+
+The set of valid one-shot handoff sites at horizon $R$ is
+\begin{equation}
+\mathcal E_R=
+\{(P{\to}C,r),(C{\to}S,r):1\le r\le R\}
+\cup
+\{(S{\to}P,r):1\le r<R\}.
+\label{eq:edge-set}
+\end{equation}
+Thus $S{\to}P$ is inactive when $R=1$. The complete execution is an unrolled
+graph of chronological micro-steps, even though role names repeat across
+rounds. Mixture,
+distillation, and deliberation patterns are represented by their own unrolled
+edge sets rather than forced into this serial schedule.
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox[c][1.42in][c]{0.92\linewidth}{\centering
+\textbf{Figure 1 placeholder: actual unrolled computation.}\\[0.4em]
+Draw $P_r\rightarrow C_r\rightarrow S_r\rightarrow P_{r+1}$ for two rounds.
+Highlight one handoff $e$, the paired/mismatched replacement gate, the
+$\pm h$ antithetic probes, and the terminal option-margin readout.}}
+\caption{The proposed diagnostic acts on a concrete transmitted latent tensor
+in the actual serial execution. Downstream recomputation follows the descendants
+of that handoff; no synchronous role-state approximation is used.}
+\label{fig:unrolled-overview}
+\end{figure}
+
+\subsection{One-shot relative perturbations}
+
+Let $z_e\in\R^{d_e}$ denote the vectorized latent object transmitted at an
+eligible handoff $e\in\mathcal E_{\threat}(\sys,x)$. We inject once within
+\(\mathcal U_e\),
+\begin{equation}
+    \widetilde z_e=z_e+\delta_e,
+    \qquad
+    \delta_e\in\mathcal U_e,
+    \qquad
+    \|\delta_e\|_2\le\eps s_{x,e},
+    \label{eq:relative-perturbation}
+\end{equation}
+and recompute its descendants while holding the question, prompts, model
+weights, decoding rule, and all exogenous inputs fixed. For matrix-valued or
+cache-valued handoffs, $\|\cdot\|_2$ in Equation~\eqref{eq:relative-perturbation}
+denotes the Frobenius norm after vectorization unless a restricted perturbation
+subspace is stated explicitly.
+
+Low-precision inference can make the requested perturbation differ from the
+inserted perturbation. We therefore log
+\begin{equation}
+    \eps_{\mathrm{act}}
+    =
+    \frac{\|\operatorname{cast}(z_e+\delta_e)-
+    \operatorname{cast}(z_e)\|_2}{s_{x,e}^{\mathrm{cast}}}
+\end{equation}
+where \(s_{x,e}^{\mathrm{cast}}\) is the cast-domain realization of the
+declared reference scale. We use the actual post-cast norm in all analyses.
+Probes that collapse to zero
+or become substantially asymmetric after casting are resampled or excluded by
+a pre-specified rule.
+
+\subsection{Pairwise decision margins}
+
+For a multiple-choice example $x$ with correct option $y$, let
+\(F_{x,e,j}(z)\) be the length-normalized score of option $j$ under the
+intervention map in Equation~\eqref{eq:intervention-map}. For each competitor
+$j\ne y$, define the pairwise margin
+\begin{equation}
+    m_{x,e,j}(z)=F_{x,e,y}(z)-F_{x,e,j}(z).
+    \label{eq:pairwise-margin}
+\end{equation}
+At the clean handoff, write \(m_{x,j}=m_{x,e,j}(z_e)\); its value is shared
+across edges while its derivatives are not. An example is clean-correct when
+every \(m_{x,j}>0\). Using all pairwise margins avoids assuming that the clean
+runner-up remains the strongest competitor under perturbation.
+
+For a clean-correct example, the exact one-shot radius of edge \(e\) is
+\begin{equation}
+    \rho^\star_{x,e}
+    =
+    \inf_{\substack{\delta\in\mathcal U_e:\\
+    \min_{j\ne y}m_{x,e,j}(z_e+\delta)\le 0}}
+    \frac{\|\delta\|_2}{s_{x,e}},
+    \label{eq:exact-edge-radius}
+\end{equation}
+with the infimum defined as \(+\infty\) if the feasible set is empty. Ties
+count as reaching the boundary. This is the target quantity: the smallest
+relative intervention at that exact handoff that reaches any terminal decision
+boundary. Computing it exactly is generally intractable. \method{} estimates
+its local first-order analogue without using the attack later employed for
+evaluation.
+
+Our theorem-bearing evaluation uses tasks with explicit option scores, with
+GPQA as the first pilot and MedQA as the planned replication. Free-form tasks
+such as Math500 are included only after a continuous generative margin or
+behavioral threshold has been validated separately; they do not inherit the
+multiple-choice theorem by analogy.
+
+\section{Stage 0: Is the Handoff Causally Used?}
+\label{sec:causal-gate}
+
+A robustness score is difficult to interpret if the receiver does not use the
+sender's example-specific content. Before estimating fragility, we audit each
+handoff with four replacements:
+\begin{itemize}
+    \item \textbf{Paired:} the clean relay $z_e(x)$ generated for the evaluated
+    example.
+    \item \textbf{Label-matched mismatch:} a relay $z_e(x')$ from a different
+    example with the same correct option label, assigned by a within-label
+    derangement, matched in shape, and rescaled to the paired relay norm. An
+    arbitrary mismatch is retained as a supplementary control.
+    \item \textbf{Zero:} an all-zero tensor with the same shape.
+    \item \textbf{Moment-matched noise:} random noise matched to the empirical
+    location and scale of clean relays at the same site.
+\end{itemize}
+
+The accuracy-based example-specific utility of link $e$ is
+\begin{equation}
+    U_e^{\mathrm{acc}}
+    =
+    \Acc_e^{\mathrm{paired}}
+    -
+    \Acc_e^{\mathrm{mismatched}},
+    \label{eq:utility-accuracy}
+\end{equation}
+and its continuous counterpart is
+\begin{equation}
+    U_e^{\mathrm{margin}}
+    =
+    \E_x\!\left[
+    m_x^{\mathrm{paired}}-m_x^{\mathrm{mismatched}}
+    \right],
+    \qquad
+    m_x=\min_{j\ne y}m_{x,j}.
+    \label{eq:utility-margin}
+\end{equation}
+The paired--zero contrast measures dependence on message presence, while the
+paired--mismatched contrast measures dependence on example identity. A large
+zeroing effect with negligible mismatched effect is therefore not treated as
+evidence that the link transfers useful example-specific information.
+
+The causal-use gate is evaluated with paired bootstrap intervals and a
+pre-specified equivalence margin. It changes interpretation rather than
+silently deleting attacker-accessible edges: the all-edge exposure profile
+includes every predeclared accessible handoff, while a separate useful-link
+profile includes only links whose identity effect passes a gate learned on
+calibration data. A low-utility, high-fragility edge is reported as unnecessary
+attack surface, not useful communication failure. If the current full-question
+routing shows no identity effect, that result is retained and a disclosed,
+pre-registered receiver-necessary setting---where the sender has information
+unavailable to the receiver---is added as a causal positive control.
+
+\section{LinkRadius: Attack-Independent Link Diagnosis}
+\label{sec:method}
+
+\subsection{End-to-end margin susceptibility}
+
+For every clean-correct example, handoff, and competitor, define
+\begin{equation}
+    g_{x,e,j}
+    =P_e\nabla_{z_e}m_{x,e,j}(z_e),
+\end{equation}
+where \(P_e\) is the orthogonal projector onto the declared admissible
+subspace \(\mathcal U_e\). The scale-normalized end-to-end margin
+susceptibility is
+\begin{equation}
+    \chi_{x,e,j}
+    =
+    s_{x,e}\,\|g_{x,e,j}\|_2.
+    \label{eq:susceptibility}
+\end{equation}
+This quantity measures the largest first-order change in pairwise margin per
+unit of relative latent perturbation. The end-to-end gradient already contains
+the complete ordered downstream computation:
+\begin{equation}
+    g_{x,e,j}
+    =
+    P_eJ_{e\rightsquigarrow\mathrm{out}}^\top
+    \nabla_{\mathrm{out}}m_{x,e,j},
+    \label{eq:unrolled-jacobian}
+\end{equation}
+where $J_{e\rightsquigarrow\mathrm{out}}$ is the Jacobian product along the
+actual descendants of $e$. Direct end-to-end measurement retains contractions,
+cancellations, and the receiver's ability to ignore the relay. Products of
+local Jacobian norms are used only as a mechanistic upper-bound analysis in the
+appendix.
+
+\subsection{Exact distance in the affine model}
+
+Linearizing each pairwise margin within \(\mathcal U_e\) gives
+\begin{equation}
+    \widetilde m_{x,e,j}(\delta)
+    =m_{x,j}+\langle g_{x,e,j},\delta\rangle.
+    \label{eq:affine-margin}
+\end{equation}
+Define the pairwise first-order radius
+\begin{equation}
+    \rho^{(1)}_{x,e,j}
+    =
+    \begin{cases}
+    m_{x,j}/\chi_{x,e,j}, & \chi_{x,e,j}>0,\\
+    +\infty, & \chi_{x,e,j}=0,
+    \end{cases}
+\end{equation}
+and \(\rho^{(1)}_{x,e}=\min_{j\ne y}\rho^{(1)}_{x,e,j}\).
+
+\begin{proposition}[Exact affine-model LinkRadius]
+\label{prop:affine-radius}
+For a strict clean-correct example, \(\rho^{(1)}_{x,e}\) is exactly the
+minimum relative norm \(\|\delta\|_2/s_{x,e}\) that reaches any pairwise
+decision boundary in the affine model in Equation~\eqref{eq:affine-margin}.
+For a competitor with nonzero \(g_{x,e,j}\), the minimum-norm direction is
+\begin{equation}
+    \delta_{x,e,j}^\star
+    =-\frac{m_{x,j}}{\|g_{x,e,j}\|_2^2}g_{x,e,j}.
+\end{equation}
+\end{proposition}
+
+Thus \(\rho^{(1)}\) is an exact geometric distance for the local affine
+model, not the exact nonlinear radius \(\rho^\star\) in
+Equation~\eqref{eq:exact-edge-radius}.
+
+\subsection{Two-sided isotropic random probes}
+
+For $u_k$ sampled uniformly from the unit sphere in the admissible perturbation
+subspace \(\mathcal U_e\), define the two-sided response
+\begin{equation}
+    \widehat d_{h,k,j}
+    =
+    \frac{
+    m_{x,e,j}(z_e+hs_{x,e}u_k)
+    -
+    m_{x,e,j}(z_e-hs_{x,e}u_k)
+    }{2h}.
+    \label{eq:central-difference}
+\end{equation}
+The squared susceptibility estimator is
+\begin{equation}
+    \widehat\chi_{h,x,e,j}^{\,2}
+    =
+    \frac{q_e}{K}
+    \sum_{k=1}^{K}\widehat d_{h,k,j}^{\,2}.
+    \label{eq:chi-estimator}
+\end{equation}
+The probes are generated independently of attack trajectories, failure labels,
+and held-out test outcomes. Where automatic differentiation is available, the
+exact gradient norm is used only as an estimator-validation baseline.
+
+\begin{proposition}[Isotropic recovery and finite-probe variance]
+\label{prop:isotropic-recovery}
+Let $u$ be uniform on the unit sphere in the $q_e$-dimensional admissible
+subspace, and let
+\begin{equation}
+    d_j(u)
+    =
+    \left.\frac{\partial}{\partial t}
+    m_{x,e,j}(z_e+ts_{x,e}u)\right|_{t=0}.
+\end{equation}
+Then
+\begin{equation}
+    \E_u[d_j(u)^2]
+    =
+    \frac{\chi_{x,e,j}^2}{q_e}.
+\end{equation}
+For independent directions,
+\begin{equation}
+    Q_j=\frac{q_e}{K}\sum_{k=1}^K d_j(u_k)^2
+\end{equation}
+is unbiased and consistent for \(\chi_{x,e,j}^2\), with
+\begin{equation}
+    \operatorname{Var}(Q_j)
+    =\chi_{x,e,j}^4
+    \frac{2(q_e-1)}{K(q_e+2)}.
+    \label{eq:probe-variance}
+\end{equation}
+If the third derivative of the one-dimensional margin trace is bounded by
+\(B\) on \([-h,h]\), replacing \(d_j(u_k)\) with the central difference in
+Equation~\eqref{eq:central-difference} incurs error at most \(Bh^2/6\).
+\end{proposition}
+
+The squared estimator is unbiased for exact directional derivatives;
+\(\sqrt{Q_j}\) and the resulting minimum radius are not unbiased. The
+large-\(q_e\) relative standard deviation of \(Q_j\) is approximately
+\(\sqrt{2/K}\). The current validation protocol uses $K=8$ with repeated
+probe seeds for both estimation and exploratory prediction; $K\in\{16,32\}$
+is reserved for a probe-count ablation rather than silently substituted after
+seeing outcomes. Finite \(h\), low-precision casting, and taking minima over
+competitors and edges add further error. The implementation checks that
+the realized positive and negative offsets satisfy predeclared norm,
+antipodality, and cosine tolerances; otherwise it resamples or fits the
+directional slope using realized offsets.
+
+\subsection{Empirical first-order link radius}
+
+Finite probes give the empirical first-order radius
+\begin{equation}
+    \widehat\rho^{(1)}_{h,x,e}
+    =
+    \min_{j\ne y}
+    \begin{cases}
+    m_{x,j}/\widehat\chi_{h,x,e,j}, &
+    \widehat\chi_{h,x,e,j}>0,\\
+    +\infty, & \widehat\chi_{h,x,e,j}=0.
+    \end{cases}
+    \label{eq:empirical-radius}
+\end{equation}
+After \(h\) is fixed on validation data, we suppress it in
+\(\widehat\rho^{(1)}_{x,e}\) when no ambiguity arises.
+At relative budget $\eps$, the dimensionless link load is
+\begin{equation}
+    \Load_{x,e}(\eps)
+    =
+    \frac{\eps}{\widehat\rho^{(1)}_{h,x,e}}.
+    \label{eq:load-ratio}
+\end{equation}
+This load is useful for calibration but is unbounded; it is not the paper's
+\([0,1]\) system score. A small radius, or equivalently a large load, means
+that a sufficiently aligned direction can locally exhaust the affine margin at
+a smaller budget.
+
+\subsection{Curvature-aware stability}
+
+\begin{assumption}[Local curvature]
+\label{ass:curvature}
+Fix a maximum audited relative radius \(\bar\eps>0\). For a pairwise margin
+$m_{x,e,j}$, suppose it is twice continuously differentiable throughout
+\(\{z_e+\delta:\delta\in\mathcal U_e,
+\|\delta\|_2\le\bar\eps s_{x,e}\}\) and
+\begin{equation}
+    \sup_z
+    \|P_e\nabla^2 m_{x,e,j}(z)P_e\|_{\mathrm{op}}
+    \le H_{x,e,j}.
+\end{equation}
+Define $\kappa_{x,e,j}=s_{x,e}^2H_{x,e,j}$.
+\end{assumption}
+
+\begin{theorem}[Curvature-aware pairwise margin stability]
+\label{thm:margin-stability}
+Under Assumption~\ref{ass:curvature}, every perturbation satisfying
+$\delta_e\in\mathcal U_e$, $\|\delta_e\|_2\le\eps s_{x,e}$, and
+\(0\le\eps\le\bar\eps\) obeys
+\begin{equation}
+    m_{x,e,j}(z_e+\delta_e)
+    \ge
+    m_{x,j}
+    -\eps\chi_{x,e,j}
+    -\frac{1}{2}\eps^2\kappa_{x,e,j}.
+    \label{eq:curvature-bound}
+\end{equation}
+Therefore the predicted option remains $y$ whenever the right-hand side is
+positive for every $j\ne y$.
+\end{theorem}
+
+Define the pairwise sufficient root
+\begin{equation}
+    r^{\mathrm{cert}}_{x,e,j}
+    =
+    \begin{cases}
+    \dfrac{-\chi_{x,e,j}+
+    \sqrt{\chi_{x,e,j}^2+2\kappa_{x,e,j}m_{x,j}}}
+    {\kappa_{x,e,j}}, & \kappa_{x,e,j}>0,\\[0.8em]
+    m_{x,j}/\chi_{x,e,j}, & \kappa_{x,e,j}=0,\ \chi_{x,e,j}>0,\\
+    +\infty, & \kappa_{x,e,j}=\chi_{x,e,j}=0.
+    \end{cases}
+    \label{eq:cert-radius}
+\end{equation}
+Then
+\(\rho^{\mathrm{cert}}_{x,e}
+=\min\{\bar\eps,\min_{j\ne y}r^{\mathrm{cert}}_{x,e,j}\}\)
+satisfies \(\rho^\star_{x,e}\ge\rho^{\mathrm{cert}}_{x,e}\): every
+\(\eps<\rho^{\mathrm{cert}}_{x,e}\) preserves the clean decision.
+
+\begin{center}
+\fbox{\parbox{0.91\linewidth}{
+\textbf{Claim boundary.}
+Equation~\eqref{eq:cert-radius} is a certificate only if the gradient norm and
+a uniform curvature upper bound are conservatively verified throughout the
+ball. Our finite-probe experiments do neither. We therefore call
+$\widehat\rho^{(1)}$ an \emph{empirical first-order radius}, not a certificate.
+$\Load\ge1$ means ``the budget reaches the estimated affine boundary for a
+sufficiently aligned direction,'' not ``every attack must succeed.'' Two probe
+scales diagnose nonlinearity; they do not verify a Hessian bound.}}
+\end{center}
+
+\subsection{Attack alignment explains residual variation}
+
+For a unit-norm attack direction $v\in\mathcal U_e$, define its signed harmful
+alignment with competitor $j$ as
+\begin{equation}
+    A_{x,e,j}(v)
+    =
+    -\frac{\langle g_{x,e,j},v\rangle}{\|g_{x,e,j}\|_2}
+    \in[-1,1].
+    \label{eq:alignment}
+\end{equation}
+We set \(A_{x,e,j}(v)=0\) when \(g_{x,e,j}=0\). Locally,
+\begin{equation}
+    m_{x,e,j}(z_e+\eps s_{x,e}v)
+    =
+    m_{x,j}
+    -\eps\chi_{x,e,j}A_{x,e,j}(v)
+    +O(\eps^2).
+    \label{eq:alignment-decomposition}
+\end{equation}
+In the affine model, the threshold along \(v\) is
+\begin{equation}
+    \rho^{(1)}_{x,e}(v)
+    =
+    \min_{\substack{j\ne y:\ A_{x,e,j}(v)>0}}
+    \frac{m_{x,j}}{\chi_{x,e,j}A_{x,e,j}(v)}
+    \ge \rho^{(1)}_{x,e},
+    \label{eq:directional-radius}
+\end{equation}
+with the minimum of an empty set defined as \(+\infty\).
+Thus $\chi$ measures system susceptibility, $A(v)$ measures attack quality,
+and $m$ measures remaining decision margin. Alignment is a post-hoc explanatory
+variable, not part of the attack-independent diagnostic. It should explain why
+two attacks with the same norm can have different success rates and why a
+small predicted radius need not make an arbitrary DiffMean direction succeed.
+
+\subsection{Communication utility versus fragility}
+
+We summarize each link with its causal utility $U_e$ and its vulnerable
+fraction at a validation-fixed reference budget,
+\begin{equation}
+    F_e(\eps_0)
+    =\Pr_{x\sim\mathcal D_{\cc}}
+    [\widehat\rho_{h,x,e}^{(1)}\le\eps_0].
+\end{equation}
+Unlike a reciprocal-median score, this quantity remains bounded when an
+estimated radius is zero or infinite. Combining utility and fragility produces
+four qualitatively different design cases:
+\begin{center}
+\small
+\begin{tabular}{lll}
+\toprule
+& \textbf{Low fragility} & \textbf{High fragility} \\
+\midrule
+\textbf{High utility} & Valuable, robust relay & Critical link to protect \\
+\textbf{Low utility} & Largely irrelevant relay & Unnecessary attack surface \\
+\bottomrule
+\end{tabular}
+\end{center}
+This map makes a null result useful: a link that moves hidden states but fails
+the identity test should not be described as a valuable communication channel,
+even if it appears sensitive to zeroing.
+
+\section{From Link Radii to System Vulnerability Profiles}
+\label{sec:system-profile}
+
+\subsection{Exact budget-conditioned vulnerability}
+
+Let \(\mathcal E_{\threat}(\sys,x)\) be the attacker-accessible handoffs
+declared before evaluation. Under an adaptive one-shot site policy, define the
+exact system radius
+\begin{equation}
+    \rho^\star_{x,\sys,\threat,\mathrm{adv}}
+    =
+    \min_{e\in\mathcal E_{\threat}(\sys,x)}\rho^\star_{x,e},
+    \label{eq:exact-system-radius}
+\end{equation}
+with the minimum of an empty set equal to \(+\infty\). For a stated
+clean-correct population \(\mathcal D_{\cc}\), the exact vulnerability
+profile is
+\begin{equation}
+    \Vuln^\star_{\sys,\mathcal D,\threat,\mathrm{adv}}(\eps)
+    =
+    \Pr_{x\sim\mathcal D_{\cc}}
+    [\rho^\star_{x,\sys,\threat,\mathrm{adv}}\le\eps].
+    \label{eq:exact-vulnerability-profile}
+\end{equation}
+This is a cumulative distribution function and therefore lies in \([0,1]\)
+and is nondecreasing in \(\eps\). It answers a precise question: what fraction
+of initially correct examples admits some allowed handoff and some admissible
+one-shot direction that reaches a decision boundary within budget \(\eps\)?
+It is conditional on the dataset, horizon, interface metric, accessible links,
+and site-selection policy; it is not an architecture-intrinsic constant.
+
+Adaptive worst-site selection legitimately counts a larger set of handoffs as
+a larger attack surface. To separate this exposure from average per-link
+fragility, for any predeclared site distribution \(\pi(e\mid\sys,x)\) we also
+define
+\begin{equation}
+    \Vuln^\star_{\sys,\mathcal D,\threat,\pi}(\eps)
+    =
+    \E_{x\sim\mathcal D_{\cc}}
+    \left[
+    \sum_{e\in\mathcal E_{\threat}(\sys,x)}
+    \pi(e\mid\sys,x)
+    \mathbf 1\{\rho^\star_{x,e}\le\eps\}
+    \right].
+    \label{eq:policy-vulnerability-profile}
+\end{equation}
+Uniform \(\pi\) gives a random-site profile. A fixed-site profile uses a
+single site selected on validation data and held fixed for every test example.
+
+\subsection{Empirical LinkRadius profile}
+
+For \(n\) held-out clean-correct examples, the plug-in LinkRadius profile is
+\begin{equation}
+    \widehat\Vuln^{\mathrm{LR}}_{\sys,n,\threat,\mathrm{adv}}(\eps)
+    =
+    \frac{1}{n}\sum_{i=1}^{n}
+    \mathbf 1\!\left\{
+    \min_{e\in\mathcal E_{\threat}(\sys,x_i)}
+    \widehat\rho^{(1)}_{h,x_i,e}
+    \le\eps
+    \right\}.
+    \label{eq:empirical-vulnerability-profile}
+\end{equation}
+It is a predicted, linearized vulnerability profile. It equals neither the
+exact profile in Equation~\eqref{eq:exact-vulnerability-profile} nor observed
+ASR by definition; held-out attacks test those empirical relationships.
+
+The main all-edge profile includes every predeclared attacker-accessible link.
+We additionally report a useful-link profile restricted to a set
+\(\mathcal E_{\mathrm{use}}\) selected using causal identity effects on
+calibration data only. The distinction separates total latent-interface
+exposure from fragility of communication that demonstrably carries
+example-specific information.
+
+\begin{corollary}[One-shot system stability]
+\label{cor:system-stability}
+Suppose Assumption~\ref{ass:curvature} and the required conservative quantities
+hold for every competitor at every eligible handoff. Define
+\begin{equation}
+    \rho^{\mathrm{cert}}_{x,\sys,\threat}
+    =
+    \min_{e\in\mathcal E_{\threat}(\sys,x)}
+    \rho^{\mathrm{cert}}_{x,e}.
+\end{equation}
+Then every allowed one-shot intervention with relative norm
+\(\eps<\rho^{\mathrm{cert}}_{x,\sys,\threat}\) preserves the terminal
+decision. Consequently, if
+\(C_{\sys,\mathcal D,\threat}(\eps)
+=\Pr[\rho^{\mathrm{cert}}_{x,\sys,\threat}>\eps]\), then
+\begin{equation}
+    \Vuln^\star_{\sys,\mathcal D,\threat,\mathrm{adv}}(\eps)
+    \le 1-C_{\sys,\mathcal D,\threat}(\eps).
+\end{equation}
+This inequality does not hold when empirical first-order radii replace the
+conservative radii.
+\end{corollary}
+
+\subsection{Curve summaries and clean-accuracy accounting}
+
+The full vulnerability curve is primary. We summarize it by
+\begin{equation}
+    \eps_q=\inf\{\eps:\Vuln(\eps)\ge q\},
+\end{equation}
+especially \(\eps_{50}\). If a single \([0,1]\) summary is needed, we
+predeclare \(\eps_{\max}\) on validation data and use
+\begin{align}
+    \AUV_{[0,\eps_{\max}]}
+    &=\frac{1}{\eps_{\max}}
+    \int_0^{\eps_{\max}}\Vuln(\eps)\,d\eps \\
+    &=\E_x\!\left[
+    \left(1-\frac{\rho^{\min}_x}{\eps_{\max}}\right)_+
+    \right].
+    \label{eq:auv}
+\end{align}
+where \(\rho_x^{\min}\) is the exact or empirical system radius corresponding
+to the plotted profile.
+Unlike an arbitrary sigmoid, this scalar has an explicit budget range; it is
+the expected vulnerable fraction under a uniform budget on that range.
+
+Conditioning only on clean-correct examples can make an inaccurate system look
+robust. We therefore also report predicted robust accuracy on the original
+evaluation population:
+\begin{equation}
+    \widehat{\mathrm{RA}}_{\sys}(\eps)
+    =\frac{1}{|\mathcal D|}\sum_{x\in\mathcal D}
+    \mathbf 1\{\sys(x)=y_x\}
+    \mathbf 1\{\widehat\rho^{\min}_{x,\sys}>\eps\}.
+    \label{eq:predicted-robust-accuracy}
+\end{equation}
+Architecture, horizon, and prompt comparisons use paired raw IDs and the common
+intersection-clean-correct set as the primary denominator. Each system's own
+clean-correct curve and clean accuracy are reported secondarily. All compared
+systems use the same option scorer, realized relative-budget semantics, and
+attacker access. Worst-site and random-site profiles are both required because
+the minimum in Equation~\eqref{eq:exact-system-radius} mechanically gives
+architectures with more accessible edges more opportunities to fail.
+
+\section{Experimental Design}
+\label{sec:experimental-design}
+
+\subsection{Research questions}
+
+The paper is organized around seven questions:
+\begin{enumerate}
+    \item[\textbf{RQ0}] Do the evaluated latent handoffs carry
+    example-specific information?
+    \item[\textbf{RQ1}] Do finite random probes recover a stable local
+    susceptibility across probe radii, seeds, and probe counts?
+    \item[\textbf{RQ2}] Does the empirical radius predict per-example flips,
+    empirical failure thresholds, and the most vulnerable handoff?
+    \item[\textbf{RQ3}] Does prediction transfer to attacks constructed
+    independently of the probes and test examples?
+    \item[\textbf{RQ4}] Do aggregated radii predict system-level vulnerability
+    curves across recursion horizons, datasets, and collaboration patterns?
+    \item[\textbf{RQ5}] Do amplifying and corrective prompts change
+    vulnerability through clean margin, latent susceptibility, or relay use?
+    \item[\textbf{RQ6}] Does combining communication utility with fragility
+    support a better link-protection decision than fixed or random selection?
+\end{enumerate}
+
+\subsection{Systems, tasks, and scope}
+
+The completed pilot uses the sequential-light RecursiveMAS implementation with
+planner, critic, and solver roles at $R=2$, batch size one, and latent length
+32. Deterministic forced-option scoring defines correctness: an example is
+eligible exactly when every finite gold-versus-competitor margin is positive.
+Free-form generation remains a diagnostic and cannot exclude an otherwise
+valid forced-margin example. The final paper records the exact checkpoint,
+role-specific weights, RecursiveLink parameters, precision, and code revision
+actually used rather than inheriting model details from the official
+RecursiveMAS release. Expansion to other horizons is conditional on completing
+the held-out $R=2$ boundary test.
+
+GPQA is the theorem-bearing primary task because all answer competitors have
+well-defined option scores. MedQA is the planned multiple-choice replication.
+Math500 and MBPPplus are secondary behavioral transfer tasks only after a
+candidate-set, verifier, or token-level continuous score is independently
+validated. They do not inherit the multiple-choice theorem by analogy.
+
+The pilot perturbs the first valid occurrence of each handoff type:
+$P{\to}C@1$, $C{\to}S@1$, and $S{\to}P@1$. The implementation labels these
+zero-indexed sites \texttt{p2c@0}, \texttt{c2s@0}, and \texttt{s2p@0}; the
+manuscript uses one-indexed round labels. This keeps the first comparison small
+while preserving different downstream paths. Expansion to every valid
+occurrence in Equation~\eqref{eq:edge-set} is a later study and will always
+report the injection round rather than collapsing repeated role pairs.
+
+After local validation, we profile four collaboration patterns---sequential,
+mixture, distillation, and deliberation---using their exact unrolled graphs
+\cite{yang2026recursivemas}. Native released systems differ in roles,
+backbones, training, and compute, so their comparison is explicitly a
+\emph{whole-system profile}, not causal evidence that topology alone determines
+robustness. A causal topology comparison additionally uses matched backbones,
+training data, option scoring, and approximately matched inference compute.
+Deliberation is theorem-bearing only when the local tool trace is fixed; results
+that change discrete tool selection are labeled behavioral.
+
+\subsection{Admissible perturbation interfaces}
+
+Probes and evaluated attacks must occupy the same declared subspace. We write
+\begin{equation}
+    \delta_e=\eps s_{x,e}B_eu,
+    \qquad B_e^\top B_e=I_{q_e},
+    \qquad \mathcal U_e=\operatorname{span}(B_e).
+    \label{eq:subspace-parameterization}
+\end{equation}
+For variable-length relays, \(B_e\) is a fixed channel-wise or otherwise
+aligned parameterization that broadcasts over valid positions; it is fitted or
+declared without test outcomes. The estimator dimension is \(q_e\), not the
+raw tensor size. Universal, DiffMean, PCA, PGD, and random directions all use
+these coordinates. This avoids comparing full-space susceptibility with an
+attack constrained to a different broadcast or channel subspace.
+
+\subsection{Architecture and prompt expansion}
+
+The broad sweep is deliberately nested rather than fully factorial:
+\begin{enumerate}
+    \item sequential-light GPQA at \(R\in\{1,2,4\}\), followed by all valid
+    sites and \(R=1,\ldots,5\);
+    \item frozen-protocol replication on MedQA;
+    \item compatible mixture and distillation systems as whole-system external
+    validity, followed by deliberation under fixed control flow;
+    \item amplifying versus corrective prompts on sequential-light GPQA and one
+    frozen MedQA replication.
+\end{enumerate}
+The prompt study is a mechanism analysis. On paired examples it decomposes
+\begin{equation}
+    \log\rho^{(1)}_{x,e,j}
+    =\log m_{x,j}-\log\chi_{x,e,j},
+    \label{eq:prompt-decomposition}
+\end{equation}
+and separately measures relay identity utility and the binding competitor.
+Prompts are frozen before evaluation. They are not treated as an independent
+proof of the theorem.
+
+\subsection{Data and split discipline}
+
+Raw example identifiers are partitioned before clean-correct filtering:
+\begin{itemize}
+    \item $\mathcal D_{\mathrm{atk}}$ (40\%) constructs universal, DiffMean,
+    and PCA directions.
+    \item $\mathcal D_{\mathrm{val}}$ (20\%) selects probe radius, probe count,
+    attack budgets, and attack hyperparameters.
+    \item $\mathcal D_{\mathrm{test}}$ (40\%) is evaluated once after the
+    protocol is frozen.
+\end{itemize}
+No test example, test failure label, or test probe response is used to construct
+an attack. Primary analyses use a single frozen clean reference and deterministic
+option scoring. The raw partitions are identical across architectures, horizons,
+and prompts. Mismatched-relay donors come from a fixed disjoint donor pool and
+are matched by site, round, horizon, answer label, and tensor-shape or sequence-
+length bucket. Comparisons across systems use paired raw IDs and the
+intersection clean-correct set; system-specific conditional curves are reported
+only as secondary views.
+
+\subsection{Probe protocol}
+
+The completed validation pilot screened all 40 validation examples. Thirteen
+were forced-margin clean-correct (32.5\%) and all 13 retained that status on a
+fresh clean recapture. The probe grid uses $K=8$ antithetic directions, three
+fixed direction seeds (101, 202, and 303), two candidate relative radii
+($10^{-3}$ and $3\times10^{-3}$), and the three first-round handoffs. This
+produced 234 eligible example--edge--scale--seed configurations and 1,872
+antithetic pairs; every pair passed the frozen post-cast acceptance rule. The
+frozen empirical analysis permits a minimum effective count of six of eight
+directions, although the completed pilot retained all eight in every eligible
+configuration.
+
+We record requested and realized perturbation norms, requested--realized
+cosine, positive--negative antipodality, each pairwise margin response, the
+binding competitor, clean rerun disagreement, and invalid outputs for every
+probe. A six-unit exact-autograd diagnostic was finite but achieved zero of six
+finite-difference agreement checks, with maximum relative error 1.043. We
+therefore retain that result as a negative estimator diagnostic and make no
+exact-gradient or certification claim. Increasing $K$ and resolving the
+autograd discrepancy are follow-up measurements rather than hidden conditions
+for reporting the empirical $K=8$ result.
+
+\subsection{Independent attack families}
+
+We evaluate the diagnostic against attacks with different alignment properties.
+The currently executed validation experiment contains the last two families
+below; the first three remain planned transfer tests:
+\begin{itemize}
+    \item \textbf{Held-out universal margin attack:} one direction per handoff
+    type learned at $R=2$ on $\mathcal D_{\mathrm{atk}}$, then frozen and
+    transferred to both $R=2$ and $R=4$ test conditions.
+    \item \textbf{Held-out DiffMean:} a failure-associated direction estimated
+    only from attack-training trajectories, with target construction and sign
+    fixed in advance. We use target-conditioned or pairwise-margin construction
+    rather than averaging heterogeneous wrong-answer directions that can cancel.
+    \item \textbf{Held-out PCA direction:} a principal failure-associated
+    subspace learned on attack-training data, evaluated without test adaptation.
+    \item \textbf{Per-example PGD:} a near-worst-case white-box ceiling used to
+    test whether the radius locates a local boundary; it is reported separately
+    from transfer attacks.
+    \item \textbf{Random direction:} a null attack baseline distinct from the
+    probe directions used by the diagnostic.
+\end{itemize}
+Attacks are norm-normalized after casting. The current grid is
+$\{3\times10^{-4},10^{-3},3\times10^{-3},10^{-2},3\times10^{-2},10^{-1}\}$.
+PGD uses 20 optimization steps and independently targets every wrong option;
+the minimum resulting pairwise margin defines failure. The empirical threshold
+is the first pairwise-margin exit. Crossings between tested budgets are
+interval-censored; examples that never cross are right-censored above the
+maximum budget. Because independently optimized PGD runs can re-enter the safe
+region at a larger requested budget, first crossing and interval-censored
+ordering are primary, and raw non-monotone dose responses remain visible.
+
+The random-direction control exposed a BF16-scale floor: all 18 rows at
+$3\times10^{-4}$ failed the probe-derived direction-fidelity thresholds, while
+none collapsed and their realized-to-requested norm ratios remained near one.
+All 90 rows at $10^{-3}$ and above passed. We therefore retain the smallest
+random cell as a numerical diagnostic, use $10^{-3}$ and above for the
+direction-qualified random sensitivity analysis, and do not remove individual
+rows based on outcomes.
+
+\subsection{Baselines and ablations}
+
+The complete radius is compared with:
+\begin{itemize}
+    \item clean margin $m$ alone;
+    \item susceptibility $\widehat\chi$ alone;
+    \item latent norm $\|z_e\|_2$ alone;
+    \item number of downstream micro-steps or nominal path length;
+    \item terminal hidden-state displacement under random noise;
+    \item worst-of-$K$ random directional response;
+    \item empirical random-noise flip rate on validation-fixed probes;
+    \item the previous role-gain $\widehat\Lambda$ score, recomputed only where
+    its required quantities are available;
+    \item a factorized product of local gains on the correctly unrolled graph;
+    \item the exact-gradient radius as a white-box measurement oracle.
+\end{itemize}
+Estimator ablations vary $K\in\{4,8,16,32\}$, one-sided versus antithetic
+probing, probe radius, scale normalization, and terminal margin versus hidden
+distance. Where feasible, exact autograd gradient norms provide a measurement
+reference rather than an attack.
+
+At the system level, we compare the LinkRadius profile with edge count,
+recursion depth, minimum and average clean margin, average susceptibility,
+path length, and aggregated versions of the previous \(\widehat\Lambda\)
+score. Scores without budget units receive a monotone calibration fitted on
+validation data before curve-calibration comparisons; ranking metrics may use
+their raw values. The decisive ablation remains whether \(m/\widehat\chi\)
+beats both \(m\) and \(\widehat\chi\) separately.
+
+\subsection{Metrics and statistical protocol}
+
+Primary metrics are:
+\begin{itemize}
+    \item per-example flip $\AUROC$ and $\AUPRC$ using
+    $\eps/\widehat\rho_{h,x,e}^{(1)}$;
+    \item Spearman correlation and interval-censored concordance between the
+    predicted radius and observed attack threshold;
+    \item within-example site-ranking accuracy and Kendall rank correlation;
+    \item calibration of failure rate against normalized budget
+    $\eps/\widehat\rho$;
+    \item system-level error in \(\eps_{50}\), integrated absolute error between
+    predicted and observed vulnerability curves, architecture rank agreement
+    by \(\AUV\), and predicted versus observed robust accuracy;
+    \item paired cluster-bootstrap confidence intervals with raw example as the
+    resampling unit and probe/attack seeds nested within examples.
+\end{itemize}
+We also report clean accuracy, clean-clean flip rate when decoding is stochastic,
+invalid-output rate, actual perturbation norm, and probe cost. Causal-use tests
+use Holm correction across links and a predeclared equivalence margin. Probe
+uncertainty is propagated with repeated direction sets in addition to the
+example-level bootstrap.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{3.6pt}
+\caption{Planned experimental sequence. Scaling is conditional on the preceding
+gate, so compute is spent only after the diagnostic is identifiable.}
+\label{tab:experiment-sequence}
+\begin{tabular}{p{0.16\linewidth}p{0.35\linewidth}p{0.37\linewidth}}
+\toprule
+\textbf{Stage} & \textbf{Design} & \textbf{Decision} \\
+\midrule
+0: Causal use &
+Paired, mismatched, zero, and moment-matched relays on GPQA; $R\in\{2,4\}$ &
+Label every link by identity utility; if all full-routing links fail, retain the
+negative result and add the disclosed receiver-necessary positive control. \\
+\midrule
+1: Estimator &
+Two probe radii; $K=8$ pilot; exact-gradient check where feasible &
+Proceed if realized probes survive casting and susceptibility is stable across
+radii/seeds. \\
+\midrule
+2: Prediction &
+Frozen GPQA test set; all valid sites, rounds, budgets, and independent attacks &
+Proceed if the full radius beats both margin-only and susceptibility-only with
+paired intervals. \\
+\midrule
+3: Replication &
+MedQA replication at two horizons with two transfer attacks &
+Test cross-domain stability without reopening hyperparameters. \\
+\midrule
+4: Profiling &
+Worst-site, random-site, and useful-link curves across horizons and compatible
+architectures &
+Proceed only if local radii predict held-out thresholds; compare both common
+and system-specific clean sets. \\
+\midrule
+5: Mechanism &
+Amplifying versus corrective prompts with margin--susceptibility decomposition &
+Explain profile movement without treating prompts as theorem validation. \\
+\midrule
+6: Actionability &
+Protect lowest-radius link versus random, fixed-last, and highest-radius links &
+Test whether diagnosis improves robustness at matched intervention cost. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Results}
+\label{sec:results}
+
+Results in this section have two explicitly separated statuses. RQ0 and RQ1
+use the complete 40-row validation pilot and its 13 forced-margin clean-correct
+examples. RQ2 uses an exploratory, fixed execution-order prefix of six of those
+13 examples (18 example--handoff units). The prefix contains every frozen
+budget at all three handoffs for both PGD and the random control; it was chosen
+to obtain an early matched analysis while the remaining validation attack jobs
+were incomplete. Probe seeds are averaged equally and are not counted as
+independent examples. No held-out test outcomes have been accessed. RQ3--RQ6
+remain planned unless a row is explicitly marked as completed validation
+evidence.
+
+\subsection{RQ0: Causal use of the latent handoffs}
+
+Table~\ref{tab:causal-use} reports the complete validation causal audit on the
+13 stable clean-correct examples. The paired--mismatched contrast is the
+decisive identity quantity; paired--zero is a message-presence diagnostic.
+All 360 scheduled causal-grid tasks completed: 117 yielded eligible sample
+rows (39 per handoff and 39 per intervention mode), while 243 were
+predeclared frozen-cohort exclusions rather than runtime failures.
+
+\begin{table}[t]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{2.2pt}
+\caption{Completed validation causal-use audit ($n=13$). Effects are paired
+baseline minus intervention; 95\% paired-bootstrap intervals are in
+parentheses. Paired accuracy is one by construction on the stable
+forced-margin cohort. Moment-matched noise and private-evidence routing have
+not yet been run.}
+\label{tab:causal-use}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lrrrrrr}
+\toprule
+Handoff & $n$ & Paired Acc. & $\Delta\Acc_{\mathrm{id}}$ &
+$\Delta m_{\mathrm{id}}$ & $\Delta\Acc_{0}$ & $\Delta m_{0}$ \\
+\midrule
+$P{\to}C@1$ & 13 & 1.000 & 0.385 (0.154, 0.615) &
+0.029 ($-0.148$, 0.178) & 0.308 (0.077, 0.538) &
+0.025 ($-0.123$, 0.143) \\
+$C{\to}S@1$ & 13 & 1.000 & 0.385 (0.154, 0.615) &
+0.043 ($-0.111$, 0.189) & 0.231 (0.000, 0.462) &
+0.044 ($-0.100$, 0.161) \\
+$S{\to}P@1$ & 13 & 1.000 & 0.077 (0.000, 0.231) &
+0.026 ($-0.079$, 0.123) & 0.077 (0.000, 0.231) &
+$-0.040$ ($-0.245$, 0.114) \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+Answer-label-matched replacement reduced paired accuracy by 38.5 percentage
+points at both $P{\to}C@1$ and $C{\to}S@1$; their bootstrap intervals exclude
+zero. The corresponding $S{\to}P@1$ effect was 7.7 points with an interval
+touching zero. Continuous minimum-margin effects were small and all intervals
+crossed zero. These results are preliminary evidence that the first two
+handoffs carry example-specific information on this cohort, while the evidence
+for the first solver-to-planner handoff is weak. They do not yet establish the
+stronger private-evidence positive control.
+
+\subsection{RQ1: Probe validity, efficiency, and local linearity}
+
+The finite-probe pipeline was numerically usable, but the exact-gradient
+comparison was not. Table~\ref{tab:probe-validation} reports both facts rather
+than treating a successful forward pass as gradient validation.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4.0pt}
+\caption{Completed numerical and probe-quality checks on validation. A
+configuration is one example--edge--scale--seed cell; each contains eight
+antithetic pairs. Exact-gradient agreement is a negative diagnostic, so the
+reported radius remains empirical rather than certified.}
+\label{tab:probe-validation}
+\begin{tabular}{p{0.27\linewidth}p{0.18\linewidth}p{0.45\linewidth}}
+\toprule
+Check & Units & Result \\
+\midrule
+Screening numerics & 40 raw examples & 40/40 finite scorer rows and
+40/40 finite relay interfaces \\
+Forced-margin eligibility & 40 raw examples & 13/40 clean-correct (32.5\%) \\
+Fresh clean recapture & 13 eligible examples & 13/13 retained; zero demotions
+and zero promotions \\
+$K=8$ antithetic probes & 720 grid tasks (234 eligible) & All 720 tasks
+completed; 486 were frozen-cohort exclusions; 1,872/1,872 eligible pairs were
+accepted, with eight directions in every eligible configuration \\
+Exact-autograd diagnostic & 6 example--edge units & 6/6 finite, but 0/6 met
+the finite-difference agreement rule; maximum relative error 1.043; retained
+as a diagnostic outside the frozen probe gate because its evidence rows lacked
+resolved system-identity metadata \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The failed exact-gradient agreement prevents a claim that the finite probes
+recover the exact gradient norm in this implementation. It does not make the
+subsequent empirical prediction test circular: the probes remain independent
+of the PGD outcomes. The present claim is therefore narrower---the resulting
+finite-probe score has empirical predictive value if it orders independently
+measured failures.
+
+\subsection{RQ2: Predicting failure boundaries}
+
+The core test asks whether a pre-attack score predicts empirical attack
+thresholds. The currently completed matched prefix contains six validation
+examples, three handoffs, three probe seeds, and the full six-budget PGD grid.
+The observed threshold is the first budget at which a pairwise margin exits the
+correct region, with interval-censoring between adjacent budgets and
+right-censoring when no tested budget crosses it. This is an exploratory
+validation analysis, not the confirmatory held-out result.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{3.2pt}
+\caption{Exploratory PGD prediction on six validation examples (18
+example--handoff units). Flip metrics are descriptive means over the six fixed
+budgets; threshold and site metrics use actual post-cast norms. Probe seeds are
+averaged equally. No confidence intervals are claimed at this sample size.}
+\label{tab:core-prediction}
+\begin{tabular}{lrrrrr}
+\toprule
+Score & Flip $\AUROC$ & Flip $\AUPRC$ & Threshold $\rho_s$ & C-index & Site rank acc. \\
+\midrule
+Clean margin only & 0.770 & 0.736 & 0.316 & 0.753 & 0.333 \\
+Susceptibility only & 0.523 & 0.484 & 0.600 & 0.523 & 0.556 \\
+\method{} radius & 0.745 & 0.689 & 0.750 & 0.740 & 0.444 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{3.0pt}
+\caption{Per-budget PGD flip prediction. Each cell averages the metric equally
+over three probe seeds; each seed evaluates the same 18 example--handoff units.
+Boldface only identifies the largest point estimate and does not denote
+statistical significance.}
+\label{tab:pgd-budget-prediction}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{rrrrrrr}
+\toprule
+$\eps$ & \multicolumn{3}{c}{$\AUROC$} & \multicolumn{3}{c}{$\AUPRC$} \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}
+& \method{} & Margin & Suscept. & \method{} & Margin & Suscept. \\
+\midrule
+$3\!\times\!10^{-4}$ & \textbf{0.867} & 0.800 & 0.662 &
+\textbf{0.769} & 0.767 & 0.516 \\
+$10^{-3}$ & \textbf{0.810} & 0.753 & 0.563 &
+\textbf{0.744} & 0.742 & 0.519 \\
+$3\!\times\!10^{-3}$ & \textbf{0.792} & 0.753 & 0.576 &
+0.732 & \textbf{0.742} & 0.526 \\
+$10^{-2}$ & 0.713 & \textbf{0.763} & 0.454 &
+0.713 & \textbf{0.764} & 0.510 \\
+$3\!\times\!10^{-2}$ & 0.694 & \textbf{0.875} & 0.523 &
+0.670 & \textbf{0.833} & 0.484 \\
+$10^{-1}$ & 0.597 & \textbf{0.675} & 0.359 &
+0.504 & \textbf{0.567} & 0.351 \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{3.2pt}
+\caption{Threshold-ordering sensitivity to the budget coordinate. Actual
+post-cast norms are primary; requested-grid values are a complete-grid
+sensitivity analysis. ``Site pair'' is within-example concordance over
+order-comparable handoff pairs.}
+\label{tab:boundary-coordinate}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{llrrrr}
+\toprule
+Coordinate & Score & Threshold $\rho_s$ & C-index & Site pair & Site top-1 \\
+\midrule
+Realized & Clean margin & 0.316 & 0.753 & 0.500 & 0.333 \\
+Realized & Susceptibility & 0.600 & 0.523 & 0.889 & 0.556 \\
+Realized & \method{} & \textbf{0.750} & 0.740 & \textbf{0.889} & 0.444 \\
+Requested & Clean margin & 0.203 & 0.731 & 0.500 & 0.667 \\
+Requested & Susceptibility & 0.569 & 0.538 & \textbf{0.867} & \textbf{0.889} \\
+Requested & \method{} & \textbf{0.786} & \textbf{0.752} & \textbf{0.867} & \textbf{0.889} \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\begin{table}[t]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{3.2pt}
+\caption{Observed failures by requested budget in the exploratory matched
+prefix. Entries are failures out of six examples. Random results at
+$3\times10^{-4}$ are omitted from the qualified control because all 18
+example--handoff rows failed direction-fidelity checks without collapsing.}
+\label{tab:dose-response-counts}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{rrrrrrr}
+\toprule
+& \multicolumn{3}{c}{Per-example PGD} &
+\multicolumn{3}{c}{Qualified random direction} \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}
+$\eps$ & $P{\to}C@1$ & $C{\to}S@1$ & $S{\to}P@1$ &
+$P{\to}C@1$ & $C{\to}S@1$ & $S{\to}P@1$ \\
+\midrule
+$3\!\times\!10^{-4}$ & 2/6 & 1/6 & 2/6 & n/a & n/a & n/a \\
+$10^{-3}$ & 2/6 & 3/6 & 2/6 & 2/6 & 2/6 & 0/6 \\
+$3\!\times\!10^{-3}$ & 3/6 & 2/6 & 2/6 & 0/6 & 1/6 & 1/6 \\
+$10^{-2}$ & 2/6 & 3/6 & 3/6 & 2/6 & 1/6 & 1/6 \\
+$3\!\times\!10^{-2}$ & 2/6 & 2/6 & 2/6 & 1/6 & 1/6 & 1/6 \\
+$10^{-1}$ & 3/6 & 2/6 & 2/6 & 2/6 & 2/6 & 1/6 \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+Across the five direction-qualified random budgets, PGD produced 35 failures
+in 90 repeated example--edge--budget cells (38.9\%), compared with 18/90
+(20.0\%) for the random control. This is descriptive rather than an
+independent-sample test, but it confirms that optimized attacks find more
+failures than an unrelated direction. Raw PGD failure counts are non-monotone
+because each budget is optimized independently; the first-crossing threshold
+retains any adversarial point already found inside the nested budget set.
+Across all six requested random budgets, 90/108 rows passed the frozen
+post-cast direction-quality rule. The 18 failures were exactly the six examples
+at all three handoffs at $3\times10^{-4}$; all had cosine below 0.627 and
+off-direction relative error above 0.779, while none collapsed and realized
+norms remained approximately equal to the requested norms.
+
+The central result is mixed. \method{} gives much stronger crossed-threshold
+ordering than clean margin (0.750 versus 0.316 on realized norms), while clean
+margin is slightly better on interval-censored concordance (0.753 versus
+0.740). \method{} has the largest flip AUROC at the three smallest budgets,
+but margin is stronger at the three largest. Susceptibility alone is generally
+weaker on flip prediction and censored concordance, although it ties or exceeds
+\method{} on some low-support site-ranking metrics. The evidence therefore
+supports the narrower statement that \method{} adds useful local ordering,
+especially near small budgets; it does not yet support uniform dominance over
+margin.
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox[c][1.45in][c]{0.92\linewidth}{\centering
+\textbf{Figure 2 placeholder: preliminary boundary prediction.}\\[0.4em]
+Left: predicted $\widehat\rho$ versus interval-censored realized PGD threshold
+for the six-example validation prefix. Right: per-budget AUROC for \method{},
+clean margin, and susceptibility, with validation-only status marked.}}
+\caption{The preliminary result favors \method{} for crossed-threshold ordering
+and low-budget flip prediction, but not for every baseline comparison. The
+final figure must add raw-example bootstrap intervals and held-out test data.}
+\label{fig:radius-calibration}
+\end{figure}
+
+\subsection{RQ3: Transfer across independent attacks}
+
+Per-example PGD tests the local worst-case interpretation of the radius. The
+universal, DiffMean, and PCA directions test the harder claim that susceptibility
+rankings remain useful for attacks not used in diagnosis. We report these
+separately because a universal direction can fail through poor alignment even
+when the underlying link is fragile.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{3.4pt}
+\caption{Current transfer status. The PGD row repeats the exploratory
+validation summary above; independent transfer attacks have not been run.
+Alignment will be measured only after each attack is frozen and will explain
+residuals rather than construct the attack-independent radius.}
+\label{tab:attack-transfer}
+\begin{tabular}{llrrrr}
+\toprule
+Attack & Status & Flip $\AUROC$ & Threshold $\rho_s$ & Site top-1 & Alignment \\
+\midrule
+Per-example PGD & Validation prefix & 0.745 & 0.750 & 0.444 & \NotRun \\
+Random direction & Qualified control only & \NotRun & \NotRun & \NotRun & \NotRun \\
+Universal margin & Planned & \NotRun & \NotRun & \NotRun & \NotRun \\
+Held-out DiffMean & Planned & \NotRun & \NotRun & \NotRun & \NotRun \\
+Held-out PCA & Planned & \NotRun & \NotRun & \NotRun & \NotRun \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Interpretation rule.}
+Strong PGD prediction with weaker universal-attack prediction supports the
+radius as a susceptibility diagnostic but not a universal ASR predictor. If
+adding measured alignment substantially explains the residual, the intended
+margin--susceptibility--alignment decomposition is supported. The paper must
+not relabel poor attack alignment as a failure of the system-level diagnostic.
+At present there is no RQ3 transfer result: the random direction is only a null
+control, and no universal, DiffMean, or PCA attack has been evaluated.
+
+\subsection{RQ4: System profiles across sites, horizons, and architectures}
+
+RQ4 has not been run. In particular, the current six-example validation prefix
+must not be promoted to an architecture-level vulnerability profile. The
+tables and figure in this subsection specify the planned analysis that becomes
+eligible only after the full validation grid is frozen and the held-out RQ2
+result is evaluated.
+
+Site is indexed by both role pair and exact injection round. We therefore avoid
+averaging all $P{\to}C$ events into one value when they have different numbers
+of downstream micro-steps. $S{\to}P$ results omit invalid $R=1$ conditions.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{3.5pt}
+\caption{Planned condition-level radius and empirical $\eps_{50}$ analysis
+across the unrolled graph. No entries in this table have yet been evaluated.}
+\label{tab:site-horizon}
+\begin{tabular}{llrrrrr}
+\toprule
+Dataset & Site & Horizon & Median $\widehat\rho$ & PGD $\eps_{50}$ & Univ. $\eps_{50}$ & Rank match \\
+\midrule
+GPQA & $P{\to}C@1$ & 2 & \NotRun & \NotRun & \NotRun & \NotRun \\
+GPQA & $C{\to}S@1$ & 2 & \NotRun & \NotRun & \NotRun & \NotRun \\
+GPQA & $S{\to}P@1$ & 2 & \NotRun & \NotRun & \NotRun & \NotRun \\
+GPQA & $P{\to}C@1$ & 4 & \NotRun & \NotRun & \NotRun & \NotRun \\
+GPQA & $C{\to}S@1$ & 4 & \NotRun & \NotRun & \NotRun & \NotRun \\
+GPQA & $S{\to}P@1$ & 4 & \NotRun & \NotRun & \NotRun & \NotRun \\
+MedQA & All valid & 2,4 & \NotRun & \NotRun & \NotRun & \NotRun \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+We do not assume that more rounds monotonically increase fragility. Extra
+computation may amplify, contract, overwrite, or ignore a relay. The empirical
+claim is instead that \method{} tracks these horizon-specific changes better
+than nominal path length.
+
+We next aggregate exact-site radii into the profiles in
+Section~\ref{sec:system-profile}. Predicted profiles are compared with empirical
+PGD curves as the closest observed local worst-case reference and with held-out
+universal curves as the transfer test.
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox[c][1.55in][c]{0.92\linewidth}{\centering
+\textbf{Figure 3 placeholder: system vulnerability profiles.}\\[0.4em]
+Left: worst-site, validation-fixed-site, and uniform-random-site
+\(\widehat\Vuln^{\mathrm{LR}}(\eps)\) for sequential horizons. Middle:
+predicted versus observed PGD curves. Right: whole-system profiles for
+sequential, mixture, distillation, and fixed-trace deliberation.}}
+\caption{Budget-indexed profiles preserve the meaning of a \([0,1]\)
+vulnerability score. Worst-site curves include the number of accessible links;
+uniform-site curves expose average per-link fragility.}
+\label{fig:system-vulnerability-curves}
+\end{figure}
+
+\begin{table}[t]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{2.7pt}
+\caption{System-level vulnerability profiling. \(\eps_0\) and
+\(\eps_{\max}\) are frozen on validation data and shared across compared
+systems. Architecture rows use the intersection-clean-correct set; system-own
+conditional results and predicted robust accuracy are reported alongside them.}
+\label{tab:system-profiles}
+\begin{tabular}{llrrrrrr}
+\toprule
+Dataset & System / horizon & Clean Acc. &
+\(\Vuln_{\mathrm{adv}}(\eps_0)\) &
+\(\Vuln_{\mathrm{unif}}(\eps_0)\) &
+\(\eps_{50}\) & \(\AUV\) & \(\widehat{\mathrm{RA}}(\eps_0)\) \\
+\midrule
+GPQA & Sequential, $R=1$ & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun \\
+GPQA & Sequential, $R=2$ & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun \\
+GPQA & Sequential, $R=4$ & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun \\
+GPQA & Mixture & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun \\
+GPQA & Distillation & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun \\
+GPQA & Deliberation, fixed trace & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun \\
+MedQA & Frozen-protocol replication & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The architecture table is interpreted at two levels. Matched-backbone,
+matched-compute variants support claims about collaboration structure. Native
+released variants support only whole-system comparisons because role models,
+training, and link interfaces differ. We test whether LinkRadius ordering
+agrees with observed curve ordering and report integrated absolute curve error,
+not merely visually separated curves.
+
+\subsection{RQ5: Prompt-induced vulnerability mechanisms}
+
+RQ5 has not been run. Prompt effects remain a conditional extension rather
+than evidence supporting the current local-boundary result.
+
+Amplifying and corrective prompts are evaluated on paired examples under the
+same topology, weights, handoffs, and budgets. The analysis asks which factor
+moves the radius rather than merely whether prompts change ASR.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{3.3pt}
+\caption{Prompt-regime decomposition on the intersection-clean-correct set.
+Report paired changes and confidence intervals. Radius decomposition is
+competitor-specific before aggregation because the binding competitor may
+change between prompts.}
+\label{tab:prompt-decomposition}
+\begin{tabular}{lrrrrrrr}
+\toprule
+Regime & Identity $U$ & Margin $m$ & Suscept. $\widehat\chi$ &
+Median $\widehat\rho$ & $\Vuln_{\mathrm{adv}}(\eps_0)$ & $\eps_{50}$ & $\AUV$ \\
+\midrule
+Amplifying & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun \\
+Corrective & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun \\
+Paired difference & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+A corrective prompt may improve the profile by widening the clean margin,
+reducing susceptibility, or bypassing the relay. Only the first two represent
+greater robustness while preserving the same communication function; the
+causal-use audit distinguishes them from lost relay utility.
+
+\subsection{RQ6: Utility--fragility map and targeted protection}
+
+RQ6 has not been run. The protection experiment will be selected only from a
+frozen held-out vulnerability analysis; the current validation prefix is not
+used to choose a protected link.
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox[c][1.42in][c]{0.92\linewidth}{\centering
+\textbf{Figure 4 placeholder: link utility--fragility map.}\\[0.4em]
+Plot paired--mismatched margin utility on the horizontal axis and
+\(F_e(\eps_0)=\Pr[\widehat\rho_{x,e}\le\eps_0]\) on the vertical axis.
+Label each site, injection round, and horizon. Shade the ``critical link'' and
+``unnecessary attack surface'' regions.}}
+\caption{Utility and fragility answer different design questions. A link is a
+protection priority only when it is both causally useful and easy to destabilize.}
+\label{fig:utility-fragility}
+\end{figure}
+
+As a final actionability test, validation data select
+\begin{equation}
+    e^\star
+    =\arg\max_{e:U_e\ge\delta_U}
+    \Pr_{x\sim\mathcal D_{\mathrm{val}}}
+    [\widehat\rho^{(1)}_{h,x,e}\le\eps_0],
+    \label{eq:protected-link-selection}
+\end{equation}
+where \(\delta_U\) and \(\eps_0\) are predeclared. The cleanest
+selection-only experiment applies an integrity shield to one link, making that
+single handoff unavailable to the latent attacker while leaving every other
+link accessible. An optional practical realization selectively textualizes or
+redundantly recomputes the chosen relay. The same mechanism and cost are used
+for every selection policy; this tests diagnosis, not defense novelty. The
+attacker is then evaluated against the worst remaining eligible site.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{3.6pt}
+\caption{Matched-cost link protection. Report clean utility and robustness so
+selection cannot win by disabling communication.}
+\label{tab:protection}
+\begin{tabular}{lrrrrr}
+\toprule
+Protected-link policy & Clean Acc. & Utility retained & PGD $\eps_{50}$ &
+Univ. $\eps_{50}$ & $\AUV$ \\
+\midrule
+No protection & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun \\
+Random valid link & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun \\
+Fixed last link & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun \\
+Largest-radius link & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun \\
+Smallest-radius useful link & \NotRun & \NotRun & \NotRun & \NotRun & \NotRun \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Discussion}
+
+\paragraph{What the current evidence establishes.}
+The validation pilot establishes that the complete measurement path is
+feasible on sequential-light GPQA at $R=2$: forced-option margins and relay
+interfaces were finite, all 13 selected examples repeated their clean-correct
+status, the three first-round handoffs admitted complete $K=8$ antithetic probe
+sets, and PGD produced empirical boundary crossings. On the fixed six-example
+attack prefix, \method{} substantially improved crossed-threshold ordering over
+clean margin and susceptibility and improved low-budget flip AUROC over both.
+The causally audited $P{\to}C@1$ and $C{\to}S@1$ links also showed sizeable
+accuracy effects under answer-label-matched relay replacement. Together these
+are meaningful preliminary evidence that an attack-independent local radius
+contains information about later optimized failures.
+
+\paragraph{What the current evidence does not establish.}
+The same prefix does not show uniform dominance. Clean margin slightly exceeds
+\method{} on realized interval-censored concordance and on the descriptive
+mean of per-budget AUROC, while susceptibility ties or exceeds \method{} on
+some site-ranking summaries with very small support. Exact-gradient agreement
+also failed. Most importantly, all boundary results so far use validation
+examples, only six independent raw examples enter the attack analysis, and no
+test outcome has been opened. We therefore do not claim held-out prediction,
+estimator correctness relative to autograd, transfer beyond PGD, or a validated
+system-level profile.
+
+\paragraph{What a confirmatory positive result would establish.}
+If the frozen radius reproduces its boundary-ordering advantage on held-out
+test examples with raw-example bootstrap intervals, then small random probes
+reveal a system property useful before selecting an attack. Transfer to
+universal and failure-associated directions would further show that the
+fragility ordering is not specific to one optimization procedure. Agreement
+between aggregated \method{} profiles and observed worst-site curves would
+then justify testing the architecture-level \([0,1]\) score, while
+diagnosis-guided shielding would test whether the profile supports an actual
+design decision.
+
+\paragraph{What a negative result would establish.}
+If the causal-use gate fails, the evaluated full-routing links are not carrying
+the example-specific information attributed to them; their sensitivity is
+latent-interface exposure rather than communication fragility, and the
+receiver-necessary condition becomes the causal positive control. If the full
+radius fails while margin-only succeeds, output confidence dominates the
+measured latent sensitivity. If PGD follows the radius but universal attacks do
+not, alignment---rather than system susceptibility---is the limiting factor.
+If local prediction fails, architecture-level curves are not promoted to the
+headline merely because they separate systems. Each branch is more informative
+than reporting small average excess ASR over many conditions.
+
+\paragraph{Why the random-control floor is informative.}
+The smallest random budget preserved its requested norm but not its requested
+direction after low-precision casting. Because this occurred in all examples
+and sites at exactly one predeclared budget, and because none of the
+interventions collapsed, it is best treated as a measurement-resolution limit
+rather than selective missingness. Excluding the entire $3\times10^{-4}$ cell
+from the direction-qualified random comparison is outcome-independent and
+leaves the PGD analysis unchanged.
+
+\paragraph{What the system score does and does not mean.}
+\(\Vuln_{\sys,\mathcal D,\threat}(\eps)\) is a budget-conditioned fraction,
+not a universal security grade. Changing the allowed handoffs, perturbation
+subspace, scale convention, site policy, horizon, or clean population changes
+the question and therefore the score. The full curve is primary;
+\(\eps_{50}\) and \(\AUV\) are compact summaries with explicit units or
+budget ranges.
+
+\paragraph{Why this is not another attack paper.}
+Attacks are used as held-out instruments for testing a pre-attack diagnostic.
+The contribution is the ability to localize and rank latent failure exposure,
+not a new way to maximize damage. This makes the work complementary to latent
+attack construction and latent-channel defenses.
+
+\section{Related Work}
+\label{sec:related-work}
+
+\paragraph{Latent communication.}
+InterLat and LatentMAS replace textual inter-agent messages with continuous
+representations, while RecursiveMAS organizes latent communication into a
+recursive multi-agent computation \cite{du2025interlat,zou2025latentmas,
+yang2026recursivemas}. These systems motivate handoff-level analysis because
+their communication object is continuous and their execution is composed over
+multiple downstream modules.
+
+\paragraph{Latent attacks and safeguards.}
+Latent-only interventions can reactivate attack-associated behavior in latent
+multi-agent systems, particularly at inter-agent handoffs
+\cite{wang2026outofsight}, while tampered KV-cache collaboration exposes an
+integrity risk invisible to text-only checks \cite{brito2026latentagents}.
+LCGuard primarily studies reconstruction-based sensitive-information leakage
+and learned transformations for safer KV sharing \cite{asif2026lcguard}.
+Our work is complementary: we ask whether attack-independent measurements can
+identify fragile links and budgets before choosing a defense or attack.
+
+\paragraph{Causal audits of communication.}
+Recent work distinguishes the effect of a message's presence from the effect
+of its example-specific identity using matched, mismatched, zero, and randomized
+relays \cite{cheng2026when,zhang2026channels}. We adopt this distinction as a
+prerequisite for robustness analysis: perturbation sensitivity is meaningful as
+communication fragility only when the link transmits task-relevant content.
+
+\paragraph{Random directional estimation and robustness margins.}
+Random-direction finite differences are a standard way to recover gradient
+information without backpropagation \cite{nesterov2017random}. Attack-independent
+margin and local-Lipschitz robustness scores also precede this work, notably
+CLEVER \cite{weng2018clever}. We therefore do not claim the spherical moment
+identity or Taylor margin bound alone as novel. The contribution is their
+system-specific use at causally audited latent handoffs, exact unrolled
+execution, held-out threshold prediction, budget-indexed architecture
+aggregation, and diagnosis-guided link selection.
+
+\section{Limitations}
+
+\method{} is local, norm-specific, subspace-specific, and margin-specific. Its
+first-order radius is exact only for the affine model. Finite random probes can
+underestimate narrow sensitivity directions, and minimizing noisy estimates
+over competitors and edges introduces selection bias. Repeated probes and
+exact-gradient checks quantify this error but do not create a certificate. A
+small empirical radius indicates opportunity for a sufficiently aligned
+perturbation, not success of an arbitrary universal, DiffMean, or random attack.
+
+The theorem assumes deterministic smooth scoring on a fixed local control-flow
+branch. Discrete token or tool decisions can violate the Taylor model. Pairwise
+option margins also make the primary method an offline labeled audit; open-ended
+generation and code require a separately validated continuous decision score.
+When inference is stochastic, clean-clean variation must be estimated and
+paired with each intervention.
+
+The threat model covers one-shot, single-edge additive interventions over a
+finite unrolled horizon. It does not cover joint, persistent, adaptive
+multi-round corruption or infinite-horizon stability. Relative Frobenius norms
+are invariant to scalar rescaling but not arbitrary latent reparameterization,
+so cross-architecture profiles require an explicit interface metric and should
+not be read as intrinsic constants. Native architecture comparisons remain
+confounded by different role models, training, compute, and numbers of exposed
+links; matched variants are required for causal topology claims. Finally, full
+access to the original question may let receivers bypass the relay. We treat
+that as a measured property rather than subtracting it away.
+
+The reported empirical results have additional, concrete limitations. The
+causal and probe audits contain only 13 forced-margin clean-correct validation
+examples, and the attack analysis contains only six independent examples and
+18 example--handoff units. Three probe seeds quantify estimator variation but
+do not triple the independent sample size. Crossed-threshold Spearman uses only
+nine crossed units per seed; realized vulnerable-site top-1 uses only three
+informative examples per seed, and realized site-pair concordance has only
+three comparable pairs per seed. These point estimates therefore have high
+sampling uncertainty and are reported without inferential confidence claims.
+
+The PGD dose response is non-monotone because each budget is optimized
+independently with one 20-step run. First-crossing analysis correctly preserves
+an adversarial point found inside a nested budget, but the raw per-budget curve
+is an optimizer lower bound rather than the exact robust-risk curve. The
+smallest random budget also lies below the reliable direction-fidelity scale in
+BF16. Finally, zero of six exact-autograd comparisons met the finite-difference
+agreement rule. These facts motivate more attack restarts, a monotone
+carry-forward sensitivity analysis, larger $K$, and investigation of the
+autograd path, but none should be silently repaired after observing held-out
+test outcomes.
+
+\section{Conclusion}
+
+This paper reframes latent multi-agent robustness at two resolutions: which
+concrete handoff is closest to a terminal decision boundary, and what fraction
+of a system's clean-correct behavior is exposed at a stated budget. \method{}
+combines causal relay auditing with attack-independent random probing of
+end-to-end margins, then aggregates validated handoff radii into explicit
+worst-site and random-site vulnerability profiles. The construction follows the
+actual unrolled computation and separates clean margin, system susceptibility,
+and attack alignment. The completed validation pilot provides preliminary but
+mixed support for the local diagnostic. On six examples, \method{} strongly
+improves crossed-threshold ordering and small-budget flip prediction, but clean
+margin remains competitive or better on other summaries. This is enough to
+justify the frozen held-out test, not enough to claim general prediction or a
+validated system vulnerability score. Local held-out threshold prediction
+therefore remains the load-bearing empirical test; cross-dataset,
+cross-architecture, prompt, and protection claims stay conditional on its
+outcome.
+
+\appendix
+
+\section{Proofs}
+
+\subsection{Proof of Proposition~\ref{prop:affine-radius}}
+
+Fix a competitor \(j\) and suppress \((x,e,j)\) subscripts. Reaching its
+affine boundary requires \(m+\langle g,\delta\rangle\le0\). If \(g=0\), the
+strictly positive clean margin cannot be changed in the affine model. If
+\(g\ne0\), Cauchy--Schwarz gives
+\begin{equation}
+    m\le-\langle g,\delta\rangle
+    \le\|g\|_2\|\delta\|_2,
+\end{equation}
+so every feasible perturbation has
+\(\|\delta\|_2/s\ge m/(s\|g\|_2)=m/\chi\). Equality is achieved by
+\(\delta^\star=-m g/\|g\|_2^2\). The incorrect-decision region of the affine
+model is the union of these competitor halfspaces, so minimizing over that
+union gives \(\min_{j\ne y}m_j/\chi_j\), with the stated infinite-radius
+convention.
+
+\subsection{Proof of Proposition~\ref{prop:isotropic-recovery}}
+
+Let $g=g_{x,e,j}$, $s=s_{x,e}$, and $q=q_e$. The exact directional derivative is
+\begin{equation}
+    d_j(u)=s\langle g,u\rangle.
+\end{equation}
+For $u$ uniform on the unit sphere in $q$ dimensions,
+$\E[uu^\top]=I/q$. Therefore
+\begin{align}
+    \E[d_j(u)^2]
+    &=s^2\E[g^\top uu^\top g]\\
+    &=\frac{s^2\|g\|_2^2}{q}
+    =\frac{\chi_{x,e,j}^2}{q}.
+\end{align}
+Rotational symmetry lets us align the first coordinate with \(g\). Using
+\(\E[u_1^4]=3/[q(q+2)]\),
+\begin{align}
+    \operatorname{Var}\!\left(qd_j(u)^2\right)
+    &=q^2\chi^4
+    \left(\frac{3}{q(q+2)}-\frac{1}{q^2}\right)\\
+    &=\chi^4\frac{2(q-1)}{q+2}.
+\end{align}
+Averaging \(K\) independent directions yields
+Equation~\eqref{eq:probe-variance}; the law of large numbers gives consistency.
+For the finite difference, a third-order Taylor expansion of
+\(\phi(t)=m(z+tsu)\) about zero gives the standard central-difference remainder
+bounded by \(Bh^2/6\).
+
+\subsection{Proof of Theorem~\ref{thm:margin-stability}}
+
+Fix one competitor and suppress \((x,e,j)\) subscripts. For any admissible
+$\delta$, Taylor's theorem gives
+\begin{equation}
+    m(z+\delta)
+    =m(z)+\langle \nabla m(z),\delta\rangle
+    +\frac{1}{2}\delta^\top
+    \nabla^2m(z+t\delta)\delta
+\end{equation}
+for some $t\in(0,1)$. By Cauchy--Schwarz and
+Assumption~\ref{ass:curvature}, and because \(\delta=P\delta\),
+\begin{align}
+    m(z+\delta)
+    &\ge m(z)-\|P\nabla m(z)\|_2\|\delta\|_2
+    -\frac{1}{2}H\|\delta\|_2^2\\
+    &\ge m(z)-\eps s\|g\|_2
+    -\frac{1}{2}\eps^2s^2H,
+\end{align}
+which is Equation~\eqref{eq:curvature-bound}. If this lower bound is positive
+for every competitor, the correct option retains the largest score. Solving the
+quadratic lower bound for its positive root gives
+Equation~\eqref{eq:cert-radius}, with the stated linear and constant special
+cases. Truncation at \(\bar\eps\) keeps the result inside the audited ball.
+
+\subsection{Proof of Corollary~\ref{cor:system-stability}}
+
+If \(\eps<\min_e\rho^{\mathrm{cert}}_{x,e}\), then
+\(\eps<\rho^{\mathrm{cert}}_{x,e}\) for every eligible handoff. Theorem
+\ref{thm:margin-stability} therefore preserves all pairwise margins under an
+intervention at any one eligible edge, proving one-shot system stability. Hence
+an exact failure at budget \(\eps\) can occur only outside the set certified
+robust at that budget. Taking probabilities gives
+\(\Vuln^\star(\eps)\le1-C(\eps)\).
+
+\section{Mechanistic Decomposition on the Unrolled Graph}
+
+For a unique downstream path, submultiplicativity gives
+\begin{equation}
+    \chi_{x,e,j}
+    \le
+    s_{x,e}
+    \|\nabla_{\mathrm{out}}m_{x,e,j}\|_2
+    \prod_{v\in\operatorname{path}(e,\mathrm{out})}
+    \|J_v\|_{\mathrm{op}}.
+\end{equation}
+For branching computation, the end-to-end Jacobian is a sum over paths rather
+than a product of scalar role gains. The direct probe estimate remains primary
+because scalar norm products discard cancellations and can be extremely loose.
+
+\section{Preliminary Run Provenance and Evidence Status}
+
+Table~\ref{tab:run-provenance} records the execution state underlying every
+numerical result in Section~\ref{sec:results}. Input task directories and
+artifacts were checked against their completion records before aggregation.
+The derived six-example attack analysis is explicitly diagnostic and does not
+constitute a frozen test-set result.
+
+\begin{table}[h]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\caption{Provenance of the current preliminary evidence. The source hash is
+the code identity recorded by the completed pilot artifacts.}
+\label{tab:run-provenance}
+\begin{tabular}{p{0.27\linewidth}p{0.66\linewidth}}
+\toprule
+Field & Recorded value \\
+\midrule
+Workflow root & \path{linkradius-rq2-seqlight-forcedmargin-v1} \\
+Source hash &
+\texttt{79815ae8cb16c6cd1478400185da4de6}\newline
+\texttt{29a84be655350ae6ea50e10f5496c922} \\
+System & Sequential-light on GPQA; $R=2$; batch size 1; latent length 32 \\
+Decision rule & Deterministic forced-option scoring and minimum pairwise
+margin; free-generation validity retained only as a diagnostic \\
+Screen/clean cohort & 40 validation examples screened; 13 forced-margin
+clean-correct; 13/13 stable under authenticated clean recapture \\
+Causal audit & All 13 eligible examples at $P{\to}C@1$, $C{\to}S@1$, and
+$S{\to}P@1$ for mismatch, identity, and zero interventions \\
+Probe audit & $K=8$ antithetic directions; $h\in\{10^{-3},3\times10^{-3}\}$;
+seeds 101, 202, and 303; 234 eligible configurations and 1,872 accepted pairs \\
+Gradient diagnostic & Six finite example--edge rows; 0/6 finite-difference
+agreements; maximum relative error 1.043; archived outside the frozen probe
+gate because the rows lacked resolved system-identity metadata; not used as a
+certificate \\
+Attack prefix & First six of 13 eligible validation examples in frozen
+execution order; 36/78 full validation attack tasks represented (three sites,
+two families, six budgets), yielding 216 sample rows and 324 PGD
+competitor-target rows; remaining 42 tasks not used \\
+Attack settings & Per-example 20-step PGD and independent random directions;
+$\eps\in\{3\!\times\!10^{-4},10^{-3},3\!\times\!10^{-3},10^{-2},
+3\!\times\!10^{-2},10^{-1}\}$ \\
+Data-access status & Validation only; no held-out test outcome accessed; no
+architecture, prompt, protection, or independent transfer-attack result \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Full Reproducibility Checklist}
+
+The final appendix should report:
+\begin{itemize}
+    \item exact model checkpoint, precision, tokenizer, decoding rule, and
+    option-scoring procedure;
+    \item the chronological micro-step associated with every handoff label;
+    \item shape, scale \(s_{x,e}\), basis \(B_e\), dimension \(q_e\), and
+    admissible perturbation subspace of every latent object;
+    \item requested and realized post-cast perturbation norms;
+    \item realized probe antipodality and requested--realized cosine checks;
+    \item random seeds and exact antithetic direction construction;
+    \item causal-audit derangement rule and moment-matching procedure;
+    \item calibration, validation, and test indices;
+    \item attack training objectives, steps, restarts, and stopping rules;
+    \item clean-correct and intersection clean-correct denominators;
+    \item all-edge, useful-edge, worst-site, fixed-site, and random-site threat
+    declarations, including validation-only link selection;
+    \item treatment of censored thresholds, ties, invalid outputs, and clean
+    rerun disagreement;
+    \item fixed discrete traces used for theorem-bearing architecture analyses;
+    \item per-example results sufficient to reproduce bootstrap intervals.
+\end{itemize}
+
+\section{Expanded Result Tables}
+
+The final appendix should expand Table~\ref{tab:site-horizon} by dataset,
+horizon, exact injection round, site, attack, and budget. It should also include
+per-competitor margins, estimator seed stability, probe-radius stability,
+clean-clean floors, actual perturbation norms, and all baseline comparisons.
+Do not pool incompatible clean denominators or average effects across budgets
+before showing the dose--response curves. System-level appendices should include
+full \(\Vuln(\eps)\) curves, \(\eps_q\) values, \(\AUV\), predicted robust
+accuracy, edge counts, useful-link gates, and paired architecture/prompt
+comparisons on both intersection and system-specific clean sets.
+
+\begin{thebibliography}{20}
+
+\bibitem{du2025interlat}
+Zhuoyun Du, Runze Wang, Huiyu Bai, Zouying Cao, Xiaoyong Zhu, Yu Cheng,
+Bo Zheng, Wei Chen, and Haochao Ying.
+\newblock \emph{Enabling Agents to Communicate Entirely in Latent Space}.
+\newblock arXiv:2511.09149, 2025.
+\newblock \url{https://arxiv.org/abs/2511.09149}
+
+\bibitem{zou2025latentmas}
+Jiaru Zou, Xiyuan Yang, Ruizhong Qiu, Gaotang Li, Katherine Tieu, Pan Lu,
+Ke Shen, Hanghang Tong, Yejin Choi, Jingrui He, James Zou, Mengdi Wang,
+and Ling Yang.
+\newblock \emph{Latent Collaboration in Multi-Agent Systems}.
+\newblock arXiv:2511.20639, 2025.
+\newblock \url{https://arxiv.org/abs/2511.20639}
+
+\bibitem{yang2026recursivemas}
+Xiyuan Yang, Jiaru Zou, Rui Pan, Ruizhong Qiu, Pan Lu, Shizhe Diao,
+Jindong Jiang, Hanghang Tong, Tong Zhang, Markus J. Buehler, Jingrui He,
+and James Zou.
+\newblock \emph{Recursive Multi-Agent Systems}.
+\newblock arXiv:2604.25917, 2026.
+\newblock \url{https://arxiv.org/abs/2604.25917}
+
+\bibitem{wang2026outofsight}
+Chenxi Wang, Ruiyang Huang, Jiayan Sun, Lei Wei, and Yifan Wu.
+\newblock \emph{Out of Sight, Not Out of Mind: Unveiling Latent Attack in
+Latent-based Multi-Agent Systems}.
+\newblock arXiv:2605.28214, 2026.
+\newblock \url{https://arxiv.org/abs/2605.28214}
+
+\bibitem{brito2026latentagents}
+Lu\'is Brito and Carlos Baquero.
+\newblock \emph{When Latent Agents Lie: KV-Cache Integrity in Multi-Agent LLM
+Collaboration}.
+\newblock arXiv:2606.28958, 2026.
+\newblock \url{https://arxiv.org/abs/2606.28958}
+
+\bibitem{asif2026lcguard}
+Sadia Asif, Mohammad Mohammadi Amiri, Momin Abbas, Prasanna Sattigeri,
+and Karthikeyan Natesan Ramamurthy.
+\newblock \emph{LCGuard: Latent Communication Guard for Safe KV Sharing in
+Multi-Agent Systems}.
+\newblock arXiv:2605.22786, 2026.
+\newblock \url{https://arxiv.org/abs/2605.22786}
+
+\bibitem{cheng2026when}
+Jiaming Cheng, Subhransu Das, and Rajiv Ramnath.
+\newblock \emph{When Does Latent Communication Pay? A Causal Audit of Relayed
+KV Caches in Multi-Agent LLMs}.
+\newblock arXiv:2608.04893, 2026.
+\newblock \url{https://arxiv.org/abs/2608.04893}
+
+\bibitem{zhang2026channels}
+Huixiang Zhang and Mahzabeen Emu.
+\newblock \emph{Do Latent Channels Actually Communicate? A Causal Audit of
+Latent Multi-Agent LLM}.
+\newblock arXiv:2607.26773, 2026.
+\newblock \url{https://arxiv.org/abs/2607.26773}
+
+\bibitem{nesterov2017random}
+Yurii Nesterov and Vladimir Spokoiny.
+\newblock Random gradient-free minimization of convex functions.
+\newblock \emph{Foundations of Computational Mathematics}, 17(2):527--566,
+2017.
+
+\bibitem{weng2018clever}
+Tsui-Wei Weng, Huan Zhang, Pin-Yu Chen, Jinfeng Yi, Dong Su, Yupeng Gao,
+Cho-Jui Hsieh, and Luca Daniel.
+\newblock Evaluating the robustness of neural networks: An extreme value
+theory approach.
+\newblock In \emph{International Conference on Learning Representations},
+2018.
+\newblock \url{https://arxiv.org/abs/1801.10578}
+
+\end{thebibliography}
+
+\end{document}
